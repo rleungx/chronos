@@ -1,20 +1,20 @@
 use std::env;
 use std::error::Error;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::sync::Barrier;
 use tonic::transport::Channel;
 use tonic::Request;
 
-use chronos_tso::proto::v1::{
+use chronos::proto::v1::{
     timeline_route_service_client::TimelineRouteServiceClient,
     timestamp_service_client::TimestampServiceClient, AllocateTimestampsRequest,
     EnsureTimelineRequest, ResourceTier,
 };
 
-type AppResult<T> = Result<T, Box<dyn Error>>;
+type AppResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
 #[derive(Clone)]
 struct BenchConfig {
@@ -65,7 +65,8 @@ fn load_config() -> BenchConfig {
     let batch = env_or("CHRONOS_BENCH_BATCH", 1u32);
     let duration_secs = env_or("CHRONOS_BENCH_DURATION_SECS", 10u64);
     let warmup_secs = env_or("CHRONOS_BENCH_WARMUP_SECS", 3u64);
-    let resource_tier = parse_resource_tier(&env_or_string("CHRONOS_BENCH_RESOURCE_TIER", "shared"));
+    let resource_tier =
+        parse_resource_tier(&env_or_string("CHRONOS_BENCH_RESOURCE_TIER", "shared"));
     let scenario = env_or_string("CHRONOS_BENCH_SCENARIO", "round_robin");
     BenchConfig {
         endpoint,
@@ -79,7 +80,10 @@ fn load_config() -> BenchConfig {
     }
 }
 
-async fn ensure_timelines(config: &BenchConfig, channel: Channel) -> AppResult<Vec<(String, u64, u64)>> {
+async fn ensure_timelines(
+    config: &BenchConfig,
+    channel: Channel,
+) -> AppResult<Vec<(String, u64, u64)>> {
     let mut client = TimelineRouteServiceClient::new(channel);
     let mut routes = Vec::with_capacity(config.timeline_count);
     for idx in 0..config.timeline_count {
@@ -97,6 +101,15 @@ async fn ensure_timelines(config: &BenchConfig, channel: Channel) -> AppResult<V
     Ok(routes)
 }
 
+async fn connect_channel(endpoint: String) -> AppResult<Channel> {
+    let channel = Channel::from_shared(endpoint.clone())
+        .map_err(|error| format!("invalid bench endpoint {endpoint}: {error}"))?;
+    channel
+        .connect()
+        .await
+        .map_err(|error| format!("failed to connect bench endpoint {endpoint}: {error}").into())
+}
+
 fn percentile(sorted: &[u64], pct: f64) -> u64 {
     if sorted.is_empty() {
         return 0;
@@ -108,7 +121,7 @@ fn percentile(sorted: &[u64], pct: f64) -> u64 {
 #[tokio::main]
 async fn main() -> AppResult<()> {
     let config = load_config();
-    let channel = Channel::from_shared(config.endpoint.clone())?.connect().await?;
+    let channel = connect_channel(config.endpoint.clone()).await?;
     let routes = Arc::new(ensure_timelines(&config, channel.clone()).await?);
 
     let barrier = Arc::new(Barrier::new(config.concurrency + 1));
@@ -124,7 +137,7 @@ async fn main() -> AppResult<()> {
         let id_gen = id_gen.clone();
         let batch = config.batch;
         handles.push(tokio::spawn(async move {
-            let channel = Channel::from_shared(endpoint).unwrap().connect().await.unwrap();
+            let channel = connect_channel(endpoint).await?;
             let mut client = TimestampServiceClient::new(channel);
             let mut stats = WorkerStats::default();
             let mut route_idx = worker_idx % routes.len();
@@ -146,12 +159,16 @@ async fn main() -> AppResult<()> {
                         count: batch,
                         expected_epoch: route.1,
                         expected_route_version: route.2,
-                        client_request_id: format!("{}-{}", worker_idx, id_gen.fetch_add(1, Ordering::Relaxed)),
+                        client_request_id: format!(
+                            "{}-{}",
+                            worker_idx,
+                            id_gen.fetch_add(1, Ordering::Relaxed)
+                        ),
                         request_timeout_ms: 0,
                     }))
                     .await;
                 let elapsed = start.elapsed().as_micros() as u64;
-                result.unwrap();
+                result?;
 
                 if start >= warmup_until {
                     stats.requests += 1;
@@ -159,7 +176,7 @@ async fn main() -> AppResult<()> {
                     stats.latencies_us.push(elapsed);
                 }
             }
-            stats
+            Ok::<WorkerStats, Box<dyn Error + Send + Sync>>(stats)
         }));
     }
 
@@ -170,7 +187,7 @@ async fn main() -> AppResult<()> {
     let mut total_tsos = 0u64;
     let mut latencies = Vec::new();
     for handle in handles {
-        let stats = handle.await?;
+        let stats = handle.await??;
         total_requests += stats.requests;
         total_tsos += stats.tsos;
         latencies.extend(stats.latencies_us);

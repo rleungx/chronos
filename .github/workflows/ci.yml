@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 5 * * *'
+
+jobs:
+  layer-0-3-verify:
+    runs-on: ubuntu-latest
+    if: github.event_name != 'schedule'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.94.0
+          components: rustfmt, clippy
+      - name: Run Layer 0 static
+        run: make test-layer-0
+      - name: Run Layer 1 fast smoke
+        run: make test-layer-1
+      - name: Run Layer 2 binary startup and transport seam
+        run: make test-layer-2
+      - name: Run Layer 3 memory-path semantic regression
+        run: make test-layer-3
+
+  layer-4-real-etcd:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      ETCD_ENDPOINTS: 127.0.0.1:2379
+      CHRONOS_BUILD_COMMIT: ${{ github.sha }}
+      RUST_BACKTRACE: 1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.94.0
+      - name: Start etcd
+        run: make etcd-up
+      - name: Wait for etcd health
+        run: |
+          for attempt in $(seq 1 60); do
+            if make etcd-health; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "etcd did not become healthy within 60 attempts" >&2
+          exit 1
+      - name: Run Layer 4 real-etcd validation
+        run: make test-layer-4
+      - name: Dump etcd diagnostics
+        if: failure()
+        run: |
+          docker compose -f hack/etcd/docker-compose.yml ps
+          docker compose -f hack/etcd/docker-compose.yml logs --no-color etcd
+      - name: Stop etcd
+        if: always()
+        run: make etcd-reset

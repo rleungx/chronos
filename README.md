@@ -1,107 +1,157 @@
-# Chronos TSO (Rust)
+# Chronos
 
-Chronos is a multi-timeline TSO example implementation designed to provide:
+Chronos is a correctness-first Rust timestamp service for many independent timelines.
 
-- a single `uint64 tso`
-- global uniqueness
-- strict monotonicity and linearizability within a single `timeline_key`
-- migration, failover, lease/fencing, and recovery-floor protection
+It issues `uint64` TSOs, keeps the hot allocation path local to the legal owner, and treats
+metadata as the authority for routing, ownership, and recovery boundaries.
 
-See `design.md` for the design document and `tso.proto` for the protocol definition.
+## What Chronos is optimized for
 
-## Architecture Highlights
+Chronos is built around one idea: **correctness is scoped to a single `timeline_key`**.
 
-- Timestamp encoding: `40 bits physical_ms + 13 bits generator_id + 11 bits sequence`
-- `timeline_key` is not encoded into `tso`; routing is maintained by the control plane and client-side routing layer
-- At any time, a single timeline can have only one legal owner issuing timestamps
-- Requests for the same timeline must pass through a single serial ingress point before they enter the allocation path
-- Generator-level lease, owner identity, lease token, and `issued_upper_bound` provide fencing
-- Migration and failover rely on persisted `recovery_floor_tso` so timestamps do not go backwards even if the new owner restarts before its first post-cutover allocation
-- watch is only a convergence accelerator, not a correctness source
+For successful allocations on one timeline, Chronos is designed to provide:
 
-## Implemented APIs
+- globally unique successful TSOs across the cluster
+- strict monotonicity and linearizability for that timeline
+- rejection of stale route / epoch / ownership views
+- no rollback across graceful transfer or failover once the recovery boundary is established in an
+  authoritative metadata store
 
-- `EnsureTimeline`
-- `GetTimelineRoute`
-- `WatchTimelineRoutes`
-- `AllocateTimestamps`
-- `TransferTimeline`
-- `Health`
+Different timelines are intentionally independent. Chronos does **not** try to provide a total
+order across the whole cluster.
 
-## Quick Start
+## Core model
 
-Run the demo with in-memory metadata:
+- one TSO is one `uint64`
+- the current wire format is:
+
+  ```text
+  physical_ms(40) + generator_id(13) + sequence(11)
+  ```
+
+- `timeline_key` is the unit of correctness
+- a timeline maps to a route: owner endpoint, generator, epoch, and route version
+- only one legal owner may issue for one timeline at a time
+- watch is a convergence hint; authoritative route reads remain the correctness source
+
+## Service shape
+
+Chronos currently provides:
+
+- a Rust library crate and a `chronos` binary
+- gRPC APIs for timeline creation, routing, allocation, transfer, and watch flows
+- timeline status read APIs
+- health, readiness, and Prometheus metrics endpoints
+- in-memory metadata for local runs and etcd-backed metadata for authoritative routing
+
+The binary is currently environment-driven rather than a stable flag-driven CLI.
+
+## Verification posture
+
+This repository is not relying on a single smoke test. It uses layered verification:
+
+- **Layer 0**: format, lint, and static checks
+- **Layer 1**: library and public API smoke tests
+- **Layer 2**: binary startup and transport seam tests
+- **Layer 3**: semantic regression tests for routing, proxying, rebalance, and transfer behavior
+- **Layer 4**: real-etcd validation
+
+The CI workflow runs Layers 0-4 on normal CI flows, with a dedicated real-etcd job for Layer 4.
+
+Recent kernel hardening also added explicit regression coverage for:
+
+- stale cached route serving after missed updates
+- stale cached lifecycle state serving
+- lease expiry across slow timeline loads
+- lease expiry across slow generator loads
+- process-local monotonic wall-clock behavior
+
+## Fast local validation
 
 ```bash
-cargo run --bin chronos-tso-demo
+cargo check --all-targets
+cargo test --lib
+cargo test --test lifecycle_semantics
+cargo test --test rpc_semantics
 ```
 
-Default listeners:
-
-- gRPC: `CHRONOS_TSO_BIND_ADDR=[::1]:50051`
-- Metrics: `CHRONOS_TSO_METRICS_BIND_ADDR=127.0.0.1:9898`
-
-## Using Etcd as Metadata
+For the full repository validation flow:
 
 ```bash
-export CHRONOS_TSO_METADATA=etcd
-export CHRONOS_TSO_ETCD_ENDPOINTS=127.0.0.1:2379
-export CHRONOS_TSO_ETCD_PREFIX=/chronos-tso
-cargo run --bin chronos-tso-demo
+make test-layer-0
+make test-layer-1
+make test-layer-2
+make test-layer-3
+make test-layer-4
 ```
 
-In the current implementation, hot Etcd writes are limited to:
+## Minimal local run
 
-- generator-level lease / ownership hot state
-- low-frequency timeline routing and migration state updates
-
-## Run Tests
+If `CHRONOS_METADATA` is unset, Chronos runs with in-memory metadata.
 
 ```bash
-cargo test
+export CHRONOS_SECURITY_MODE=dev-insecure
+export CHRONOS_BIND_ADDR=127.0.0.1:50051
+export CHRONOS_ADVERTISE_ENDPOINT=127.0.0.1:50051
+
+cargo run --bin chronos
 ```
 
-Benchmark:
+## Minimal etcd-backed run
 
 ```bash
-cargo run --release --bin chronos-bench
+make etcd-up
+make etcd-health
+
+export CHRONOS_SECURITY_MODE=dev-insecure
+export CHRONOS_METADATA=etcd
+export CHRONOS_BIND_ADDR=127.0.0.1:50051
+export CHRONOS_ETCD_ENDPOINTS=127.0.0.1:2379
+export CHRONOS_ETCD_PREFIX=/chronos-local
+export CHRONOS_WORKER_ID=worker-a
+export CHRONOS_ADVERTISE_ENDPOINT=127.0.0.1:50051
+
+cargo run --bin chronos
 ```
 
-## Configuration
+Layer 4 validation requires Docker / Docker Compose because it boots a local etcd for the test
+run.
 
-Base configuration:
+## Client flow
 
-- `CHRONOS_TSO_BIND_ADDR`
-- `CHRONOS_TSO_METADATA`: `memory` / `etcd`
-- `CHRONOS_TSO_ETCD_ENDPOINTS`
-- `CHRONOS_TSO_ETCD_PREFIX`
-- `CHRONOS_TSO_METRICS_BIND_ADDR`
+The smallest useful remote sequence is:
 
-Core TSO configuration:
+1. `Health`
+2. `EnsureTimeline`
+3. `GetTimelineRoute`
+4. `AllocateTimestamps`
 
-- `CHRONOS_TSO_WORKER_ID`
-- `CHRONOS_TSO_INSTANCE_ID`
-- `CHRONOS_TSO_ADVERTISE_ENDPOINT`
-- `CHRONOS_TSO_SHARED_GENERATORS`
-- `CHRONOS_TSO_WARM_GENERATORS`
-- `CHRONOS_TSO_DEFAULT_RESOURCE_TIER`
-- `CHRONOS_TSO_MAX_BATCH_PER_REQUEST`
-- `CHRONOS_TSO_MAX_FUTURE_BORROW_MS`
-- `CHRONOS_TSO_MAX_CLOCK_REWIND_MS`
-- `CHRONOS_TSO_LEASE_TTL_MS`
-- `CHRONOS_TSO_GENERATOR_LEASE_TTL_MS`
-- `CHRONOS_TSO_GENERATOR_MAINTENANCE_INTERVAL_MS`
-- `CHRONOS_TSO_SHARED_JUMP_AHEAD_THRESHOLD_MS`
-- `CHRONOS_TSO_SAFETY_GAP_MS`
-- `CHRONOS_TSO_ROUTE_CACHE_TTL_MS`
-- `CHRONOS_TSO_MAX_TIMELINE_PROXY_LANES`
-- `CHRONOS_TSO_MAX_TIMELINE_RUNTIME_ENTRIES`
-- `CHRONOS_TSO_GENERATOR_OWNERSHIP_MODULO`
-- `CHRONOS_TSO_GENERATOR_OWNERSHIP_REMAINDER`
+`AllocateTimestamps` must use the `epoch` and `route_version` from the route it is acting on.
+If either becomes stale, the client must refresh the route and retry as a new request.
 
-## Current Implementation Boundaries
+## Current scope and limits
 
-- Guarantees strict monotonicity and linearizability within a single timeline
-- Does not guarantee a strict total order across timelines
-- Allows gaps
-- If multiple clients share one timeline and require “earlier requester gets smaller TSO”, they should use a timeline-scoped serial proxy instead of independent local prefetch pools
+Chronos is already strong on kernel correctness and verification, but this repository is still
+primarily the service/kernel itself.
+
+What is already present:
+
+- explicit startup preflight validation
+- enforced production-profile build identity checks
+- security-mode and TLS validation
+- health / readiness / metrics surfaces
+- layered semantic and real-etcd verification
+
+What is not yet a first-class part of this repository:
+
+- a stable operator CLI surface
+- official deployment artifacts such as Dockerfile / Helm / Kubernetes manifests
+- a fully productized release and deployment layer
+
+## Repository layout
+
+- `src/`: service, runtime, metadata, routing, RPC, startup, and kernel logic
+- `tests/`: semantic and integration regression suites
+- `hack/`: validation helpers and local etcd workflow
+- `.github/workflows/`: layered CI and real-etcd verification
+- `tso.proto`: public protobuf service definition

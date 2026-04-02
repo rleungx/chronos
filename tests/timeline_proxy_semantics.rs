@@ -5,15 +5,31 @@ use tokio::sync::oneshot;
 use tokio::time::{sleep, Duration};
 use tonic::Request;
 
-use chronos_tso::metadata::{GeneratorBatchOp, GeneratorRecord, MemoryMetadataStore, MetadataStore, TimelineBatchOp, TimelineRecord};
-use chronos_tso::metrics;
-use chronos_tso::proto::v1::{
+use chronos::metadata::{
+    ControlPlaneStore, GeneratorBatchOp, GeneratorLeaseAuthority, GeneratorRecord,
+    MemoryMetadataStore, RouteUpdateSource, TimelineAuthority, TimelineBatchOp, TimelineRecord,
+};
+use chronos::metrics;
+use chronos::proto::v1::{
     timestamp_service_server::TimestampService, AllocateTimestampsRequest as ProtoAllocateRequest,
 };
-use chronos_tso::rpc::TsoTimestampService;
-use chronos_tso::timeline_proxy::TimelineScopedAllocator;
-use chronos_tso::{ManualClock, TsoConfig, TsoError, TsoService};
+use chronos::rpc::TsoTimestampService;
+use chronos::timeline_proxy::TimelineScopedAllocator;
+use chronos::{ManualClock, TsoConfig, TsoError, TsoSecurityMode, TsoService};
 use tokio::sync::broadcast;
+
+fn required_test_config(config: TsoConfig) -> TsoConfig {
+    TsoConfig {
+        security_mode: Some(TsoSecurityMode::Required),
+        grpc_tls_cert_file: Some("server.crt".into()),
+        grpc_tls_key_file: Some("server.key".into()),
+        grpc_client_ca_file: Some("ca.pem".into()),
+        grpc_request_timeout_ms: Some(100),
+        grpc_max_request_bytes: Some(1024),
+        grpc_max_concurrent_requests: Some(16),
+        ..config
+    }
+}
 
 #[derive(Clone)]
 struct SlowMetadataStore {
@@ -22,51 +38,98 @@ struct SlowMetadataStore {
 }
 
 #[async_trait]
-impl MetadataStore for SlowMetadataStore {
-    async fn get_record(&self, timeline_key: &str) -> Result<Option<(TimelineRecord, u64)>, TsoError> {
+impl TimelineAuthority for SlowMetadataStore {
+    async fn load_timeline(
+        &self,
+        timeline_key: &str,
+    ) -> Result<Option<(TimelineRecord, u64)>, TsoError> {
         sleep(self.read_delay).await;
-        self.inner.get_record(timeline_key).await
+        self.inner.load_timeline(timeline_key).await
     }
 
-    async fn create_record(&self, timeline_key: &str, record: &TimelineRecord) -> Result<u64, TsoError> {
-        self.inner.create_record(timeline_key, record).await
-    }
-
-    async fn cas_record(&self, timeline_key: &str, previous_revision: u64, record: &TimelineRecord) -> Result<u64, TsoError> {
-        self.inner.cas_record(timeline_key, previous_revision, record).await
-    }
-
-    async fn cas_records_batch(&self, operations: &[TimelineBatchOp]) -> Result<Vec<u64>, TsoError> {
-        self.inner.cas_records_batch(operations).await
-    }
-
-    async fn get_generator_record(&self, generator_id: u32) -> Result<Option<(GeneratorRecord, u64)>, TsoError> {
+    async fn list_timelines(&self) -> Result<Vec<TimelineRecord>, TsoError> {
         sleep(self.read_delay).await;
-        self.inner.get_generator_record(generator_id).await
+        self.inner.list_timelines().await
     }
 
-    async fn create_generator_record(&self, generator_id: u32, record: &GeneratorRecord) -> Result<u64, TsoError> {
-        self.inner.create_generator_record(generator_id, record).await
+    async fn create_timeline(
+        &self,
+        timeline_key: &str,
+        record: &TimelineRecord,
+    ) -> Result<u64, TsoError> {
+        self.inner.create_timeline(timeline_key, record).await
     }
 
-    async fn cas_generator_record(&self, generator_id: u32, previous_revision: u64, record: &GeneratorRecord) -> Result<u64, TsoError> {
-        self.inner.cas_generator_record(generator_id, previous_revision, record).await
+    async fn compare_exchange_timeline(
+        &self,
+        timeline_key: &str,
+        previous_revision: u64,
+        record: &TimelineRecord,
+    ) -> Result<u64, TsoError> {
+        self.inner
+            .compare_exchange_timeline(timeline_key, previous_revision, record)
+            .await
     }
 
-    async fn cas_generator_records_batch(&self, operations: &[GeneratorBatchOp]) -> Result<Vec<u64>, TsoError> {
-        self.inner.cas_generator_records_batch(operations).await
-    }
-
-    fn subscribe_timeline_routes(&self) -> broadcast::Receiver<chronos_tso::TimelineRoute> {
-        self.inner.subscribe_timeline_routes()
+    async fn compare_exchange_timelines(
+        &self,
+        operations: &[TimelineBatchOp],
+    ) -> Result<Vec<u64>, TsoError> {
+        self.inner.compare_exchange_timelines(operations).await
     }
 }
 
-fn max_tso(response: &chronos_tso::proto::v1::AllocateTimestampsResponse) -> u64 {
+#[async_trait]
+impl GeneratorLeaseAuthority for SlowMetadataStore {
+    async fn load_generator(
+        &self,
+        generator_id: u32,
+    ) -> Result<Option<(GeneratorRecord, u64)>, TsoError> {
+        sleep(self.read_delay).await;
+        self.inner.load_generator(generator_id).await
+    }
+
+    async fn create_generator(
+        &self,
+        generator_id: u32,
+        record: &GeneratorRecord,
+    ) -> Result<u64, TsoError> {
+        self.inner.create_generator(generator_id, record).await
+    }
+
+    async fn compare_exchange_generator(
+        &self,
+        generator_id: u32,
+        previous_revision: u64,
+        record: &GeneratorRecord,
+    ) -> Result<u64, TsoError> {
+        self.inner
+            .compare_exchange_generator(generator_id, previous_revision, record)
+            .await
+    }
+
+    async fn compare_exchange_generators(
+        &self,
+        operations: &[GeneratorBatchOp],
+    ) -> Result<Vec<u64>, TsoError> {
+        self.inner.compare_exchange_generators(operations).await
+    }
+}
+
+impl RouteUpdateSource for SlowMetadataStore {
+    fn subscribe_route_updates(&self) -> broadcast::Receiver<chronos::metadata::RouteUpdateSignal> {
+        self.inner.subscribe_route_updates()
+    }
+}
+
+#[async_trait]
+impl ControlPlaneStore for SlowMetadataStore {}
+
+fn max_tso(response: &chronos::proto::v1::AllocateTimestampsResponse) -> u64 {
     response.ranges.last().unwrap().end_tso
 }
 
-fn min_tso(response: &chronos_tso::proto::v1::AllocateTimestampsResponse) -> u64 {
+fn min_tso(response: &chronos::proto::v1::AllocateTimestampsResponse) -> u64 {
     response.ranges.first().unwrap().start_tso
 }
 
@@ -74,8 +137,12 @@ fn min_tso(response: &chronos_tso::proto::v1::AllocateTimestampsResponse) -> u64
 async fn same_timeline_requests_preserve_request_order_at_proxy_ingress() {
     let clock = Arc::new(ManualClock::new(5_000));
     let metadata = Arc::new(MemoryMetadataStore::new());
-    let service = TsoService::new(TsoConfig::default(), clock, metadata).unwrap();
-    let route = service.ensure_timeline("proxy.order.timeline").await.unwrap();
+    let service =
+        TsoService::new(required_test_config(TsoConfig::default()), clock, metadata).unwrap();
+    let route = service
+        .ensure_timeline("proxy.order.timeline")
+        .await
+        .unwrap();
     let rpc = Arc::new(TsoTimestampService::new(service.data_plane()));
 
     let (start_a_tx, start_a_rx) = oneshot::channel();
@@ -131,7 +198,8 @@ async fn same_timeline_requests_preserve_request_order_at_proxy_ingress() {
 async fn different_timelines_do_not_break_independent_allocation() {
     let clock = Arc::new(ManualClock::new(6_000));
     let metadata = Arc::new(MemoryMetadataStore::new());
-    let service = TsoService::new(TsoConfig::default(), clock, metadata).unwrap();
+    let service =
+        TsoService::new(required_test_config(TsoConfig::default()), clock, metadata).unwrap();
     let route_a = service.ensure_timeline("proxy.timeline.a").await.unwrap();
     let route_b = service.ensure_timeline("proxy.timeline.b").await.unwrap();
     let rpc = Arc::new(TsoTimestampService::new(service.data_plane()));
@@ -179,12 +247,16 @@ async fn different_timelines_do_not_break_independent_allocation() {
 async fn proxy_reuses_cached_timeline_lanes() {
     let clock = Arc::new(ManualClock::new(7_000));
     let metadata = Arc::new(MemoryMetadataStore::new());
-    let service = TsoService::new(TsoConfig::default(), clock, metadata).unwrap();
-    let route = service.ensure_timeline("proxy.cleanup.timeline").await.unwrap();
+    let service =
+        TsoService::new(required_test_config(TsoConfig::default()), clock, metadata).unwrap();
+    let route = service
+        .ensure_timeline("proxy.cleanup.timeline")
+        .await
+        .unwrap();
     let allocator = TimelineScopedAllocator::new(service.data_plane());
 
     let response = allocator
-        .allocate_timestamps(chronos_tso::AllocateTimestampsRequest {
+        .allocate_timestamps(chronos::AllocateTimestampsRequest {
             timeline_key: route.timeline_key,
             count: 1,
             expected_epoch: route.epoch,
@@ -198,7 +270,7 @@ async fn proxy_reuses_cached_timeline_lanes() {
     assert_eq!(allocator.serializer_count(), 1);
 
     let second = allocator
-        .allocate_timestamps(chronos_tso::AllocateTimestampsRequest {
+        .allocate_timestamps(chronos::AllocateTimestampsRequest {
             timeline_key: "proxy.cleanup.timeline".to_string(),
             count: 1,
             expected_epoch: route.epoch,
@@ -220,13 +292,13 @@ async fn proxy_prunes_idle_lanes_when_at_capacity() {
         max_timeline_proxy_lanes: 1,
         ..TsoConfig::default()
     };
-    let service = TsoService::new(config, clock, metadata).unwrap();
+    let service = TsoService::new(required_test_config(config), clock, metadata).unwrap();
     let route_a = service.ensure_timeline("proxy.prune.a").await.unwrap();
     let route_b = service.ensure_timeline("proxy.prune.b").await.unwrap();
     let allocator = TimelineScopedAllocator::new(service.data_plane());
 
     allocator
-        .allocate_timestamps(chronos_tso::AllocateTimestampsRequest {
+        .allocate_timestamps(chronos::AllocateTimestampsRequest {
             timeline_key: route_a.timeline_key,
             count: 1,
             expected_epoch: route_a.epoch,
@@ -238,7 +310,7 @@ async fn proxy_prunes_idle_lanes_when_at_capacity() {
     assert_eq!(allocator.serializer_count(), 1);
 
     allocator
-        .allocate_timestamps(chronos_tso::AllocateTimestampsRequest {
+        .allocate_timestamps(chronos::AllocateTimestampsRequest {
             timeline_key: route_b.timeline_key,
             count: 1,
             expected_epoch: route_b.epoch,
@@ -251,39 +323,18 @@ async fn proxy_prunes_idle_lanes_when_at_capacity() {
 }
 
 #[tokio::test]
-async fn proxy_rejects_new_lanes_when_capacity_is_zero() {
+async fn service_rejects_zero_proxy_lane_capacity() {
     let clock = Arc::new(ManualClock::new(9_000));
     let metadata = Arc::new(MemoryMetadataStore::new());
     let config = TsoConfig {
         max_timeline_proxy_lanes: 0,
         ..TsoConfig::default()
     };
-    let service = TsoService::new(config, clock, metadata).unwrap();
-    let route = service.ensure_timeline("proxy.saturated.timeline").await.unwrap();
-    let allocator = TimelineScopedAllocator::new(service.data_plane());
-
-    let before = metrics::TSO_TIMELINE_PROXY_SATURATED_TOTAL.get();
-    let result = allocator
-        .allocate_timestamps(chronos_tso::AllocateTimestampsRequest {
-            timeline_key: route.timeline_key,
-            count: 1,
-            expected_epoch: route.epoch,
-            expected_route_version: route.route_version,
-            client_request_id: "saturated".to_string(),
-        })
-        .await;
-
-    match result {
-        Err(TsoError::TimelineIngressSaturated {
-            timeline_key,
-            max_lanes,
-        }) => {
-            assert_eq!(timeline_key, "proxy.saturated.timeline");
-            assert_eq!(max_lanes, 0);
-        }
-        other => panic!("unexpected saturation result: {:?}", other),
-    }
-    assert!(metrics::TSO_TIMELINE_PROXY_SATURATED_TOTAL.get() >= before + 1);
+    let result = TsoService::new(required_test_config(config), clock, metadata);
+    assert!(matches!(
+        result,
+        Err(TsoError::Internal(message)) if message.contains("max_timeline_proxy_lanes must be greater than 0")
+    ));
 }
 
 #[tokio::test]
@@ -295,26 +346,32 @@ async fn proxy_timeout_does_not_poison_lane_usage_for_pruning() {
         instance_id: "proxy-timeout-instance".to_string(),
         ..TsoConfig::default()
     };
-    let seed_service = TsoService::new(config.clone(), clock.clone(), base_store.clone()).unwrap();
-    let route_a = seed_service.ensure_timeline("proxy.timeout.a").await.unwrap();
-    let route_b = seed_service.ensure_timeline("proxy.timeout.b").await.unwrap();
+    let seed_service = TsoService::new(
+        required_test_config(config.clone()),
+        clock.clone(),
+        base_store.clone(),
+    )
+    .unwrap();
+    let route_a = seed_service
+        .ensure_timeline("proxy.timeout.a")
+        .await
+        .unwrap();
+    let route_b = seed_service
+        .ensure_timeline("proxy.timeout.b")
+        .await
+        .unwrap();
 
     let slow_store = Arc::new(SlowMetadataStore {
         inner: base_store,
         read_delay: Duration::from_millis(50),
     });
-    let service = TsoService::new(
-        config,
-        clock,
-        slow_store,
-    )
-    .unwrap();
+    let service = TsoService::new(required_test_config(config), clock, slow_store).unwrap();
     let allocator = TimelineScopedAllocator::new(service.data_plane());
 
     let before = metrics::TSO_TIMELINE_PROXY_TIMEOUT_TOTAL.get();
     let timeout_result = allocator
         .allocate_timestamps_with_timeout(
-            chronos_tso::AllocateTimestampsRequest {
+            chronos::AllocateTimestampsRequest {
                 timeline_key: route_a.timeline_key,
                 count: 1,
                 expected_epoch: route_a.epoch,
@@ -324,11 +381,14 @@ async fn proxy_timeout_does_not_poison_lane_usage_for_pruning() {
             1,
         )
         .await;
-    assert!(matches!(timeout_result, Err(chronos_tso::timeline_proxy::TimelineProxyError::TimedOut)));
-    assert!(metrics::TSO_TIMELINE_PROXY_TIMEOUT_TOTAL.get() >= before + 1);
+    assert!(matches!(
+        timeout_result,
+        Err(chronos::timeline_proxy::TimelineProxyError::TimedOut)
+    ));
+    assert!(metrics::TSO_TIMELINE_PROXY_TIMEOUT_TOTAL.get() > before);
 
     let response = allocator
-        .allocate_timestamps(chronos_tso::AllocateTimestampsRequest {
+        .allocate_timestamps(chronos::AllocateTimestampsRequest {
             timeline_key: route_b.timeline_key,
             count: 1,
             expected_epoch: route_b.epoch,
@@ -341,4 +401,63 @@ async fn proxy_timeout_does_not_poison_lane_usage_for_pruning() {
     assert_eq!(response.ranges.len(), 1);
     assert_eq!(allocator.serializer_count(), 1);
     assert_eq!(allocator.max_serializers(), 1);
+}
+
+#[tokio::test]
+async fn proxy_timeout_releases_same_timeline_lane_for_follow_up_request() {
+    let clock = Arc::new(ManualClock::new(10_500));
+    let base_store = Arc::new(MemoryMetadataStore::new());
+    let config = TsoConfig {
+        max_timeline_proxy_lanes: 1,
+        instance_id: "proxy-timeout-same-timeline".to_string(),
+        ..TsoConfig::default()
+    };
+    let seed_service = TsoService::new(
+        required_test_config(config.clone()),
+        clock.clone(),
+        base_store.clone(),
+    )
+    .unwrap();
+    let route = seed_service
+        .ensure_timeline("proxy.timeout.same")
+        .await
+        .unwrap();
+
+    let slow_store = Arc::new(SlowMetadataStore {
+        inner: base_store,
+        read_delay: Duration::from_millis(50),
+    });
+    let service = TsoService::new(required_test_config(config), clock, slow_store).unwrap();
+    let allocator = TimelineScopedAllocator::new(service.data_plane());
+
+    let timeout_result = allocator
+        .allocate_timestamps_with_timeout(
+            chronos::AllocateTimestampsRequest {
+                timeline_key: route.timeline_key.clone(),
+                count: 1,
+                expected_epoch: route.epoch,
+                expected_route_version: route.route_version,
+                client_request_id: "timeout-same-a".to_string(),
+            },
+            1,
+        )
+        .await;
+    assert!(matches!(
+        timeout_result,
+        Err(chronos::timeline_proxy::TimelineProxyError::TimedOut)
+    ));
+
+    let response = allocator
+        .allocate_timestamps(chronos::AllocateTimestampsRequest {
+            timeline_key: route.timeline_key,
+            count: 1,
+            expected_epoch: route.epoch,
+            expected_route_version: route.route_version,
+            client_request_id: "timeout-same-b".to_string(),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(response.ranges.len(), 1);
+    assert_eq!(allocator.serializer_count(), 1);
 }

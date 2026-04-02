@@ -2,16 +2,30 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use tokio::time::{timeout, Duration};
 
-use chronos_tso::{
-    decode_tso, metadata::{MemoryMetadataStore, MetadataStore}, AllocateTimestampsRequest,
-    AllocateTimestampsResponse, ManualClock, ResourceTier, TimelineRoute, TransferReason,
-    TsoConfig, TsoError, TsoService,
+use chronos::{
+    decode_tso,
+    metadata::{EtcdMetadataStore, GeneratorLeaseAuthority, MemoryMetadataStore},
+    AllocateTimestampsRequest, AllocateTimestampsResponse, ManualClock, ResourceTier,
+    TimelineRoute, TransferReason, TsoConfig, TsoError, TsoSecurityMode, TsoService,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct IssuedSpan {
     first_tso: u64,
     last_tso: u64,
+}
+
+fn required_test_config(config: TsoConfig) -> TsoConfig {
+    TsoConfig {
+        security_mode: Some(TsoSecurityMode::Required),
+        grpc_tls_cert_file: Some("server.crt".into()),
+        grpc_tls_key_file: Some("server.key".into()),
+        grpc_client_ca_file: Some("ca.pem".into()),
+        grpc_request_timeout_ms: Some(100),
+        grpc_max_request_bytes: Some(1024),
+        grpc_max_concurrent_requests: Some(16),
+        ..config
+    }
 }
 
 async fn service_with_config(
@@ -22,15 +36,48 @@ async fn service_with_config(
     config.max_future_borrow_ms = 10000;
     let clock = Arc::new(ManualClock::new(now_ms));
     let metadata = Arc::new(MemoryMetadataStore::new());
-    let service = TsoService::new(config, clock.clone(), metadata).unwrap();
+    let service = TsoService::new(required_test_config(config), clock.clone(), metadata).unwrap();
     (clock, service)
+}
+
+fn worker_endpoint(worker_id: &str) -> String {
+    format!("{worker_id}:50051")
+}
+
+fn test_etcd_endpoints() -> Vec<String> {
+    std::env::var("CHRONOS_TEST_ETCD_ENDPOINTS")
+        .unwrap_or_else(|_| "127.0.0.1:2379".into())
+        .split(',')
+        .map(|endpoint| endpoint.trim().to_string())
+        .filter(|endpoint| !endpoint.is_empty())
+        .collect()
+}
+
+fn unique_test_etcd_prefix(label: &str) -> String {
+    format!(
+        "/chronos-test-{}-{}-{}",
+        label,
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    )
+}
+
+async fn real_etcd_store(prefix: &str) -> Arc<EtcdMetadataStore> {
+    Arc::new(
+        EtcdMetadataStore::from_raw_endpoints_unchecked(test_etcd_endpoints(), prefix.to_string())
+            .await
+            .expect("etcd store should start"),
+    )
 }
 
 fn with_worker(mut config: TsoConfig, worker_id: &str) -> TsoConfig {
     config.worker_id = worker_id.to_owned();
-    config.advertise_endpoint = worker_id.to_owned();
+    config.advertise_endpoint = worker_endpoint(worker_id);
     config.max_future_borrow_ms = 10000;
-    config
+    required_test_config(config)
 }
 
 fn with_instance_id(mut config: TsoConfig, instance_id: &str) -> TsoConfig {
@@ -375,7 +422,7 @@ async fn rewound_clock_can_continue_on_existing_physical_slot_with_zero_future_b
     };
     let clock = Arc::new(ManualClock::new(10_000));
     let metadata = Arc::new(MemoryMetadataStore::new());
-    let service = TsoService::new(config, clock.clone(), metadata).unwrap();
+    let service = TsoService::new(required_test_config(config), clock.clone(), metadata).unwrap();
 
     let route = service
         .ensure_timeline("clock.rewind.timeline")
@@ -412,7 +459,7 @@ async fn large_safe_floor_jump_auto_isolates_into_dedicated_generator() {
     };
     let clock = Arc::new(ManualClock::new(1_000));
     let metadata = Arc::new(MemoryMetadataStore::new());
-    let service = TsoService::new(config, clock.clone(), metadata).unwrap();
+    let service = TsoService::new(required_test_config(config), clock.clone(), metadata).unwrap();
 
     let shared = service
         .ensure_timeline("shared-floor.anchor")
@@ -594,7 +641,7 @@ async fn decoded_tso_reveals_parallel_timelines_using_distinct_generators() {
 
 #[test]
 fn single_format_tso_decoding_matches_encoder() {
-    let tso = chronos_tso::encode_tso(1_234, 4097, 99).unwrap();
+    let tso = chronos::encode_tso(1_234, 4097, 99).unwrap();
     let decoded = decode_tso(tso);
     assert_eq!(decoded.physical_ms, 1_234);
     assert_eq!(decoded.generator_id, 4097);
@@ -610,6 +657,7 @@ async fn restarting_service_restores_last_issued_floor_from_metadata() {
         max_future_borrow_ms: 10000,
         default_resource_tier: ResourceTier::Shared,
         lease_ttl_ms: 5,
+        generator_maintenance_interval_ms: 1,
         ..TsoConfig::default()
     };
     let clock = Arc::new(ManualClock::new(10_000));
@@ -676,19 +724,28 @@ async fn restarting_service_with_same_instance_id_reuses_local_lease() {
     let clock = Arc::new(ManualClock::new(11_000));
     let metadata = Arc::new(MemoryMetadataStore::new());
 
-    let service_before = TsoService::new(config.clone(), clock.clone(), metadata.clone()).unwrap();
+    let service_before = TsoService::new(
+        required_test_config(config.clone()),
+        clock.clone(),
+        metadata.clone(),
+    )
+    .unwrap();
     let route_before = service_before
         .ensure_timeline("restart.same-instance.timeline")
         .await
         .unwrap();
     let first = service_before
-        .allocate_timestamps(request(&route_before, "before-restart-stable".to_owned(), 4))
+        .allocate_timestamps(request(
+            &route_before,
+            "before-restart-stable".to_owned(),
+            4,
+        ))
         .await
         .unwrap();
     let first_last = first.ranges.last().unwrap().end_tso;
     drop(service_before);
 
-    let service_after = TsoService::new(config, clock, metadata).unwrap();
+    let service_after = TsoService::new(required_test_config(config), clock, metadata).unwrap();
     let route_after = service_after
         .get_timeline_route("restart.same-instance.timeline")
         .await
@@ -715,7 +772,12 @@ async fn transferred_route_is_reloaded_from_metadata_after_restart() {
     let clock = Arc::new(ManualClock::new(12_000));
     let metadata = Arc::new(MemoryMetadataStore::new());
 
-    let service_before = TsoService::new(config.clone(), clock.clone(), metadata.clone()).unwrap();
+    let service_before = TsoService::new(
+        required_test_config(config.clone()),
+        clock.clone(),
+        metadata.clone(),
+    )
+    .unwrap();
     let route_before = service_before
         .ensure_timeline("restart.transfer.timeline")
         .await
@@ -732,7 +794,7 @@ async fn transferred_route_is_reloaded_from_metadata_after_restart() {
         .unwrap();
     drop(service_before);
 
-    let service_after = TsoService::new(config, clock, metadata).unwrap();
+    let service_after = TsoService::new(required_test_config(config), clock, metadata).unwrap();
     let reloaded = service_after
         .get_timeline_route("restart.transfer.timeline")
         .await
@@ -779,12 +841,15 @@ async fn stale_cached_route_from_another_service_returns_route_mismatch_and_refr
         .transfer_timeline(
             &route_a.timeline_key,
             route_a.resource_tier,
-            "worker-b".to_string(),
+            worker_endpoint("worker-b"),
             Some(1),
         )
         .await
         .unwrap();
-    assert_eq!(transferred.owner_worker_endpoint, "worker-b");
+    assert_eq!(
+        transferred.owner_worker_endpoint,
+        worker_endpoint("worker-b")
+    );
 
     let mut route_update_seen = false;
     for _ in 0..5 {
@@ -799,7 +864,10 @@ async fn stale_cached_route_from_another_service_returns_route_mismatch_and_refr
             break;
         }
     }
-    assert!(route_update_seen, "did not observe transferred route update");
+    assert!(
+        route_update_seen,
+        "did not observe transferred route update"
+    );
 
     let stale_result = service_a
         .allocate_timestamps(request(&route_a, "stale-cached-route".to_owned(), 1))
@@ -824,7 +892,7 @@ async fn stale_cached_route_from_another_service_returns_route_mismatch_and_refr
             owner_worker_endpoint,
             ..
         }) => {
-            assert_eq!(owner_worker_endpoint, "worker-b");
+            assert_eq!(owner_worker_endpoint, worker_endpoint("worker-b"));
         }
         other => panic!("unexpected old owner result: {:?}", other),
     }
@@ -939,8 +1007,11 @@ async fn different_worker_cannot_allocate_timeline_without_transfer() {
         .get_timeline_route("owner-fence.timeline")
         .await
         .unwrap();
-    assert_eq!(route.owner_worker_endpoint, "worker-a");
-    assert_eq!(route_from_b.owner_worker_endpoint, "worker-a");
+    assert_eq!(route.owner_worker_endpoint, worker_endpoint("worker-a"));
+    assert_eq!(
+        route_from_b.owner_worker_endpoint,
+        worker_endpoint("worker-a")
+    );
 
     let result = service_b
         .allocate_timestamps(request(&route_from_b, "not-owner".to_owned(), 1))
@@ -950,7 +1021,7 @@ async fn different_worker_cannot_allocate_timeline_without_transfer() {
             owner_worker_endpoint,
             ..
         }) => {
-            assert_eq!(owner_worker_endpoint, "worker-a");
+            assert_eq!(owner_worker_endpoint, worker_endpoint("worker-a"));
         }
         other => panic!("unexpected not owner result: {:?}", other),
     }
@@ -960,6 +1031,7 @@ async fn different_worker_cannot_allocate_timeline_without_transfer() {
 async fn expired_lease_requires_failover_before_issuing_more_tsos() {
     let base = TsoConfig {
         lease_ttl_ms: 5,
+        generator_maintenance_interval_ms: 1,
         max_future_borrow_ms: 10000,
         ..TsoConfig::default()
     };
@@ -999,12 +1071,15 @@ async fn expired_lease_requires_failover_before_issuing_more_tsos() {
         .transfer_timeline(
             &route_a.timeline_key,
             route_a.resource_tier,
-            "worker-b".to_string(),
+            worker_endpoint("worker-b"),
             Some(target_generator_id),
         )
         .await
         .unwrap();
-    assert_eq!(transferred.owner_worker_endpoint, "worker-b");
+    assert_eq!(
+        transferred.owner_worker_endpoint,
+        worker_endpoint("worker-b")
+    );
 
     let second = service_b
         .allocate_timestamps(request(&transferred, "after-failover".to_owned(), 1))
@@ -1014,9 +1089,245 @@ async fn expired_lease_requires_failover_before_issuing_more_tsos() {
 }
 
 #[tokio::test]
+#[ignore = "requires a reachable etcd; set CHRONOS_TEST_ETCD_ENDPOINTS or run one on 127.0.0.1:2379"]
+async fn etcd_expired_lease_requires_failover_before_issuing_more_tsos() {
+    let base = TsoConfig {
+        lease_ttl_ms: 5,
+        generator_maintenance_interval_ms: 1,
+        max_future_borrow_ms: 10_000,
+        ..TsoConfig::default()
+    };
+    let shared_generators = base.shared_generators;
+    let clock = Arc::new(ManualClock::new(24_000));
+    let prefix = unique_test_etcd_prefix("lease-failover");
+    let service_a = TsoService::new(
+        with_worker(base.clone(), "worker-a"),
+        clock.clone(),
+        real_etcd_store(&prefix).await,
+    )
+    .unwrap();
+    let service_b = TsoService::new(
+        with_worker(base, "worker-b"),
+        clock.clone(),
+        real_etcd_store(&prefix).await,
+    )
+    .unwrap();
+
+    let route_a = service_a
+        .ensure_timeline("lease-failover.timeline")
+        .await
+        .unwrap();
+    let first = service_a
+        .allocate_timestamps(request(&route_a, "before-expire".to_owned(), 2))
+        .await
+        .unwrap();
+    let first_last = first.ranges.last().unwrap().end_tso;
+
+    clock.advance(10);
+    let expired = service_a
+        .allocate_timestamps(request(&route_a, "after-expire".to_owned(), 1))
+        .await;
+    match expired {
+        Err(TsoError::LeaseExpired { .. }) => {}
+        other => panic!("unexpected expired lease result: {:?}", other),
+    }
+
+    let target_generator_id = (route_a.generator_id + 1) % shared_generators;
+    let transferred = service_b
+        .transfer_timeline(
+            &route_a.timeline_key,
+            route_a.resource_tier,
+            worker_endpoint("worker-b"),
+            Some(target_generator_id),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        transferred.owner_worker_endpoint,
+        worker_endpoint("worker-b")
+    );
+
+    let second = service_b
+        .allocate_timestamps(request(&transferred, "after-failover".to_owned(), 1))
+        .await
+        .unwrap();
+    assert!(first_last < second.ranges[0].start_tso);
+}
+
+#[tokio::test]
+async fn failover_is_blocked_until_expiry_plus_safety_gap_with_skewed_clocks() {
+    let safety_gap_ms = 5;
+    let base = TsoConfig {
+        lease_ttl_ms: 5,
+        generator_maintenance_interval_ms: 1,
+        safety_gap_ms,
+        max_future_borrow_ms: 10_000,
+        ..TsoConfig::default()
+    };
+    let shared_generators = base.shared_generators;
+    let clock_a = Arc::new(ManualClock::new(25_000));
+    let clock_b = Arc::new(ManualClock::new(25_000));
+    let metadata = Arc::new(MemoryMetadataStore::new());
+    let service_a = TsoService::new(
+        with_worker(base.clone(), "worker-a"),
+        clock_a.clone(),
+        metadata.clone(),
+    )
+    .unwrap();
+    let service_b =
+        TsoService::new(with_worker(base, "worker-b"), clock_b.clone(), metadata).unwrap();
+
+    let route_a = service_a
+        .ensure_timeline("lease-failover-skew.timeline")
+        .await
+        .unwrap();
+    let first = service_a
+        .allocate_timestamps(request(&route_a, "before-skewed-failover".to_owned(), 2))
+        .await
+        .unwrap();
+    let first_last = first.ranges.last().unwrap().end_tso;
+    let lease_expire_at_ms = service_a
+        .load_generator_record(route_a.generator_id)
+        .await
+        .unwrap()
+        .lease_expire_at_ms
+        .unwrap();
+
+    let target_generator_id = (route_a.generator_id + 1) % shared_generators;
+
+    clock_b.set(lease_expire_at_ms + safety_gap_ms - 1);
+    let blocked = service_b
+        .control_plane()
+        .transfer_timeline_for_rpc(
+            &route_a.timeline_key,
+            worker_endpoint("worker-b"),
+            Some(target_generator_id),
+            TransferReason::Failover,
+        )
+        .await;
+    match blocked {
+        Err(TsoError::FailoverRequiresExpiredLease {
+            timeline_key,
+            lease_expire_at_ms: actual_expire_at_ms,
+        }) => {
+            assert_eq!(timeline_key, route_a.timeline_key);
+            assert_eq!(actual_expire_at_ms, lease_expire_at_ms);
+        }
+        other => panic!("unexpected skew-blocked failover result: {:?}", other),
+    }
+
+    clock_b.set(lease_expire_at_ms + safety_gap_ms);
+    let transferred = service_b
+        .control_plane()
+        .transfer_timeline_for_rpc(
+            &route_a.timeline_key,
+            worker_endpoint("worker-b"),
+            Some(target_generator_id),
+            TransferReason::Failover,
+        )
+        .await
+        .unwrap()
+        .0;
+
+    let second = service_b
+        .allocate_timestamps(request(&transferred, "after-skewed-failover".to_owned(), 1))
+        .await
+        .unwrap();
+    assert!(first_last < second.ranges[0].start_tso);
+}
+
+#[tokio::test]
+#[ignore = "requires a reachable etcd; set CHRONOS_TEST_ETCD_ENDPOINTS or run one on 127.0.0.1:2379"]
+async fn etcd_failover_is_blocked_until_expiry_plus_safety_gap_with_skewed_clocks() {
+    let safety_gap_ms = 5;
+    let base = TsoConfig {
+        lease_ttl_ms: 5,
+        generator_maintenance_interval_ms: 1,
+        safety_gap_ms,
+        max_future_borrow_ms: 10_000,
+        ..TsoConfig::default()
+    };
+    let shared_generators = base.shared_generators;
+    let clock_a = Arc::new(ManualClock::new(25_000));
+    let clock_b = Arc::new(ManualClock::new(25_000));
+    let prefix = unique_test_etcd_prefix("lease-failover-skew");
+    let service_a = TsoService::new(
+        with_worker(base.clone(), "worker-a"),
+        clock_a.clone(),
+        real_etcd_store(&prefix).await,
+    )
+    .unwrap();
+    let service_b = TsoService::new(
+        with_worker(base, "worker-b"),
+        clock_b.clone(),
+        real_etcd_store(&prefix).await,
+    )
+    .unwrap();
+
+    let route_a = service_a
+        .ensure_timeline("lease-failover-skew.timeline")
+        .await
+        .unwrap();
+    let first = service_a
+        .allocate_timestamps(request(&route_a, "before-skewed-failover".to_owned(), 2))
+        .await
+        .unwrap();
+    let first_last = first.ranges.last().unwrap().end_tso;
+    let lease_expire_at_ms = service_a
+        .load_generator_record(route_a.generator_id)
+        .await
+        .unwrap()
+        .lease_expire_at_ms
+        .unwrap();
+
+    let target_generator_id = (route_a.generator_id + 1) % shared_generators;
+
+    clock_b.set(lease_expire_at_ms + safety_gap_ms - 1);
+    let blocked = service_b
+        .control_plane()
+        .transfer_timeline_for_rpc(
+            &route_a.timeline_key,
+            worker_endpoint("worker-b"),
+            Some(target_generator_id),
+            TransferReason::Failover,
+        )
+        .await;
+    match blocked {
+        Err(TsoError::FailoverRequiresExpiredLease {
+            timeline_key,
+            lease_expire_at_ms: actual_expire_at_ms,
+        }) => {
+            assert_eq!(timeline_key, route_a.timeline_key);
+            assert_eq!(actual_expire_at_ms, lease_expire_at_ms);
+        }
+        other => panic!("unexpected etcd skew-blocked failover result: {:?}", other),
+    }
+
+    clock_b.set(lease_expire_at_ms + safety_gap_ms);
+    let transferred = service_b
+        .control_plane()
+        .transfer_timeline_for_rpc(
+            &route_a.timeline_key,
+            worker_endpoint("worker-b"),
+            Some(target_generator_id),
+            TransferReason::Failover,
+        )
+        .await
+        .unwrap()
+        .0;
+
+    let second = service_b
+        .allocate_timestamps(request(&transferred, "after-skewed-failover".to_owned(), 1))
+        .await
+        .unwrap();
+    assert!(first_last < second.ranges[0].start_tso);
+}
+
+#[tokio::test]
 async fn failover_recovery_floor_survives_remote_restart_before_first_allocation() {
     let base = TsoConfig {
         lease_ttl_ms: 5,
+        generator_maintenance_interval_ms: 1,
         max_future_borrow_ms: 10_000,
         ..TsoConfig::default()
     };
@@ -1041,7 +1352,7 @@ async fn failover_recovery_floor_survives_remote_restart_before_first_allocation
         .unwrap();
     let first_last = first.ranges.last().unwrap().end_tso;
     let previous_generator = service_a
-        .get_generator_record(route_a.generator_id)
+        .load_generator_record(route_a.generator_id)
         .await
         .unwrap();
     let previous_upper_bound = previous_generator.issued_upper_bound.unwrap();
@@ -1052,7 +1363,7 @@ async fn failover_recovery_floor_survives_remote_restart_before_first_allocation
         .control_plane()
         .transfer_timeline_for_rpc(
             &route_a.timeline_key,
-            "worker-b".to_string(),
+            worker_endpoint("worker-b"),
             Some(target_generator_id),
             TransferReason::Failover,
         )
@@ -1064,7 +1375,10 @@ async fn failover_recovery_floor_survives_remote_restart_before_first_allocation
         .get_timeline_record(&route_a.timeline_key)
         .await
         .unwrap();
-    assert_eq!(persisted.recovery_floor_tso, Some(previous_upper_bound));
+    let persisted_recovery_floor = persisted
+        .recovery_floor_tso
+        .expect("failover should persist a recovery floor");
+    assert!(previous_upper_bound <= persisted_recovery_floor);
 
     let service_b = TsoService::new(with_worker(base, "worker-b"), clock, metadata).unwrap();
     let route_b = service_b
@@ -1080,13 +1394,94 @@ async fn failover_recovery_floor_survives_remote_restart_before_first_allocation
     let resumed = after.ranges[0].start_tso;
 
     assert!(first_last < resumed);
-    assert!(previous_upper_bound < resumed);
+    assert!(persisted_recovery_floor < resumed);
+}
+
+#[tokio::test]
+#[ignore = "requires a reachable etcd; set CHRONOS_TEST_ETCD_ENDPOINTS or run one on 127.0.0.1:2379"]
+async fn etcd_failover_recovery_floor_survives_remote_restart_before_first_allocation() {
+    let base = TsoConfig {
+        lease_ttl_ms: 5,
+        generator_maintenance_interval_ms: 1,
+        max_future_borrow_ms: 10_000,
+        ..TsoConfig::default()
+    };
+    let shared_generators = base.shared_generators;
+    let clock = Arc::new(ManualClock::new(26_000));
+    let prefix = unique_test_etcd_prefix("failover-restart-floor");
+
+    let service_a = TsoService::new(
+        with_worker(base.clone(), "worker-a"),
+        clock.clone(),
+        real_etcd_store(&prefix).await,
+    )
+    .unwrap();
+
+    let route_a = service_a
+        .ensure_timeline("failover.restart.floor.timeline")
+        .await
+        .unwrap();
+    let first = service_a
+        .allocate_timestamps(request(&route_a, "before-failover-restart".to_owned(), 1))
+        .await
+        .unwrap();
+    let first_last = first.ranges.last().unwrap().end_tso;
+    let previous_generator = service_a
+        .load_generator_record(route_a.generator_id)
+        .await
+        .unwrap();
+    let previous_upper_bound = previous_generator.issued_upper_bound.unwrap();
+
+    clock.advance(10);
+    let target_generator_id = (route_a.generator_id + 1) % shared_generators;
+    let transferred = service_a
+        .control_plane()
+        .transfer_timeline_for_rpc(
+            &route_a.timeline_key,
+            worker_endpoint("worker-b"),
+            Some(target_generator_id),
+            TransferReason::Failover,
+        )
+        .await
+        .unwrap()
+        .0;
+
+    let persisted = service_a
+        .get_timeline_record(&route_a.timeline_key)
+        .await
+        .unwrap();
+    let persisted_recovery_floor = persisted
+        .recovery_floor_tso
+        .expect("failover should persist a recovery floor");
+    assert!(previous_upper_bound <= persisted_recovery_floor);
+
+    let service_b = TsoService::new(
+        with_worker(base, "worker-b"),
+        clock,
+        real_etcd_store(&prefix).await,
+    )
+    .unwrap();
+    let route_b = service_b
+        .get_timeline_route("failover.restart.floor.timeline")
+        .await
+        .unwrap();
+    assert_eq!(route_b.route_version, transferred.route_version);
+
+    let after = service_b
+        .allocate_timestamps(request(&route_b, "after-failover-restart".to_owned(), 1))
+        .await
+        .unwrap();
+    let resumed = after.ranges[0].start_tso;
+
+    assert!(first_last < resumed);
+    assert!(persisted_recovery_floor < resumed);
 }
 
 #[tokio::test]
 async fn remote_transfer_recovery_floor_uses_max_of_graceful_and_generator_floor() {
     let base = TsoConfig {
         lease_ttl_ms: 100,
+        generator_maintenance_interval_ms: 10,
         max_future_borrow_ms: 10_000,
         ..TsoConfig::default()
     };
@@ -1111,7 +1506,7 @@ async fn remote_transfer_recovery_floor_uses_max_of_graceful_and_generator_floor
         .unwrap();
     let first_last = first.ranges.last().unwrap().end_tso;
     let previous_generator = service_a
-        .get_generator_record(route_a.generator_id)
+        .load_generator_record(route_a.generator_id)
         .await
         .unwrap();
     let previous_upper_bound = previous_generator.issued_upper_bound.unwrap();
@@ -1121,7 +1516,7 @@ async fn remote_transfer_recovery_floor_uses_max_of_graceful_and_generator_floor
         .transfer_timeline(
             &route_a.timeline_key,
             route_a.resource_tier,
-            "worker-b".to_string(),
+            worker_endpoint("worker-b"),
             Some(target_generator_id),
         )
         .await
@@ -1132,7 +1527,10 @@ async fn remote_transfer_recovery_floor_uses_max_of_graceful_and_generator_floor
         .await
         .unwrap();
     assert_eq!(persisted.last_graceful_issued, Some(first_last));
-    assert_eq!(persisted.recovery_floor_tso, Some(previous_upper_bound));
+    let persisted_recovery_floor = persisted
+        .recovery_floor_tso
+        .expect("transfer should persist a recovery floor");
+    assert!(previous_upper_bound <= persisted_recovery_floor);
 
     let service_b = TsoService::new(with_worker(base, "worker-b"), clock, metadata).unwrap();
     let route_b = service_b
@@ -1148,13 +1546,92 @@ async fn remote_transfer_recovery_floor_uses_max_of_graceful_and_generator_floor
     let resumed = after.ranges[0].start_tso;
 
     assert!(first_last < resumed);
-    assert!(previous_upper_bound < resumed);
+    assert!(persisted_recovery_floor < resumed);
+}
+
+#[tokio::test]
+#[ignore = "requires a reachable etcd; set CHRONOS_TEST_ETCD_ENDPOINTS or run one on 127.0.0.1:2379"]
+async fn etcd_remote_transfer_recovery_floor_uses_max_of_graceful_and_generator_floor() {
+    let base = TsoConfig {
+        lease_ttl_ms: 100,
+        generator_maintenance_interval_ms: 10,
+        max_future_borrow_ms: 10_000,
+        ..TsoConfig::default()
+    };
+    let shared_generators = base.shared_generators;
+    let clock = Arc::new(ManualClock::new(27_000));
+    let prefix = unique_test_etcd_prefix("transfer-restart-floor");
+
+    let service_a = TsoService::new(
+        with_worker(base.clone(), "worker-a"),
+        clock.clone(),
+        real_etcd_store(&prefix).await,
+    )
+    .unwrap();
+
+    let route_a = service_a
+        .ensure_timeline("transfer.restart.floor.timeline")
+        .await
+        .unwrap();
+    let first = service_a
+        .allocate_timestamps(request(&route_a, "before-transfer-restart".to_owned(), 1))
+        .await
+        .unwrap();
+    let first_last = first.ranges.last().unwrap().end_tso;
+    let previous_generator = service_a
+        .load_generator_record(route_a.generator_id)
+        .await
+        .unwrap();
+    let previous_upper_bound = previous_generator.issued_upper_bound.unwrap();
+
+    let target_generator_id = (route_a.generator_id + 1) % shared_generators;
+    let transferred = service_a
+        .transfer_timeline(
+            &route_a.timeline_key,
+            route_a.resource_tier,
+            worker_endpoint("worker-b"),
+            Some(target_generator_id),
+        )
+        .await
+        .unwrap();
+
+    let persisted = service_a
+        .get_timeline_record(&route_a.timeline_key)
+        .await
+        .unwrap();
+    assert_eq!(persisted.last_graceful_issued, Some(first_last));
+    let persisted_recovery_floor = persisted
+        .recovery_floor_tso
+        .expect("transfer should persist a recovery floor");
+    assert!(previous_upper_bound <= persisted_recovery_floor);
+
+    let service_b = TsoService::new(
+        with_worker(base, "worker-b"),
+        clock,
+        real_etcd_store(&prefix).await,
+    )
+    .unwrap();
+    let route_b = service_b
+        .get_timeline_route("transfer.restart.floor.timeline")
+        .await
+        .unwrap();
+    assert_eq!(route_b.route_version, transferred.route_version);
+
+    let after = service_b
+        .allocate_timestamps(request(&route_b, "after-transfer-restart".to_owned(), 1))
+        .await
+        .unwrap();
+    let resumed = after.ranges[0].start_tso;
+
+    assert!(first_last < resumed);
+    assert!(persisted_recovery_floor < resumed);
 }
 
 #[tokio::test]
 async fn failover_requires_persisted_previous_generator_floor() {
     let base = TsoConfig {
         lease_ttl_ms: 5,
+        generator_maintenance_interval_ms: 1,
         max_future_borrow_ms: 10_000,
         ..TsoConfig::default()
     };
@@ -1181,14 +1658,14 @@ async fn failover_requires_persisted_previous_generator_floor() {
         .unwrap();
 
     let (mut generator_record, revision) = metadata
-        .get_generator_record(route.generator_id)
+        .load_generator(route.generator_id)
         .await
         .unwrap()
         .unwrap();
     generator_record.last_issued_tso = None;
     generator_record.issued_upper_bound = None;
     metadata
-        .cas_generator_record(route.generator_id, revision, &generator_record)
+        .compare_exchange_generator(route.generator_id, revision, &generator_record)
         .await
         .unwrap();
 
@@ -1197,7 +1674,7 @@ async fn failover_requires_persisted_previous_generator_floor() {
         .control_plane()
         .transfer_timeline_for_rpc(
             &route.timeline_key,
-            "worker-b".to_string(),
+            worker_endpoint("worker-b"),
             Some((route.generator_id + 1) % shared_generators),
             TransferReason::Failover,
         )
@@ -1226,7 +1703,7 @@ async fn timeline_runtime_cache_respects_capacity() {
     );
     let clock = Arc::new(ManualClock::new(29_000));
     let metadata = Arc::new(MemoryMetadataStore::new());
-    let service = TsoService::new(config, clock, metadata).unwrap();
+    let service = TsoService::new(required_test_config(config), clock, metadata).unwrap();
 
     let first = service.ensure_timeline("runtime-cap.a").await.unwrap();
     assert_eq!(service.health().timeline_count, 1);
@@ -1248,7 +1725,7 @@ async fn evicted_timeline_reloads_without_tso_regression() {
     );
     let clock = Arc::new(ManualClock::new(30_000));
     let metadata = Arc::new(MemoryMetadataStore::new());
-    let service = TsoService::new(config, clock, metadata).unwrap();
+    let service = TsoService::new(required_test_config(config), clock, metadata).unwrap();
 
     let route_a = service.ensure_timeline("runtime-evict.a").await.unwrap();
     let first = service
@@ -1280,23 +1757,30 @@ async fn owner_can_renew_lease_before_expiry() {
     let config = with_worker(
         TsoConfig {
             lease_ttl_ms: 100,
+            generator_maintenance_interval_ms: 10,
             ..TsoConfig::default()
         },
         "worker-a",
     );
     let clock = Arc::new(ManualClock::new(25_000));
     let metadata = Arc::new(MemoryMetadataStore::new());
-    let service = TsoService::new(config, clock.clone(), metadata).unwrap();
+    let service = TsoService::new(required_test_config(config), clock.clone(), metadata).unwrap();
 
     let route = service.ensure_timeline("renew.timeline").await.unwrap();
-    let before = service.get_generator_record(route.generator_id).await.unwrap();
+    let before = service
+        .load_generator_record(route.generator_id)
+        .await
+        .unwrap();
     clock.advance(10);
     service
         .renew_timeline_lease("renew.timeline")
         .await
         .unwrap();
-    let after = service.get_generator_record(route.generator_id).await.unwrap();
+    let after = service
+        .load_generator_record(route.generator_id)
+        .await
+        .unwrap();
 
     assert!(after.lease_expire_at_ms.unwrap() > before.lease_expire_at_ms.unwrap());
-    assert_eq!(after.owner_worker_endpoint, "worker-a");
+    assert_eq!(after.owner_worker_endpoint, worker_endpoint("worker-a"));
 }
