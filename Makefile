@@ -35,19 +35,13 @@ test-layer-0:
 	cargo clippy --all-targets -- -D warnings
 
 test-layer-1:
-	cargo test --lib
-	cargo test --test crate_root_api_smoke
-	cargo test --test tso_planes_public_api
-	cargo test --test lifecycle_semantics
+	cargo test --lib --test crate_root_api_smoke --test tso_planes_public_api --test lifecycle_semantics
 
 test-layer-2:
 	cargo test --bin chronos
 
 test-layer-3:
-	cargo test --test metadata_etcd_compat
-	cargo test --test rpc_semantics
-	cargo test --test timeline_proxy_semantics
-	cargo test --test timeline_rebalance_and_scaling
+	cargo test --test metadata_etcd_compat --test rpc_semantics --test timeline_proxy_semantics --test timeline_rebalance_and_scaling
 
 test-layer-4:
 	CHRONOS_TEST_ETCD_ENDPOINTS=$(ETCD_ENDPOINTS) bash hack/validate-layer-4.sh

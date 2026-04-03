@@ -22,6 +22,24 @@ pub(super) fn status_with_error_detail(code: Code, err: TsoError) -> Status {
     )
 }
 
+pub(super) fn invalid_argument_status_with_detail(message: impl Into<String>) -> Status {
+    let message = message.into();
+    let detail = ErrorDetail {
+        code: ErrorCode::InvalidArgument as i32,
+        message: message.clone(),
+        current_epoch: 0,
+        current_route_version: 0,
+        redirect_endpoint: String::new(),
+        action_blocker: OperatorActionBlocker::Unspecified as i32,
+        next_step: OperatorActionNextStep::Unspecified as i32,
+    };
+    Status::with_details(
+        Code::InvalidArgument,
+        message,
+        prost::bytes::Bytes::from(detail.encode_to_vec()),
+    )
+}
+
 pub(super) fn map_tso_error(err: TsoError) -> Status {
     match err {
         TsoError::TimelineNotFound { .. } => status_with_error_detail(Code::NotFound, err),
@@ -215,6 +233,16 @@ mod tests {
         assert_eq!(status.code(), Code::FailedPrecondition);
         assert_eq!(detail.code, ErrorCode::NotTimelineOwner as i32);
         assert_eq!(detail.redirect_endpoint, "worker-b:50051");
+    }
+
+    #[test]
+    fn invalid_argument_status_with_detail_uses_structured_payload() {
+        let status = invalid_argument_status_with_detail("page_token is malformed");
+        let detail = ErrorDetail::decode(status.details()).expect("error detail should decode");
+
+        assert_eq!(status.code(), Code::InvalidArgument);
+        assert_eq!(detail.code, ErrorCode::InvalidArgument as i32);
+        assert_eq!(detail.message, "page_token is malformed");
     }
 
     #[test]

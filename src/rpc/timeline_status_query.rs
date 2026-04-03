@@ -7,7 +7,7 @@ use crate::proto::v1::{
 };
 use crate::{TimelineLifecycleState, TsoControlPlane};
 
-use super::{status_mapping, translation};
+use super::{public_mapping, status_mapping, translation};
 
 const DEFAULT_TIMELINE_STATUS_PAGE_SIZE: usize = 100;
 const MAX_TIMELINE_STATUS_PAGE_SIZE: usize = 1000;
@@ -92,9 +92,11 @@ fn normalize_timeline_status_list_request(
 
     let owner_worker_endpoint = request.owner_worker_endpoint;
     if owner_worker_endpoint.as_deref() == Some("") {
-        return Err(Box::new(Status::invalid_argument(
-            "owner_worker_endpoint must not be empty when present",
-        )));
+        return Err(Box::new(
+            public_mapping::invalid_argument_status_with_detail(
+                "owner_worker_endpoint must not be empty when present",
+            ),
+        ));
     }
 
     let page_size = match request.page_size {
@@ -107,7 +109,7 @@ fn normalize_timeline_status_list_request(
     } else {
         let token: TimelineStatusPageToken =
             serde_json::from_str(&request.page_token).map_err(|_| {
-                Box::new(Status::invalid_argument(
+                Box::new(public_mapping::invalid_argument_status_with_detail(
                     "page_token is malformed or not issued by this server",
                 ))
             })?;
@@ -116,9 +118,11 @@ fn normalize_timeline_status_list_request(
             || token.owner_worker_endpoint != owner_worker_endpoint
             || token.last_timeline_key.is_empty()
         {
-            return Err(Box::new(Status::invalid_argument(
-                "page_token is stale or does not match the current filter shape",
-            )));
+            return Err(Box::new(
+                public_mapping::invalid_argument_status_with_detail(
+                    "page_token is stale or does not match the current filter shape",
+                ),
+            ));
         }
         Some(token.last_timeline_key)
     };
@@ -157,15 +161,20 @@ fn decode_timeline_state_filter(state: i32) -> Result<TimelineLifecycleState, Bo
         Ok(ProtoTimelineState::Draining) => Ok(TimelineLifecycleState::Draining),
         Ok(ProtoTimelineState::Locked) => Ok(TimelineLifecycleState::Locked),
         Ok(ProtoTimelineState::Recovering) => Ok(TimelineLifecycleState::Recovering),
-        Ok(ProtoTimelineState::Unspecified) | Err(_) => Err(Box::new(Status::invalid_argument(
-            "states must not contain TIMELINE_STATE_UNSPECIFIED",
-        ))),
+        Ok(ProtoTimelineState::Unspecified) | Err(_) => Err(Box::new(
+            public_mapping::invalid_argument_status_with_detail(
+                "states must not contain TIMELINE_STATE_UNSPECIFIED",
+            ),
+        )),
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use prost::Message;
+
     use super::*;
+    use crate::proto::v1::{ErrorCode, ErrorDetail};
 
     #[test]
     fn normalize_list_request_dedups_states_and_applies_default_page_size() {
@@ -225,5 +234,47 @@ mod tests {
             error.message(),
             "page_token is stale or does not match the current filter shape"
         );
+        let detail = ErrorDetail::decode(error.details()).expect("error detail should decode");
+        assert_eq!(detail.code, ErrorCode::InvalidArgument as i32);
+    }
+
+    #[test]
+    fn normalize_list_request_rejects_empty_owner_with_error_detail() {
+        let error = normalize_timeline_status_list_request(ListTimelineStatusesRequest {
+            states: vec![],
+            owner_worker_endpoint: Some(String::new()),
+            page_size: 1,
+            page_token: String::new(),
+        })
+        .expect_err("request should be rejected");
+
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        let detail = ErrorDetail::decode(error.details()).expect("error detail should decode");
+        assert_eq!(detail.code, ErrorCode::InvalidArgument as i32);
+    }
+
+    #[test]
+    fn normalize_list_request_rejects_malformed_page_token_with_error_detail() {
+        let error = normalize_timeline_status_list_request(ListTimelineStatusesRequest {
+            states: vec![],
+            owner_worker_endpoint: None,
+            page_size: 1,
+            page_token: "not-json".into(),
+        })
+        .expect_err("request should be rejected");
+
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        let detail = ErrorDetail::decode(error.details()).expect("error detail should decode");
+        assert_eq!(detail.code, ErrorCode::InvalidArgument as i32);
+    }
+
+    #[test]
+    fn decode_timeline_state_filter_rejects_unspecified_with_error_detail() {
+        let error = decode_timeline_state_filter(ProtoTimelineState::Unspecified as i32)
+            .expect_err("state filter should be rejected");
+
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        let detail = ErrorDetail::decode(error.details()).expect("error detail should decode");
+        assert_eq!(detail.code, ErrorCode::InvalidArgument as i32);
     }
 }

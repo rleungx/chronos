@@ -61,10 +61,12 @@ assert_target_contains_tests() {
 require_local_endpoints_or_override
 
 assert_target_contains_tests --lib -- \
-  etcd_route_watch_shutdown_completes
+  etcd_route_watch_shutdown_completes \
+  etcd_list_timeline_statuses_supports_authoritative_inventory_scan
 assert_target_contains_tests --bin chronos -- \
   etcd_identity_lease_loss_flips_readiness_and_triggers_shutdown \
   etcd_startup_rejects_duplicate_instance_identity \
+  etcd_startup_failure_after_identity_lease_revokes_lease \
   etcd_cluster_contract_key_is_created_on_binary_startup \
   etcd_cluster_contract_mismatch_rejects_binary_startup
 assert_target_contains_tests --test metadata_etcd_compat -- \
@@ -88,9 +90,11 @@ assert_target_contains_tests --test multiprocess_etcd_startup -- \
   etcd_spawned_process_rejects_duplicate_instance_identity \
   etcd_spawned_process_failover_preserves_tso_monotonicity
 
-run cargo test --lib etcd_ -- --ignored --test-threads=1
-run cargo test --bin chronos etcd_ -- --ignored --test-threads=1
-run cargo test --test metadata_etcd_compat etcd_ -- --ignored --test-threads=1
-run cargo test --test rpc_semantics etcd_ -- --ignored --test-threads=1
-run cargo test --test timeline_rebalance_and_scaling etcd_ -- --ignored --test-threads=1
-run cargo test --test multiprocess_etcd_startup etcd_ -- --ignored --test-threads=1
+run cargo test \
+  --lib \
+  --bin chronos \
+  --test metadata_etcd_compat \
+  --test rpc_semantics \
+  --test timeline_rebalance_and_scaling \
+  --test multiprocess_etcd_startup \
+  etcd_ -- --ignored --test-threads=1

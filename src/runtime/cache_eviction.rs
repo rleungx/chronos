@@ -21,14 +21,17 @@ pub(super) struct TimelineCacheStore {
     access_counter: AtomicU64,
     eviction_generation_counter: AtomicU64,
     entry_count: AtomicUsize,
-    capacity_lock: StdMutex<()>,
-    eviction_generations: StdMutex<HashMap<String, u64>>,
-    eviction_candidates: StdMutex<BinaryHeap<Reverse<(u64, u64, String)>>>,
+    capacity_lock: StdMutex<CapacityState>,
 }
 
 struct TimelineCacheEntry {
     timeline: Arc<Mutex<TimelineState>>,
     last_access_tick: AtomicU64,
+}
+
+struct CapacityState {
+    eviction_generations: HashMap<String, u64>,
+    eviction_candidates: BinaryHeap<Reverse<(u64, u64, String)>>,
 }
 
 impl TimelineCacheStore {
@@ -39,9 +42,10 @@ impl TimelineCacheStore {
             access_counter: AtomicU64::new(1),
             eviction_generation_counter: AtomicU64::new(1),
             entry_count: AtomicUsize::new(0),
-            capacity_lock: StdMutex::new(()),
-            eviction_generations: StdMutex::new(HashMap::new()),
-            eviction_candidates: StdMutex::new(BinaryHeap::new()),
+            capacity_lock: StdMutex::new(CapacityState {
+                eviction_generations: HashMap::new(),
+                eviction_candidates: BinaryHeap::new(),
+            }),
         }
     }
 
@@ -93,7 +97,7 @@ impl TimelineCacheStore {
             .with_label_values(&["miss"])
             .inc();
 
-        let _capacity = self.capacity_lock();
+        let mut capacity = self.capacity_lock();
         if let Some(existing) = self.timelines.get(timeline_key) {
             let access_tick = self.next_access_tick();
             existing
@@ -102,7 +106,7 @@ impl TimelineCacheStore {
             return Ok(existing.timeline.clone());
         }
 
-        if self.timeline_count() >= self.max_entries && !self.evict_one_idle_entry() {
+        if self.timeline_count() >= self.max_entries && !self.evict_one_idle_entry(&mut capacity) {
             metrics::TSO_TIMELINE_RUNTIME_CACHE_EVENTS_TOTAL
                 .with_label_values(&["saturated"])
                 .inc();
@@ -129,7 +133,7 @@ impl TimelineCacheStore {
                 });
                 self.entry_count.fetch_add(1, AtomicOrdering::AcqRel);
                 self.set_entry_count_metric();
-                self.record_eviction_candidate(timeline_key, access_tick);
+                self.record_eviction_candidate(&mut capacity, timeline_key, access_tick);
                 Ok(timeline)
             }
         }
@@ -152,7 +156,7 @@ impl TimelineCacheStore {
             return Ok(());
         }
 
-        let _capacity = self.capacity_lock();
+        let mut capacity = self.capacity_lock();
         if let Some(mut existing) = self.timelines.get_mut(&timeline_key) {
             let access_tick = self.next_access_tick();
             existing.timeline = timeline;
@@ -162,7 +166,7 @@ impl TimelineCacheStore {
             return Ok(());
         }
 
-        if self.timeline_count() >= self.max_entries && !self.evict_one_idle_entry() {
+        if self.timeline_count() >= self.max_entries && !self.evict_one_idle_entry(&mut capacity) {
             metrics::TSO_TIMELINE_RUNTIME_CACHE_EVENTS_TOTAL
                 .with_label_values(&["saturated"])
                 .inc();
@@ -193,27 +197,27 @@ impl TimelineCacheStore {
                 });
                 self.entry_count.fetch_add(1, AtomicOrdering::AcqRel);
                 self.set_entry_count_metric();
-                self.record_eviction_candidate(&timeline_key, access_tick);
+                self.record_eviction_candidate(&mut capacity, &timeline_key, access_tick);
             }
         }
         Ok(())
     }
 
     pub(super) fn remove_timeline(&self, timeline_key: &str) {
-        let _capacity = self.capacity_lock();
+        let mut capacity = self.capacity_lock();
         if self.timelines.remove(timeline_key).is_some() {
-            self.remove_eviction_generation(timeline_key);
-            self.maybe_compact_eviction_candidates();
+            self.remove_eviction_generation(&mut capacity, timeline_key);
+            self.maybe_compact_eviction_candidates(&mut capacity);
             self.entry_count.fetch_sub(1, AtomicOrdering::AcqRel);
             self.set_entry_count_metric();
         }
     }
 
     pub(super) fn clear(&self) {
-        let _capacity = self.capacity_lock();
+        let mut capacity = self.capacity_lock();
         self.timelines.clear();
-        self.eviction_generations_lock().clear();
-        self.eviction_candidates_lock().clear();
+        capacity.eviction_generations.clear();
+        capacity.eviction_candidates.clear();
         self.entry_count.store(0, AtomicOrdering::Release);
         self.set_entry_count_metric();
     }
@@ -226,18 +230,23 @@ impl TimelineCacheStore {
         metrics::TSO_TIMELINE_RUNTIME_CACHE_ENTRIES.set(self.timeline_count() as i64);
     }
 
-    fn record_eviction_candidate(&self, timeline_key: &str, access_tick: u64) {
-        let generation = self.ensure_eviction_generation(timeline_key);
-        self.eviction_candidates_lock().push(Reverse((
+    fn record_eviction_candidate(
+        &self,
+        capacity: &mut CapacityState,
+        timeline_key: &str,
+        access_tick: u64,
+    ) {
+        let generation = self.ensure_eviction_generation(capacity, timeline_key);
+        capacity.eviction_candidates.push(Reverse((
             access_tick,
             generation,
             timeline_key.to_owned(),
         )));
     }
 
-    fn ensure_eviction_generation(&self, timeline_key: &str) -> u64 {
-        let mut generations = self.eviction_generations_lock();
-        *generations
+    fn ensure_eviction_generation(&self, capacity: &mut CapacityState, timeline_key: &str) -> u64 {
+        *capacity
+            .eviction_generations
             .entry(timeline_key.to_owned())
             .or_insert_with(|| {
                 self.eviction_generation_counter
@@ -245,12 +254,12 @@ impl TimelineCacheStore {
             })
     }
 
-    fn remove_eviction_generation(&self, timeline_key: &str) {
-        self.eviction_generations_lock().remove(timeline_key);
+    fn remove_eviction_generation(&self, capacity: &mut CapacityState, timeline_key: &str) {
+        capacity.eviction_generations.remove(timeline_key);
     }
 
-    fn maybe_compact_eviction_candidates(&self) {
-        let heap_len = self.eviction_candidates_lock().len();
+    fn maybe_compact_eviction_candidates(&self, capacity: &mut CapacityState) {
+        let heap_len = capacity.eviction_candidates.len();
         let live_entries = self.timeline_count();
         if live_entries == 0 {
             if heap_len == 0 {
@@ -263,52 +272,58 @@ impl TimelineCacheStore {
             }
         }
 
-        let generations = self.eviction_generations_lock();
-        let mut heap = self.eviction_candidates_lock();
-        let retained: BinaryHeap<_> = heap
+        let retained: BinaryHeap<_> = capacity
+            .eviction_candidates
             .drain()
             .filter(|Reverse((_, generation, candidate_key))| {
-                generations
+                capacity
+                    .eviction_generations
                     .get(candidate_key)
                     .is_some_and(|current_generation| *current_generation == *generation)
             })
             .collect();
-        *heap = retained;
+        capacity.eviction_candidates = retained;
     }
 
-    fn evict_one_idle_entry(&self) -> bool {
+    fn evict_one_idle_entry(&self, capacity: &mut CapacityState) -> bool {
         let mut deferred = Vec::new();
-        if self.try_evict_idle_entry_batch(EVICTION_CANDIDATE_BATCH_LIMIT, &mut deferred) {
+        if self.try_evict_idle_entry_batch(capacity, EVICTION_CANDIDATE_BATCH_LIMIT, &mut deferred)
+        {
             return true;
         }
 
-        self.maybe_compact_eviction_candidates();
-        if self.try_evict_idle_entry_batch(EVICTION_CANDIDATE_BATCH_LIMIT, &mut deferred) {
-            self.eviction_candidates_lock().extend(deferred.drain(..));
+        self.maybe_compact_eviction_candidates(capacity);
+        if self.try_evict_idle_entry_batch(capacity, EVICTION_CANDIDATE_BATCH_LIMIT, &mut deferred)
+        {
+            capacity.eviction_candidates.extend(deferred.drain(..));
             return true;
         }
 
-        self.eviction_candidates_lock().extend(deferred.drain(..));
+        capacity.eviction_candidates.extend(deferred.drain(..));
         let mut retried_deferred = Vec::new();
-        let evicted =
-            self.try_evict_idle_entry_batch(EVICTION_CANDIDATE_BATCH_LIMIT, &mut retried_deferred);
-        self.eviction_candidates_lock()
+        let evicted = self.try_evict_idle_entry_batch(
+            capacity,
+            EVICTION_CANDIDATE_BATCH_LIMIT,
+            &mut retried_deferred,
+        );
+        capacity
+            .eviction_candidates
             .extend(retried_deferred.drain(..));
         evicted
     }
 
     fn try_evict_idle_entry_batch(
         &self,
+        capacity: &mut CapacityState,
         attempts: usize,
         deferred: &mut Vec<Reverse<(u64, u64, String)>>,
     ) -> bool {
-        let initial_len = self.eviction_candidates_lock().len().min(attempts);
+        let initial_len = capacity.eviction_candidates.len().min(attempts);
         for _ in 0..initial_len {
-            let Some(Reverse((tick, generation, key))) = self.eviction_candidates_lock().pop()
-            else {
+            let Some(Reverse((tick, generation, key))) = capacity.eviction_candidates.pop() else {
                 break;
             };
-            let current_generation = self.eviction_generations_lock().get(&key).copied();
+            let current_generation = capacity.eviction_generations.get(&key).copied();
             if current_generation != Some(generation) {
                 continue;
             }
@@ -325,9 +340,9 @@ impl TimelineCacheStore {
             }
 
             let removed = self.timelines.remove(&key).is_some();
-            self.remove_eviction_generation(&key);
+            self.remove_eviction_generation(capacity, &key);
             if removed {
-                self.eviction_candidates_lock().extend(deferred.drain(..));
+                capacity.eviction_candidates.extend(deferred.drain(..));
                 self.entry_count.fetch_sub(1, AtomicOrdering::AcqRel);
                 metrics::TSO_TIMELINE_RUNTIME_CACHE_EVENTS_TOTAL
                     .with_label_values(&["evicted_idle"])
@@ -339,7 +354,7 @@ impl TimelineCacheStore {
         false
     }
 
-    fn capacity_lock(&self) -> StdMutexGuard<'_, ()> {
+    fn capacity_lock(&self) -> StdMutexGuard<'_, CapacityState> {
         match self.capacity_lock.lock() {
             Ok(guard) => guard,
             Err(poisoned) => {
@@ -349,26 +364,9 @@ impl TimelineCacheStore {
         }
     }
 
-    fn eviction_generations_lock(&self) -> StdMutexGuard<'_, HashMap<String, u64>> {
-        match self.eviction_generations.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => {
-                record_recovery_event("runtime", "timeline_eviction_generations", "mutex_poisoned");
-                poisoned.into_inner()
-            }
-        }
-    }
-
-    fn eviction_candidates_lock(
-        &self,
-    ) -> StdMutexGuard<'_, BinaryHeap<Reverse<(u64, u64, String)>>> {
-        match self.eviction_candidates.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => {
-                record_recovery_event("runtime", "timeline_eviction_candidates", "mutex_poisoned");
-                poisoned.into_inner()
-            }
-        }
+    #[cfg(test)]
+    fn eviction_candidate_count(&self) -> usize {
+        self.capacity_lock().eviction_candidates.len()
     }
 }
 
@@ -632,7 +630,7 @@ mod tests {
             drop(handle);
         }
 
-        assert_eq!(runtime.eviction_candidates_lock().len(), 1);
+        assert_eq!(runtime.eviction_candidate_count(), 1);
     }
 
     #[test]
@@ -649,9 +647,11 @@ mod tests {
             runtime.remove_timeline("runtime-churn.a");
         }
 
-        assert!(runtime.eviction_candidates_lock().len() <= 16);
-        runtime.maybe_compact_eviction_candidates();
-        assert_eq!(runtime.eviction_candidates_lock().len(), 0);
+        assert!(runtime.eviction_candidate_count() <= 16);
+        let mut capacity = runtime.capacity_lock();
+        runtime.maybe_compact_eviction_candidates(&mut capacity);
+        drop(capacity);
+        assert_eq!(runtime.eviction_candidate_count(), 0);
     }
 
     #[test]
