@@ -126,6 +126,7 @@ export CHRONOS_ETCD_ENDPOINTS=127.0.0.1:2379
 export CHRONOS_ETCD_PREFIX=/chronos-local
 export CHRONOS_WORKER_ID=worker-a
 export CHRONOS_ADVERTISE_ENDPOINT=127.0.0.1:50051
+export CHRONOS_SAFETY_GAP_MS=1
 
 cargo run --bin chronos
 ```
