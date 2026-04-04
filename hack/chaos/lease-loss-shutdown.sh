@@ -46,6 +46,7 @@ fi
 
 CHRONOS_PID=""
 RESULT="failure"
+RELEASE_BIN_DIR="${REPO_ROOT}/target/release"
 
 write_summary() {
   [[ -n "${SUMMARY_LOG}" ]] || return 0
@@ -86,10 +87,10 @@ PY
 
 capture_diagnostics() {
   [[ -n "${ARTIFACT_DIR}" ]] && mkdir -p "${ARTIFACT_DIR}"
-  docker ps -a >"${DOCKER_PS_LOG}" 2>/dev/null || true
-  docker logs chronos-etcd >"${ETCD_LOG}" 2>&1 || true
-  curl --max-time 2 -fsS "http://${METRICS_ENDPOINT}/readyz" >"${READYZ_LOG}" 2>&1 || true
-  curl --max-time 2 -fsS "http://${METRICS_ENDPOINT}/metrics" >"${METRICS_LOG}" 2>&1 || true
+  [[ -n "${DOCKER_PS_LOG}" ]] && docker ps -a >"${DOCKER_PS_LOG}" 2>/dev/null || true
+  [[ -n "${ETCD_LOG}" ]] && docker logs chronos-etcd >"${ETCD_LOG}" 2>&1 || true
+  [[ -n "${READYZ_LOG}" ]] && curl --max-time 2 -fsS "http://${METRICS_ENDPOINT}/readyz" >"${READYZ_LOG}" 2>&1 || true
+  [[ -n "${METRICS_LOG}" ]] && curl --max-time 2 -fsS "http://${METRICS_ENDPOINT}/metrics" >"${METRICS_LOG}" 2>&1 || true
 }
 
 cleanup() {
@@ -152,7 +153,7 @@ start_chronos() {
     CHRONOS_ETCD_ENDPOINTS="${ETCD_ENDPOINTS}" \
     CHRONOS_ETCD_PREFIX="${ETCD_PREFIX}" \
     CHRONOS_WORKER_ID="${WORKER_ID}" \
-    cargo run --locked --release --bin chronos >"${CHRONOS_LOG}" 2>&1 &
+    "${RELEASE_BIN_DIR}/chronos" >"${CHRONOS_LOG}" 2>&1 &
   CHRONOS_PID=$!
   wait_for_http "http://${METRICS_ENDPOINT}/readyz" "chronos readyz"
 }
@@ -162,6 +163,9 @@ make etcd-reset >/dev/null
 echo "[chaos] starting etcd"
 make etcd-up >/dev/null
 make etcd-health >/dev/null
+
+echo "[chaos] building release binaries"
+cargo build --locked --release --bin chronos --bin chronos-bench >/dev/null
 
 echo "[chaos] starting chronos"
 start_chronos
@@ -190,7 +194,7 @@ env \
   CHRONOS_BENCH_BATCH=1 \
   CHRONOS_BENCH_DURATION_SECS="${BENCH_DURATION_SECS}" \
   CHRONOS_BENCH_WARMUP_SECS=1 \
-  cargo run --locked --release --bin chronos-bench | tee "${RECOVERY_BENCH_LOG}"
+  "${RELEASE_BIN_DIR}/chronos-bench" | tee "${RECOVERY_BENCH_LOG}"
 
 curl -fsS "http://${METRICS_ENDPOINT}/readyz" | grep -qx 'ready'
 curl -fsS "http://${METRICS_ENDPOINT}/metrics" | grep -q '^tso_startup_ready'

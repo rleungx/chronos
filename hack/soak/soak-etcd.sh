@@ -59,6 +59,7 @@ fi
 
 CHRONOS_PID=""
 RESULT="failure"
+RELEASE_BIN_DIR="${REPO_ROOT}/target/release"
 
 write_summary() {
   [[ -n "${SUMMARY_LOG}" ]] || return 0
@@ -110,10 +111,10 @@ PY
 
 capture_diagnostics() {
   [[ -n "${ARTIFACT_DIR}" ]] && mkdir -p "${ARTIFACT_DIR}"
-  docker ps -a >"${DOCKER_PS_LOG}" 2>/dev/null || true
-  docker logs chronos-etcd >"${ETCD_LOG}" 2>&1 || true
-  curl --max-time 2 -fsS "http://${METRICS_ENDPOINT}/readyz" >"${READYZ_LOG}" 2>&1 || true
-  curl --max-time 2 -fsS "http://${METRICS_ENDPOINT}/metrics" >"${METRICS_LOG}" 2>&1 || true
+  [[ -n "${DOCKER_PS_LOG}" ]] && docker ps -a >"${DOCKER_PS_LOG}" 2>/dev/null || true
+  [[ -n "${ETCD_LOG}" ]] && docker logs chronos-etcd >"${ETCD_LOG}" 2>&1 || true
+  [[ -n "${READYZ_LOG}" ]] && curl --max-time 2 -fsS "http://${METRICS_ENDPOINT}/readyz" >"${READYZ_LOG}" 2>&1 || true
+  [[ -n "${METRICS_LOG}" ]] && curl --max-time 2 -fsS "http://${METRICS_ENDPOINT}/metrics" >"${METRICS_LOG}" 2>&1 || true
 }
 
 cleanup() {
@@ -180,6 +181,9 @@ echo "[soak] starting etcd"
 make etcd-up >/dev/null
 make etcd-health >/dev/null
 
+echo "[soak] building release binaries"
+cargo build --locked --release --bin chronos --bin chronos-bench --bin chronos-control-bench >/dev/null
+
 echo "[soak] starting chronos (release, etcd-backed)"
 env \
   CHRONOS_SECURITY_MODE=dev-insecure \
@@ -190,7 +194,7 @@ env \
   CHRONOS_ETCD_ENDPOINTS="${ETCD_ENDPOINTS}" \
   CHRONOS_ETCD_PREFIX="${ETCD_PREFIX}" \
   CHRONOS_WORKER_ID="${WORKER_ID}" \
-  cargo run --locked --release --bin chronos >"${CHRONOS_LOG}" 2>&1 &
+  "${RELEASE_BIN_DIR}/chronos" >"${CHRONOS_LOG}" 2>&1 &
 CHRONOS_PID=$!
 
 wait_for_http "http://${METRICS_ENDPOINT}/readyz" "chronos readyz"
@@ -203,7 +207,7 @@ env \
   CHRONOS_BENCH_BATCH="${SOAK_BATCH}" \
   CHRONOS_BENCH_DURATION_SECS="${SOAK_DURATION_SECS}" \
   CHRONOS_BENCH_WARMUP_SECS="${SOAK_WARMUP_SECS}" \
-  cargo run --locked --release --bin chronos-bench | tee "${BENCH_LOG}"
+  "${RELEASE_BIN_DIR}/chronos-bench" | tee "${BENCH_LOG}"
 
 echo "[soak] running control-plane status benchmark"
 env \
@@ -214,7 +218,7 @@ env \
   CHRONOS_CONTROL_BENCH_PAGE_SIZE="${CONTROL_PAGE_SIZE}" \
   CHRONOS_CONTROL_BENCH_DURATION_SECS="${SOAK_DURATION_SECS}" \
   CHRONOS_CONTROL_BENCH_WARMUP_SECS="${SOAK_WARMUP_SECS}" \
-  cargo run --locked --release --bin chronos-control-bench | tee "${CONTROL_STATUS_LOG}"
+  "${RELEASE_BIN_DIR}/chronos-control-bench" | tee "${CONTROL_STATUS_LOG}"
 
 echo "[soak] running control-plane watch benchmark"
 env \
@@ -225,7 +229,7 @@ env \
   CHRONOS_CONTROL_BENCH_DURATION_SECS="${SOAK_DURATION_SECS}" \
   CHRONOS_CONTROL_BENCH_WARMUP_SECS="${SOAK_WARMUP_SECS}" \
   CHRONOS_CONTROL_BENCH_WATCH_SNAPSHOT_TIMEOUT_MS="${WATCH_TIMEOUT_MS}" \
-  cargo run --locked --release --bin chronos-control-bench | tee "${CONTROL_WATCH_LOG}"
+  "${RELEASE_BIN_DIR}/chronos-control-bench" | tee "${CONTROL_WATCH_LOG}"
 
 echo "[soak] validating readiness and metrics surfaces"
 curl -fsS "http://${METRICS_ENDPOINT}/readyz" | grep -qx 'ready'
