@@ -17,6 +17,8 @@ ETCD_PREFIX="${CHRONOS_CHAOS_ETCD_PREFIX:-/chronos-chaos-${UNIQUE_SUFFIX}}"
 WORKER_ID="${CHRONOS_CHAOS_WORKER_ID:-worker-chaos}"
 BENCH_DURATION_SECS="${CHRONOS_CHAOS_BENCH_DURATION_SECS:-3}"
 SAFETY_GAP_MS="${CHRONOS_CHAOS_SAFETY_GAP_MS:-1}"
+LEASE_TTL_MS="${CHRONOS_CHAOS_LEASE_TTL_MS:-1500}"
+LEASE_EXPIRY_WAIT_SECS="${CHRONOS_CHAOS_LEASE_EXPIRY_WAIT_SECS:-$(( (LEASE_TTL_MS + 999) / 1000 + 1 ))}"
 ARTIFACT_ROOT="${CHRONOS_CHAOS_ARTIFACT_DIR:-${CHRONOS_ARTIFACT_DIR:-}}"
 KEEP_ARTIFACTS_ON_SUCCESS="${CHRONOS_CHAOS_KEEP_ARTIFACTS_ON_SUCCESS:-${CHRONOS_KEEP_ARTIFACTS_ON_SUCCESS:-0}}"
 STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -64,6 +66,8 @@ bench_duration_secs=${BENCH_DURATION_SECS}
 etcd_prefix=${ETCD_PREFIX}
 worker_id=${WORKER_ID}
 safety_gap_ms=${SAFETY_GAP_MS}
+lease_ttl_ms=${LEASE_TTL_MS}
+lease_expiry_wait_secs=${LEASE_EXPIRY_WAIT_SECS}
 artifact_dir=${ARTIFACT_DIR}
 artifact_index=${INDEX_LOG}
 chronos_log=${CHRONOS_LOG}
@@ -156,6 +160,7 @@ start_chronos() {
     CHRONOS_ETCD_PREFIX="${ETCD_PREFIX}" \
     CHRONOS_WORKER_ID="${WORKER_ID}" \
     CHRONOS_SAFETY_GAP_MS="${SAFETY_GAP_MS}" \
+    CHRONOS_LEASE_TTL_MS="${LEASE_TTL_MS}" \
     "${RELEASE_BIN_DIR}/chronos" >"${CHRONOS_LOG}" 2>&1 &
   CHRONOS_PID=$!
   wait_for_http "http://${METRICS_ENDPOINT}/readyz" "chronos readyz"
@@ -185,6 +190,9 @@ if [[ -n "${CHRONOS_PID}" ]] && kill -0 "${CHRONOS_PID}" 2>/dev/null; then
   kill "${CHRONOS_PID}" 2>/dev/null || true
   wait "${CHRONOS_PID}" 2>/dev/null || true
 fi
+
+echo "[chaos] waiting for identity lease expiry (${LEASE_EXPIRY_WAIT_SECS}s)"
+sleep "${LEASE_EXPIRY_WAIT_SECS}"
 
 echo "[chaos] restarting chronos"
 start_chronos
