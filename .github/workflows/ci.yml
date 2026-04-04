@@ -20,6 +20,10 @@ jobs:
         with:
           toolchain: 1.94.0
           components: rustfmt, clippy
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
       - name: Run Layer 0 static
         run: make test-layer-0
       - name: Run Layer 1 fast smoke
@@ -41,6 +45,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.94.0
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
       - name: Start etcd
         run: make etcd-up
       - name: Wait for etcd health
@@ -78,6 +86,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.94.0
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
       - name: Run etcd-backed soak validation
         run: make test-soak
       - name: Publish soak summary
@@ -119,6 +131,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.94.0
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
       - name: Run etcd-backed chaos recovery validation
         run: make test-chaos
       - name: Publish chaos summary
