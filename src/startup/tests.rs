@@ -34,13 +34,11 @@ use chronos::proto::v1::{
     WorkerReadinessState,
 };
 use chronos::{TsoConfig, TsoSecurityMode, TsoService};
-#[allow(unused_imports)]
 use hyper::client::conn;
 use hyper::{Body, Request as HyperRequest, StatusCode};
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, ExtendedKeyUsagePurpose, IsCa, KeyPair,
 };
-#[allow(unused_imports)]
 use rustls::pki_types::ServerName;
 use rustls::server::WebPkiClientVerifier;
 use rustls::{ClientConfig, ServerConfig};
@@ -103,7 +101,6 @@ fn explicit_dev_insecure_local_config(bind_addr: SocketAddr) -> TsoConfig {
     }
 }
 
-#[allow(dead_code)]
 struct MetricsTlsFixture {
     _dir: PathBuf,
     ca_cert_path: String,
@@ -113,7 +110,6 @@ struct MetricsTlsFixture {
     client_key_path: String,
 }
 
-#[allow(dead_code)]
 fn unique_temp_dir(label: &str) -> PathBuf {
     let dir = env::temp_dir().join(format!(
         "chronos-{}-{}-{}",
@@ -128,7 +124,6 @@ fn unique_temp_dir(label: &str) -> PathBuf {
     dir
 }
 
-#[allow(dead_code)]
 fn build_metrics_tls_fixture() -> MetricsTlsFixture {
     let dir = unique_temp_dir("metrics-tls");
 
@@ -174,7 +169,6 @@ fn build_metrics_tls_fixture() -> MetricsTlsFixture {
     }
 }
 
-#[allow(dead_code)]
 fn metrics_tls_config(fixture: &MetricsTlsFixture) -> TsoConfig {
     TsoConfig {
         security_mode: Some(TsoSecurityMode::DevInsecure),
@@ -185,7 +179,6 @@ fn metrics_tls_config(fixture: &MetricsTlsFixture) -> TsoConfig {
     }
 }
 
-#[allow(dead_code)]
 fn build_metrics_tls_connector(
     fixture: &MetricsTlsFixture,
     include_client_cert: bool,

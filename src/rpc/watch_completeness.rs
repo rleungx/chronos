@@ -125,21 +125,19 @@ async fn load_watch_all_routes(
     let mut start_after_timeline_key = None;
 
     loop {
-        let page = control_plane
-            .list_timeline_statuses(
-                &[],
-                None,
+        let (page_routes, next_start_after) = control_plane
+            .list_timeline_routes(
                 start_after_timeline_key.as_deref(),
                 WATCH_ALL_SNAPSHOT_PAGE_SIZE,
             )
             .await
             .map_err(translation::map_tso_error)?;
 
-        for status in page.statuses {
-            maybe_push_newer_route(status.route, delivered_versions, &mut routes);
+        for route in page_routes {
+            maybe_push_newer_route(route, delivered_versions, &mut routes);
         }
 
-        let Some(next_start_after) = page.next_start_after else {
+        let Some(next_start_after) = next_start_after else {
             break;
         };
         start_after_timeline_key = Some(next_start_after);

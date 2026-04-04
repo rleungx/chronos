@@ -85,6 +85,7 @@ assert_target_contains_tests --test timeline_rebalance_and_scaling -- \
   etcd_expired_lease_requires_failover_before_issuing_more_tsos \
   etcd_failover_is_blocked_until_expiry_plus_safety_gap_with_skewed_clocks \
   etcd_failover_recovery_floor_survives_remote_restart_before_first_allocation \
+  etcd_multihop_failover_at_capacity_horizon_uses_upper_bound_and_fails_closed \
   etcd_remote_transfer_recovery_floor_uses_max_of_graceful_and_generator_floor
 assert_target_contains_tests --test multiprocess_etcd_startup -- \
   etcd_spawned_process_rejects_duplicate_instance_identity \

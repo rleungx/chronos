@@ -1,6 +1,10 @@
+#[path = "common/config.rs"]
+mod common_config;
+
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use common_config::required_test_config;
 use tokio::sync::oneshot;
 use tokio::time::{sleep, Duration};
 use tonic::Request;
@@ -15,21 +19,8 @@ use chronos::proto::v1::{
 };
 use chronos::rpc::TsoTimestampService;
 use chronos::timeline_proxy::TimelineScopedAllocator;
-use chronos::{ManualClock, TsoConfig, TsoError, TsoSecurityMode, TsoService};
+use chronos::{ManualClock, TsoConfig, TsoError, TsoService};
 use tokio::sync::broadcast;
-
-fn required_test_config(config: TsoConfig) -> TsoConfig {
-    TsoConfig {
-        security_mode: Some(TsoSecurityMode::Required),
-        grpc_tls_cert_file: Some("server.crt".into()),
-        grpc_tls_key_file: Some("server.key".into()),
-        grpc_client_ca_file: Some("ca.pem".into()),
-        grpc_request_timeout_ms: Some(100),
-        grpc_max_request_bytes: Some(1024),
-        grpc_max_concurrent_requests: Some(16),
-        ..config
-    }
-}
 
 #[derive(Clone)]
 struct SlowMetadataStore {

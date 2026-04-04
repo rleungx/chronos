@@ -23,7 +23,7 @@ pub(super) type WatchTimelineRoutesStream = ReceiverStream<Result<TimelineRouteE
 
 struct WatchResyncGate {
     next_allowed_at: Instant,
-    pending: bool,
+    pending_at: Option<Instant>,
 }
 
 enum WatchResyncLagEffect {
@@ -35,28 +35,32 @@ impl WatchResyncGate {
     fn new() -> Self {
         Self {
             next_allowed_at: Instant::now(),
-            pending: false,
+            pending_at: None,
         }
     }
 
     fn lagged(&mut self, now: Instant) -> WatchResyncLagEffect {
-        let scheduled_at = self.next_allowed_at.max(now);
-        let already_pending = self.pending;
-        self.pending = true;
-        if already_pending {
-            WatchResyncLagEffect::Coalesced(scheduled_at)
-        } else {
-            WatchResyncLagEffect::Scheduled(scheduled_at)
+        let candidate = self.next_allowed_at.max(now);
+        match self.pending_at {
+            Some(existing) => {
+                let scheduled_at = existing.min(candidate);
+                self.pending_at = Some(scheduled_at);
+                WatchResyncLagEffect::Coalesced(scheduled_at)
+            }
+            None => {
+                self.pending_at = Some(candidate);
+                WatchResyncLagEffect::Scheduled(candidate)
+            }
         }
     }
 
     fn complete(&mut self, now: Instant) {
-        self.pending = false;
+        self.pending_at = None;
         self.next_allowed_at = now + WATCH_RESYNC_MIN_INTERVAL;
     }
 
     fn is_pending(&self) -> bool {
-        self.pending
+        self.pending_at.is_some()
     }
 }
 
@@ -265,21 +269,27 @@ async fn send_watch_event_with_timeout(
     event_tx: &tokio::sync::mpsc::Sender<Result<TimelineRouteEvent, Status>>,
     event: Result<TimelineRouteEvent, Status>,
 ) -> bool {
-    match tokio::time::timeout(WATCH_ROUTE_SEND_TIMEOUT, event_tx.send(event)).await {
-        Ok(Ok(())) => true,
-        Ok(Err(_)) => false,
-        Err(_) => {
-            metrics::TSO_WATCH_ROUTE_SEND_TIMEOUT_TOTAL.inc();
-            warn!(
-                component = "route_watch",
-                event = "send_timeout",
-                result = "degraded",
-                reason = "consumer_backpressure"
-            );
-            let _ = event_tx.try_send(Err(Status::resource_exhausted(
-                "watch consumer backpressure",
-            )));
-            false
+    match event_tx.try_send(event) {
+        Ok(()) => true,
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => false,
+        Err(tokio::sync::mpsc::error::TrySendError::Full(event)) => {
+            match tokio::time::timeout(WATCH_ROUTE_SEND_TIMEOUT, event_tx.send(event)).await {
+                Ok(Ok(())) => true,
+                Ok(Err(_)) => false,
+                Err(_) => {
+                    metrics::TSO_WATCH_ROUTE_SEND_TIMEOUT_TOTAL.inc();
+                    warn!(
+                        component = "route_watch",
+                        event = "send_timeout",
+                        result = "degraded",
+                        reason = "consumer_backpressure"
+                    );
+                    let _ = event_tx.try_send(Err(Status::resource_exhausted(
+                        "watch consumer backpressure",
+                    )));
+                    false
+                }
+            }
         }
     }
 }
@@ -439,7 +449,7 @@ mod tests {
     }
 
     #[test]
-    fn watch_resync_gate_coalesces_lagged_signals_until_completion() {
+    fn watch_resync_gate_preserves_earliest_pending_schedule_until_completion() {
         let mut gate = WatchResyncGate::new();
         let now = Instant::now();
 
@@ -450,7 +460,7 @@ mod tests {
         assert!(matches!(first, WatchResyncLagEffect::Scheduled(when) if when == now));
         assert!(matches!(
             second,
-            WatchResyncLagEffect::Coalesced(when) if when == now + Duration::from_millis(50)
+            WatchResyncLagEffect::Coalesced(when) if when == now
         ));
 
         gate.complete(now + Duration::from_millis(50));

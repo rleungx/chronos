@@ -79,6 +79,16 @@ impl TsoControlPlane {
             .await
     }
 
+    pub(crate) async fn list_timeline_routes(
+        &self,
+        start_after_timeline_key: Option<&str>,
+        limit: usize,
+    ) -> Result<(Vec<TimelineRoute>, Option<String>), TsoError> {
+        self.inner
+            .list_timeline_routes(start_after_timeline_key, limit)
+            .await
+    }
+
     pub async fn renew_timeline_lease(&self, timeline_key: &str) -> Result<(), TsoError> {
         self.inner.renew_timeline_lease(timeline_key).await
     }

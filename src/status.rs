@@ -1,27 +1,20 @@
 use crate::metadata::{GeneratorRecord, TimelineRecord};
 use crate::{HealthInfo, TimelineLifecycleState, TimelineRoute, TsoConfig};
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WorkerReadinessState {
     Ready,
     Degraded,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WorkerReadinessReason {
     Serving,
-    StartupPreflightFailed,
-    MetadataStartupProbeFailed,
-    IdentityLeaseAcquireFailed,
     IdentityLeaseLost,
     ShuttingDown,
-    Draining,
     OwnershipDrift,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WorkerStatusIdentity {
     pub(crate) worker_id: String,
@@ -39,7 +32,6 @@ impl WorkerStatusIdentity {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WorkerStatusSnapshot {
     pub(crate) identity: WorkerStatusIdentity,
@@ -91,7 +83,6 @@ impl WorkerStatusSnapshot {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) enum TimelineFailoverReadiness {
     NotApplicable,
     Eligible,
@@ -100,7 +91,6 @@ pub(crate) enum TimelineFailoverReadiness {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) struct TimelineStatusSnapshot {
     pub(crate) route: TimelineRoute,
     pub(crate) state: TimelineLifecycleState,
@@ -114,13 +104,11 @@ pub(crate) struct TimelineStatusSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) struct TimelineStatusListPage {
     pub(crate) statuses: Vec<TimelineStatusSnapshot>,
     pub(crate) next_start_after: Option<String>,
 }
 
-#[allow(dead_code)]
 pub(crate) fn matched_generator_record<'a>(
     timeline: &TimelineRecord,
     generator: Option<&'a GeneratorRecord>,
@@ -131,7 +119,6 @@ pub(crate) fn matched_generator_record<'a>(
     })
 }
 
-#[allow(dead_code)]
 pub(crate) fn build_timeline_status_snapshot(
     config: &TsoConfig,
     now_ms: u64,
@@ -163,7 +150,6 @@ pub(crate) fn build_timeline_status_snapshot(
     }
 }
 
-#[allow(dead_code)]
 fn derive_failover_readiness(
     safety_gap_ms: u64,
     now_ms: u64,

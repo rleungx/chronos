@@ -181,6 +181,12 @@ impl TsoService {
 
         let next_start_after = if statuses.len() < limit {
             None
+        } else if states.is_empty() && owner_worker_endpoint.is_none() {
+            scan_cursor.as_ref().and_then(|_| {
+                statuses
+                    .last()
+                    .map(|status| status.route.timeline_key.clone())
+            })
         } else if let Some(last_returned_key) = statuses
             .last()
             .map(|status| status.route.timeline_key.clone())
@@ -216,6 +222,34 @@ impl TsoService {
             statuses,
             next_start_after,
         })
+    }
+
+    pub(crate) async fn list_timeline_routes(
+        &self,
+        start_after_timeline_key: Option<&str>,
+        limit: usize,
+    ) -> Result<(Vec<TimelineRoute>, Option<String>), TsoError> {
+        if limit == 0 {
+            return Ok((Vec::new(), None));
+        }
+
+        let page = self
+            .metadata
+            .list_timelines_page(start_after_timeline_key, limit)
+            .await?;
+
+        let next_start_after = page.next_start_after_timeline_key.as_ref().and_then(|_| {
+            page.records
+                .last()
+                .map(|record| record.route.timeline_key.clone())
+        });
+        let routes = page
+            .records
+            .into_iter()
+            .map(|record| record.route)
+            .collect();
+
+        Ok((routes, next_start_after))
     }
 
     pub async fn load_generator_record(

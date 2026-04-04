@@ -1,4 +1,8 @@
-use std::{collections::HashSet, hash::Hash};
+use std::{
+    collections::HashSet,
+    hash::Hash,
+    sync::{Arc, RwLock},
+};
 
 use async_trait::async_trait;
 use dashmap::DashMap;
@@ -16,6 +20,7 @@ pub struct MemoryMetadataStore {
     // P2: Use DashMap to reduce lock contention in large concurrent tests
     records: DashMap<String, (TimelineRecord, u64)>,
     generators: DashMap<u32, (GeneratorRecord, u64)>,
+    sorted_timeline_keys: RwLock<Option<Arc<[String]>>>,
     route_updates: broadcast::Sender<RouteUpdateSignal>,
     timeline_cas_lock: Mutex<()>,
     generator_cas_lock: Mutex<()>,
@@ -31,6 +36,7 @@ impl MemoryMetadataStore {
         Self {
             records: DashMap::new(),
             generators: DashMap::new(),
+            sorted_timeline_keys: RwLock::new(None),
             route_updates,
             timeline_cas_lock: Mutex::new(()),
             generator_cas_lock: Mutex::new(()),
@@ -102,6 +108,27 @@ impl MemoryMetadataStore {
         let _ = self
             .route_updates
             .send(RouteUpdateSignal::Route(route.clone()));
+    }
+
+    fn invalidate_sorted_timeline_keys(&self) {
+        *self.sorted_timeline_keys.write().unwrap() = None;
+    }
+
+    fn sorted_timeline_keys(&self) -> Arc<[String]> {
+        if let Some(keys) = self.sorted_timeline_keys.read().unwrap().as_ref().cloned() {
+            return keys;
+        }
+
+        let mut timeline_keys: Vec<_> = self
+            .records
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect();
+        timeline_keys.sort_unstable();
+        let timeline_keys: Arc<[String]> = timeline_keys.into();
+
+        let mut cached = self.sorted_timeline_keys.write().unwrap();
+        cached.get_or_insert_with(|| timeline_keys.clone()).clone()
     }
 
     #[cfg(test)]
@@ -180,23 +207,18 @@ impl TimelineAuthority for MemoryMetadataStore {
             });
         }
 
-        let mut records: Vec<_> = self
-            .records
-            .iter()
-            .map(|entry| entry.value().0.clone())
-            .collect();
-        records
-            .sort_unstable_by(|left, right| left.route.timeline_key.cmp(&right.route.timeline_key));
+        let timeline_keys = self.sorted_timeline_keys();
         let start_index = start_after_timeline_key
             .map(|start_after| {
-                records.partition_point(|record| record.route.timeline_key.as_str() <= start_after)
+                timeline_keys.partition_point(|timeline_key| timeline_key.as_str() <= start_after)
             })
             .unwrap_or(0);
-        let mut page_records: Vec<_> = records
-            .into_iter()
-            .skip(start_index)
-            .take(limit + 1)
-            .collect();
+        let mut page_records = Vec::with_capacity(limit + 1);
+        for timeline_key in timeline_keys.iter().skip(start_index).take(limit + 1) {
+            if let Some(record) = self.records.get(timeline_key.as_str()) {
+                page_records.push(record.value().0.clone());
+            }
+        }
         let next_start_after_timeline_key = (page_records.len() > limit)
             .then(|| page_records[limit - 1].route.timeline_key.clone());
         page_records.truncate(limit);
@@ -217,6 +239,7 @@ impl TimelineAuthority for MemoryMetadataStore {
             .start_timer();
         let revision =
             Self::create_entry(&self.records, timeline_key.to_string(), record, "create")?;
+        self.invalidate_sorted_timeline_keys();
         let mut route_updates = Vec::with_capacity(1);
         collect_timeline_route_update(None, record, &mut route_updates);
         for route_update in route_updates {
@@ -246,9 +269,14 @@ impl TimelineAuthority for MemoryMetadataStore {
 
             let mut route_updates = Vec::with_capacity(1);
             collect_timeline_route_update(Some(current_record), record, &mut route_updates);
+            let timeline_key_changed = record.route.timeline_key != timeline_key;
             let new_revision = *current_revision + 1;
             *entry.value_mut() = (record.clone(), new_revision);
             drop(entry);
+
+            if timeline_key_changed {
+                self.invalidate_sorted_timeline_keys();
+            }
 
             for route_update in route_updates {
                 self.publish_route_update(&route_update);
@@ -302,6 +330,7 @@ impl TimelineAuthority for MemoryMetadataStore {
 
         let mut revisions = Vec::with_capacity(operations.len());
         let mut route_updates = Vec::new();
+        let mut timeline_key_changed = false;
         for operation in operations {
             let Some(mut entry) = self.records.get_mut(operation.timeline_key.as_str()) else {
                 metrics::TSO_METADATA_ERRORS_TOTAL
@@ -317,9 +346,13 @@ impl TimelineAuthority for MemoryMetadataStore {
                 &operation.record,
                 &mut route_updates,
             );
+            timeline_key_changed |= operation.record.route.timeline_key != operation.timeline_key;
             let new_revision = *current_revision + 1;
             *entry.value_mut() = (operation.record.clone(), new_revision);
             revisions.push(new_revision);
+        }
+        if timeline_key_changed {
+            self.invalidate_sorted_timeline_keys();
         }
         for route in route_updates {
             self.publish_route_update(&route);

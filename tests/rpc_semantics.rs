@@ -1,6 +1,16 @@
+#[path = "common/config.rs"]
+mod common_config;
+#[path = "common/etcd_endpoints.rs"]
+mod common_etcd_endpoints;
+#[path = "common/etcd_prefix.rs"]
+mod common_etcd_prefix;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use common_config::required_test_config;
+use common_etcd_endpoints::test_etcd_endpoints;
+use common_etcd_prefix::unique_test_etcd_prefix;
 use prost::Message;
 use tokio::time::Duration;
 use tokio_stream::wrappers::ReceiverStream;
@@ -29,21 +39,8 @@ use chronos::rpc::{
 };
 use chronos::{
     build_commit, build_version, mixed_version_contract_id, ManualClock, ResourceTier,
-    TimelineLifecycleState, TransferReason, TsoConfig, TsoSecurityMode, TsoService,
+    TimelineLifecycleState, TransferReason, TsoConfig, TsoService,
 };
-
-fn required_test_config(config: TsoConfig) -> TsoConfig {
-    TsoConfig {
-        security_mode: Some(TsoSecurityMode::Required),
-        grpc_tls_cert_file: Some("server.crt".into()),
-        grpc_tls_key_file: Some("server.key".into()),
-        grpc_client_ca_file: Some("ca.pem".into()),
-        grpc_request_timeout_ms: Some(100),
-        grpc_max_request_bytes: Some(1024),
-        grpc_max_concurrent_requests: Some(16),
-        ..config
-    }
-}
 
 fn service_with_metadata<M>(
     config: TsoConfig,
@@ -54,27 +51,6 @@ where
     M: ControlPlaneStore + 'static,
 {
     TsoService::new(required_test_config(config), clock, metadata).unwrap()
-}
-
-fn test_etcd_endpoints() -> Vec<String> {
-    std::env::var("CHRONOS_TEST_ETCD_ENDPOINTS")
-        .unwrap_or_else(|_| "127.0.0.1:2379".into())
-        .split(',')
-        .map(|endpoint| endpoint.trim().to_string())
-        .filter(|endpoint| !endpoint.is_empty())
-        .collect()
-}
-
-fn unique_test_etcd_prefix(label: &str) -> String {
-    format!(
-        "/chronos-test-{}-{}-{}",
-        label,
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    )
 }
 
 fn test_endpoint(name: &str) -> String {

@@ -85,6 +85,22 @@ make test-layer-3
 make test-layer-4
 ```
 
+For longer-running production-readiness harnesses:
+
+```bash
+make test-soak
+make test-chaos
+```
+
+`test-soak` exercises an etcd-backed release-mode service with `chronos-bench` and
+`chronos-control-bench`. `test-chaos` injects an etcd outage, verifies Chronos degrades or exits,
+restores etcd, restarts Chronos, and runs a recovery smoke benchmark.
+
+When `CHRONOS_ARTIFACT_DIR` is set, both harnesses retain logs, summaries, metrics snapshots, and
+etcd diagnostics under that directory instead of deleting them on success. Each harness also writes
+an `artifact-index.txt` alongside `summary.txt` so CI and operators can quickly see what was
+captured. The CI soak/chaos jobs use this to upload artifacts for post-mortem debugging.
+
 ## Minimal local run
 
 If `CHRONOS_METADATA` is unset, Chronos runs with in-memory metadata.

@@ -11,7 +11,11 @@ ETCD_ENDPOINTS ?= 127.0.0.1:2379
 	test-layer-2 \
 	test-layer-3 \
 	test-layer-4 \
-	test-etcd
+	test-etcd \
+	test-soak \
+	test-chaos \
+	observability-up \
+	observability-down
 
 etcd-up:
 	docker compose -f $(ETCD_COMPOSE_FILE) up -d
@@ -32,18 +36,30 @@ etcd-health:
 
 test-layer-0:
 	cargo fmt --all -- --check
-	cargo clippy --all-targets -- -D warnings
+	cargo clippy --locked --all-targets -- -D warnings
 
 test-layer-1:
-	cargo test --lib --test crate_root_api_smoke --test tso_planes_public_api --test lifecycle_semantics
+	cargo test --locked --lib --test crate_root_api_smoke --test tso_planes_public_api --test lifecycle_semantics
 
 test-layer-2:
-	cargo test --bin chronos
+	cargo test --locked --bin chronos
 
 test-layer-3:
-	cargo test --test metadata_etcd_compat --test rpc_semantics --test timeline_proxy_semantics --test timeline_rebalance_and_scaling
+	cargo test --locked --test metadata_etcd_compat --test rpc_semantics --test timeline_proxy_semantics --test timeline_rebalance_and_scaling
 
 test-layer-4:
 	CHRONOS_TEST_ETCD_ENDPOINTS=$(ETCD_ENDPOINTS) bash hack/validate-layer-4.sh
 
 test-etcd: test-layer-4
+
+test-soak:
+	bash hack/soak/soak-etcd.sh
+
+test-chaos:
+	bash hack/chaos/lease-loss-shutdown.sh
+
+observability-up:
+	docker compose -f observability/docker-compose.yml up -d
+
+observability-down:
+	docker compose -f observability/docker-compose.yml down

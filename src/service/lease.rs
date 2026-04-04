@@ -89,7 +89,7 @@ impl TsoService {
                     }
 
                     if self.is_local_endpoint(&record.owner_worker_endpoint) && exp > now_ms {
-                        self.observe_contended_local_generator_ownership(
+                        self.observe_contended_local_generator_ownership_drift(
                             generator_id,
                             &record.owner_instance_id,
                             exp,
@@ -246,7 +246,7 @@ impl TsoService {
         if !self.is_local_generator_owner(&record) || exp <= now_ms {
             crate::metrics::TSO_LEASE_EXPIRED_TOTAL.inc();
             if self.is_local_endpoint(&record.owner_worker_endpoint) && exp > now_ms {
-                self.observe_contended_local_generator_ownership(
+                self.observe_contended_local_generator_ownership_drift(
                     generator_id,
                     &record.owner_instance_id,
                     exp,

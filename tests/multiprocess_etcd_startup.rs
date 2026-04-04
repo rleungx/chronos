@@ -1,8 +1,13 @@
+#[path = "common/etcd_endpoints.rs"]
+mod common_etcd_endpoints;
+#[path = "common/etcd_prefix.rs"]
+mod common_etcd_prefix;
+
 use std::{
     io::Read,
     net::{SocketAddr, TcpListener},
     process::{Child, Command, Stdio},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
 use chronos::proto::v1::{
@@ -12,6 +17,8 @@ use chronos::proto::v1::{
     EnsureTimelineRequest, ErrorDetail, GetTimelineRouteRequest, ResourceTier, TimelineRoute,
     TimelineTransferReason, TransferTimelineRequest, WorkerReadinessState,
 };
+use common_etcd_endpoints::{test_etcd_endpoints, test_etcd_endpoints_csv};
+use common_etcd_prefix::unique_test_etcd_prefix;
 use etcd_client::Client;
 use prost::Message;
 use tokio::time::{sleep, timeout};
@@ -32,28 +39,8 @@ fn chronos_bin() -> &'static str {
     env!("CARGO_BIN_EXE_chronos")
 }
 
-fn test_etcd_endpoints() -> String {
-    std::env::var("CHRONOS_TEST_ETCD_ENDPOINTS").unwrap_or_else(|_| "127.0.0.1:2379".into())
-}
-
 fn parsed_test_etcd_endpoints() -> Vec<String> {
     test_etcd_endpoints()
-        .split(',')
-        .map(|endpoint| endpoint.trim().to_string())
-        .filter(|endpoint| !endpoint.is_empty())
-        .collect()
-}
-
-fn unique_test_etcd_prefix(label: &str) -> String {
-    format!(
-        "/chronos-test-{}-{}-{}",
-        label,
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    )
 }
 
 fn free_loopback_addr() -> SocketAddr {
@@ -69,7 +56,7 @@ fn spawn_chronos_process(config: SpawnedChronosConfig<'_>) -> Child {
     let advertise_endpoint = config.bind_addr.to_string();
     Command::new(chronos_bin())
         .env("CHRONOS_METADATA", "etcd")
-        .env("CHRONOS_ETCD_ENDPOINTS", test_etcd_endpoints())
+        .env("CHRONOS_ETCD_ENDPOINTS", test_etcd_endpoints_csv())
         .env("CHRONOS_ETCD_PREFIX", config.prefix)
         .env("CHRONOS_SECURITY_MODE", "dev-insecure")
         .env("CHRONOS_SAFETY_GAP_MS", config.safety_gap_ms.to_string())

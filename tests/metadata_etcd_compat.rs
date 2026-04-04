@@ -1,3 +1,8 @@
+#[path = "common/etcd_endpoints.rs"]
+mod common_etcd_endpoints;
+#[path = "common/etcd_prefix.rs"]
+mod common_etcd_prefix;
+
 use chronos::{
     build_commit, build_version,
     metadata::{
@@ -6,6 +11,8 @@ use chronos::{
     },
     mixed_version_contract_id, ResourceTier, TimelineLifecycleState, TimelineRoute, TsoError,
 };
+use common_etcd_endpoints::test_etcd_endpoints;
+use common_etcd_prefix::unique_test_etcd_prefix;
 use etcd_client::Client;
 use std::sync::Arc;
 use tokio::sync::Barrier;
@@ -58,27 +65,6 @@ fn generator_record(
         issued_upper_bound: Some(issued_upper_bound),
         updated_at_ms: 0,
     }
-}
-
-fn test_etcd_endpoints() -> Vec<String> {
-    std::env::var("CHRONOS_TEST_ETCD_ENDPOINTS")
-        .unwrap_or_else(|_| "127.0.0.1:2379".into())
-        .split(',')
-        .map(|endpoint| endpoint.trim().to_string())
-        .filter(|endpoint| !endpoint.is_empty())
-        .collect()
-}
-
-fn unique_test_etcd_prefix(label: &str) -> String {
-    format!(
-        "/chronos-test-{}-{}-{}",
-        label,
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    )
 }
 
 async fn real_etcd_store(label: &str) -> Arc<EtcdMetadataStore> {

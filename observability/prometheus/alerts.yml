@@ -1,0 +1,87 @@
+groups:
+  - name: chronos-availability
+    rules:
+      - alert: ChronosDown
+        expr: up{job="chronos"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: Chronos metrics target is down
+          description: Prometheus cannot scrape the Chronos metrics endpoint for 2 minutes.
+
+      - alert: ChronosNotReady
+        expr: tso_startup_ready{job="chronos"} == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: Chronos is not ready
+          description: Chronos has remained not-ready for at least 5 minutes.
+
+  - name: chronos-correctness-signals
+    rules:
+      - alert: ChronosIdentityLeaseLost
+        expr: increase(tso_identity_lease_events_total{job="chronos",event="lost"}[5m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: Chronos lost its identity lease
+          description: Identity lease loss was observed in the last 5 minutes.
+
+      - alert: ChronosClockBackwards
+        expr: increase(tso_clock_backwards_total{job="chronos"}[10m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: Chronos observed a backward clock event
+          description: A backward clock event was recorded in the last 10 minutes.
+
+      - alert: ChronosMetadataErrors
+        expr: sum(increase(tso_metadata_errors_total{job="chronos"}[5m])) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: Chronos metadata operations are erroring
+          description: Metadata store operations recorded errors in the last 5 minutes.
+
+  - name: chronos-control-plane
+    rules:
+      - alert: ChronosWatchSendTimeouts
+        expr: increase(tso_watch_route_send_timeout_total{job="chronos"}[10m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: Chronos watch consumers are timing out
+          description: Route/watch sends timed out in the last 10 minutes.
+
+      - alert: ChronosProxySaturation
+        expr: increase(tso_timeline_proxy_saturated_total{job="chronos"}[10m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: Chronos timeline proxy saturated
+          description: Timeline proxy saturation events were recorded in the last 10 minutes.
+
+      - alert: ChronosStartupPreflightFailures
+        expr: sum(increase(tso_startup_preflight_fail_total{job="chronos"}[15m])) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: Chronos startup preflight failures detected
+          description: Startup preflight failures were recorded in the last 15 minutes.
+
+      - alert: ChronosStartupBootstrapFailures
+        expr: sum(increase(tso_startup_bootstrap_fail_total{job="chronos"}[15m])) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: Chronos startup bootstrap failures detected
+          description: Startup bootstrap failures were recorded in the last 15 minutes.

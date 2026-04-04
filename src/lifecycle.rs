@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use crate::TimelineLifecycleState;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

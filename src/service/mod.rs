@@ -83,7 +83,7 @@ impl TsoService {
         }
     }
 
-    pub(super) fn observe_contended_local_generator_ownership(
+    pub(super) fn observe_contended_local_generator_ownership_drift(
         &self,
         generator_id: u32,
         contending_instance_id: &str,

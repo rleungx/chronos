@@ -11,11 +11,13 @@ jobs:
   layer-0-3-verify:
     runs-on: ubuntu-latest
     if: github.event_name != 'schedule'
+    env:
+      CHRONOS_BUILD_COMMIT: ${{ github.sha }}
+      RUST_BACKTRACE: 1
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: 1.94.0
           components: rustfmt, clippy
       - name: Run Layer 0 static
         run: make test-layer-0
@@ -36,8 +38,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: 1.94.0
       - name: Start etcd
         run: make etcd-up
       - name: Wait for etcd health
@@ -58,5 +58,83 @@ jobs:
           docker compose -f hack/etcd/docker-compose.yml ps
           docker compose -f hack/etcd/docker-compose.yml logs --no-color etcd
       - name: Stop etcd
+        if: always()
+        run: make etcd-reset
+
+  soak-real-etcd:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    env:
+      CHRONOS_BUILD_COMMIT: ${{ github.sha }}
+      RUST_BACKTRACE: 1
+      CHRONOS_ARTIFACT_DIR: ${{ github.workspace }}/artifacts
+      CHRONOS_KEEP_ARTIFACTS_ON_SUCCESS: 1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+      - name: Run etcd-backed soak validation
+        run: make test-soak
+      - name: Publish soak summary
+        if: always()
+        run: |
+          if [ -f artifacts/soak/summary.txt ]; then
+            {
+              echo '## Soak validation summary'
+              echo ''
+              cat artifacts/soak/summary.txt
+              echo ''
+              echo '### Soak artifact files'
+              ls -1 artifacts/soak
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Upload soak artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chronos-soak-artifacts
+          path: artifacts/soak/
+          if-no-files-found: error
+          retention-days: 14
+      - name: Reset etcd after soak job
+        if: always()
+        run: make etcd-reset
+
+  chaos-lease-loss:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    env:
+      CHRONOS_BUILD_COMMIT: ${{ github.sha }}
+      RUST_BACKTRACE: 1
+      CHRONOS_ARTIFACT_DIR: ${{ github.workspace }}/artifacts
+      CHRONOS_KEEP_ARTIFACTS_ON_SUCCESS: 1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+      - name: Run etcd-backed chaos recovery validation
+        run: make test-chaos
+      - name: Publish chaos summary
+        if: always()
+        run: |
+          if [ -f artifacts/chaos/summary.txt ]; then
+            {
+              echo '## Chaos validation summary'
+              echo ''
+              cat artifacts/chaos/summary.txt
+              echo ''
+              echo '### Chaos artifact files'
+              ls -1 artifacts/chaos
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Upload chaos artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chronos-chaos-artifacts
+          path: artifacts/chaos/
+          if-no-files-found: error
+          retention-days: 14
+      - name: Reset etcd after chaos job
         if: always()
         run: make etcd-reset

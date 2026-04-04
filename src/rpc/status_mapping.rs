@@ -27,18 +27,8 @@ pub(super) fn proto_worker_readiness_reason(
 ) -> ProtoWorkerReadinessReason {
     match reason {
         WorkerReadinessReason::Serving => ProtoWorkerReadinessReason::Serving,
-        WorkerReadinessReason::StartupPreflightFailed => {
-            ProtoWorkerReadinessReason::StartupPreflightFailed
-        }
-        WorkerReadinessReason::MetadataStartupProbeFailed => {
-            ProtoWorkerReadinessReason::MetadataStartupProbeFailed
-        }
-        WorkerReadinessReason::IdentityLeaseAcquireFailed => {
-            ProtoWorkerReadinessReason::IdentityLeaseAcquireFailed
-        }
         WorkerReadinessReason::IdentityLeaseLost => ProtoWorkerReadinessReason::IdentityLeaseLost,
         WorkerReadinessReason::ShuttingDown => ProtoWorkerReadinessReason::ShuttingDown,
-        WorkerReadinessReason::Draining => ProtoWorkerReadinessReason::Draining,
         WorkerReadinessReason::OwnershipDrift => ProtoWorkerReadinessReason::OwnershipDrift,
     }
 }
