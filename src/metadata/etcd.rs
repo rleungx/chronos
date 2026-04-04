@@ -182,13 +182,6 @@ impl EtcdMetadataStore {
         Self::connect_with_options(endpoints, prefix, None).await
     }
 
-    #[deprecated(
-        note = "Use EtcdMetadataStore::from_config for validated config-driven startup, or EtcdMetadataStore::from_raw_endpoints_unchecked when intentionally bypassing validation/runtime options."
-    )]
-    pub async fn new(endpoints: Vec<String>, prefix: String) -> Result<Self, TsoError> {
-        Self::from_raw_endpoints_unchecked(endpoints, prefix).await
-    }
-
     async fn connect_with_options(
         endpoints: Vec<String>,
         prefix: String,

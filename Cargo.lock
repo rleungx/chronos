@@ -219,7 +219,6 @@ dependencies = [
  "etcd-client",
  "futures",
  "hyper",
- "lazy_static",
  "prometheus",
  "prost",
  "prost-types",
