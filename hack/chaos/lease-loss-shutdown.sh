@@ -15,10 +15,10 @@ WAIT_INTERVAL_SECS="${CHRONOS_CHAOS_WAIT_INTERVAL_SECS:-1}"
 UNIQUE_SUFFIX="$(date +%s)-$$"
 ETCD_PREFIX="${CHRONOS_CHAOS_ETCD_PREFIX:-/chronos-chaos-${UNIQUE_SUFFIX}}"
 WORKER_ID="${CHRONOS_CHAOS_WORKER_ID:-worker-chaos}"
+INSTANCE_ID="${CHRONOS_CHAOS_INSTANCE_ID:-${SERVICE_ENDPOINT}}"
 BENCH_DURATION_SECS="${CHRONOS_CHAOS_BENCH_DURATION_SECS:-3}"
 SAFETY_GAP_MS="${CHRONOS_CHAOS_SAFETY_GAP_MS:-1}"
 LEASE_TTL_MS="${CHRONOS_CHAOS_LEASE_TTL_MS:-1500}"
-LEASE_EXPIRY_WAIT_SECS="${CHRONOS_CHAOS_LEASE_EXPIRY_WAIT_SECS:-$(( (LEASE_TTL_MS + 999) / 1000 + 1 ))}"
 ARTIFACT_ROOT="${CHRONOS_CHAOS_ARTIFACT_DIR:-${CHRONOS_ARTIFACT_DIR:-}}"
 KEEP_ARTIFACTS_ON_SUCCESS="${CHRONOS_CHAOS_KEEP_ARTIFACTS_ON_SUCCESS:-${CHRONOS_KEEP_ARTIFACTS_ON_SUCCESS:-0}}"
 STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -65,9 +65,9 @@ metrics_endpoint=${METRICS_ENDPOINT}
 bench_duration_secs=${BENCH_DURATION_SECS}
 etcd_prefix=${ETCD_PREFIX}
 worker_id=${WORKER_ID}
+instance_id=${INSTANCE_ID}
 safety_gap_ms=${SAFETY_GAP_MS}
 lease_ttl_ms=${LEASE_TTL_MS}
-lease_expiry_wait_secs=${LEASE_EXPIRY_WAIT_SECS}
 artifact_dir=${ARTIFACT_DIR}
 artifact_index=${INDEX_LOG}
 chronos_log=${CHRONOS_LOG}
@@ -148,6 +148,34 @@ wait_for_degrade_or_exit() {
   return 1
 }
 
+wait_for_identity_release() {
+  local key="${ETCD_PREFIX}/identity/instances/${INSTANCE_ID}"
+  local last_error=""
+  for _attempt in $(seq 1 "${WAIT_ATTEMPTS}"); do
+    local output
+    if output="$(docker exec -e ETCDCTL_API=3 chronos-etcd etcdctl --endpoints="http://${ETCD_ENDPOINTS}" get "${key}" --keys-only 2>&1)"; then
+      if [[ -z "${output}" ]]; then
+        return 0
+      fi
+      last_error="identity key still present: ${key}"
+    else
+      last_error="${output}"
+    fi
+
+    if [[ -n "${last_error}" ]]; then
+      echo "[chaos] waiting for identity release: ${last_error}" >&2
+    fi
+
+    sleep "${WAIT_INTERVAL_SECS}"
+  done
+  if [[ -n "${last_error}" ]]; then
+    echo "identity lease key did not expire in time: ${key}; last observation: ${last_error}" >&2
+  else
+    echo "identity lease key did not expire in time: ${key}" >&2
+  fi
+  return 1
+}
+
 start_chronos() {
   : >"${CHRONOS_LOG}"
   env \
@@ -159,6 +187,7 @@ start_chronos() {
     CHRONOS_ETCD_ENDPOINTS="${ETCD_ENDPOINTS}" \
     CHRONOS_ETCD_PREFIX="${ETCD_PREFIX}" \
     CHRONOS_WORKER_ID="${WORKER_ID}" \
+    CHRONOS_INSTANCE_ID="${INSTANCE_ID}" \
     CHRONOS_SAFETY_GAP_MS="${SAFETY_GAP_MS}" \
     CHRONOS_LEASE_TTL_MS="${LEASE_TTL_MS}" \
     "${RELEASE_BIN_DIR}/chronos" >"${CHRONOS_LOG}" 2>&1 &
@@ -191,8 +220,8 @@ if [[ -n "${CHRONOS_PID}" ]] && kill -0 "${CHRONOS_PID}" 2>/dev/null; then
   wait "${CHRONOS_PID}" 2>/dev/null || true
 fi
 
-echo "[chaos] waiting for identity lease expiry (${LEASE_EXPIRY_WAIT_SECS}s)"
-sleep "${LEASE_EXPIRY_WAIT_SECS}"
+echo "[chaos] waiting for identity lease release (${INSTANCE_ID})"
+wait_for_identity_release
 
 echo "[chaos] restarting chronos"
 start_chronos
