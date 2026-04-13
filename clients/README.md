@@ -16,9 +16,21 @@ Shared behavior:
 - Route refresh reconnects allocation traffic to the current owner endpoint
 - Other RPC failures are returned to the caller
 
+The protobuf route-management RPCs remain part of the wire contract, but they are treated as
+internal client machinery rather than the preferred application integration surface.
+
 ## Languages
 
 - Go: `clients/go/README.md`
 - Rust: `clients/rust/README.md`
 - Java: `clients/java/README.md`
 - C++: `clients/cpp/README.md`
+
+## Support level
+
+| Language | Status | Notes |
+|---|---|---|
+| Rust | Primary | In-repo implementation, linted, and tested |
+| Go | Primary | Packaged submodule with generated proto and tests |
+| Java | Repository-local | In-repo implementation and tests, not yet a published SDK artifact |
+| C++ | Repository-local | In-repo implementation and tests, not yet a published SDK artifact |

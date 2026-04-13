@@ -2,6 +2,8 @@
 
 `Client` is the Rust application-facing Chronos client implementation.
 
+Support level: Primary.
+
 ## Public shape
 
 - `let client = Client::connect(addr, timeline_key).await?`

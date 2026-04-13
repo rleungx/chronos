@@ -11,20 +11,26 @@ import "google/protobuf/empty.proto";
 import "google/protobuf/timestamp.proto";
 import "google/protobuf/wrappers.proto";
 
+// Route-management RPCs are used by language clients internally.
+// Application code should prefer a language-level Client wrapper instead of calling these
+// methods directly.
 service TimelineRouteService {
   rpc GetTimelineRoute(GetTimelineRouteRequest) returns (GetTimelineRouteResponse);
   rpc EnsureTimeline(EnsureTimelineRequest) returns (EnsureTimelineResponse);
 }
 
+// Timestamp allocation is the primary application-facing operation.
 service TimestampService {
   rpc AllocateTimestamps(AllocateTimestampsRequest) returns (AllocateTimestampsResponse);
 }
 
+// Control and health RPCs are intended for operators, control planes, and diagnostics.
 service TimelineControlService {
   rpc TransferTimeline(TransferTimelineRequest) returns (TransferTimelineResponse);
   rpc Health(google.protobuf.Empty) returns (HealthResponse);
 }
 
+// Status RPCs are intended for diagnostics and operator tooling.
 service TimelineStatusService {
   rpc GetTimelineStatus(GetTimelineStatusRequest) returns (GetTimelineStatusResponse);
   rpc ListTimelineStatuses(ListTimelineStatusesRequest) returns (ListTimelineStatusesResponse);

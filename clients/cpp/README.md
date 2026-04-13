@@ -2,6 +2,8 @@
 
 `Client` is the C++ application-facing Chronos client implementation.
 
+Support level: Repository-local implementation.
+
 ## Public shape
 
 - `Client client(addr, timeline_key)`

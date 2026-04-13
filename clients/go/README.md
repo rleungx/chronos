@@ -2,6 +2,8 @@
 
 `chronos` is the Go application-facing Chronos client.
 
+Support level: Primary.
+
 ## Public shape
 
 - `client, err := chronos.New(ctx, addr, timelineKey)`

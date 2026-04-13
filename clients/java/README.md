@@ -2,6 +2,8 @@
 
 `Client` is the Java application-facing Chronos client implementation.
 
+Support level: Repository-local implementation.
+
 ## Public shape
 
 - `client = new Client(addr, timelineKey)`
