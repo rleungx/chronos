@@ -9,10 +9,11 @@ repositories {
 
 dependencies {
     implementation("com.google.protobuf:protobuf-java:4.28.3")
-    implementation("io.grpc:grpc-netty-shaded:1.68.1")
+    implementation("io.grpc:grpc-okhttp:1.68.1")
     implementation("io.grpc:grpc-protobuf:1.68.1")
     implementation("io.grpc:grpc-stub:1.68.1")
     compileOnly("org.apache.tomcat:annotations-api:6.0.53")
+    testImplementation("io.grpc:grpc-inprocess:1.68.1")
     testImplementation("org.junit.jupiter:junit-jupiter:5.11.3")
     testRuntimeOnly("org.junit.platform:junit-platform-launcher:1.11.3")
 }
@@ -46,11 +47,11 @@ sourceSets {
 
 protobuf {
     protoc {
-        artifact = "com.google.protobuf:protoc:4.28.3"
+        artifact = "com.google.protobuf:protoc:4.28.3:osx-aarch_64@exe"
     }
     plugins {
         create("grpc") {
-            artifact = "io.grpc:protoc-gen-grpc-java:1.68.1"
+            artifact = "io.grpc:protoc-gen-grpc-java:1.68.1:osx-aarch_64@exe"
         }
     }
     generateProtoTasks {

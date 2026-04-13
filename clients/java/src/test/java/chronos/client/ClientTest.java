@@ -17,12 +17,13 @@ import com.chronos.tso.v1.TimelineRouteServiceGrpc;
 import com.chronos.tso.v1.TimestampRange;
 import com.chronos.tso.v1.TimestampServiceGrpc;
 import com.google.protobuf.Any;
+import io.grpc.ManagedChannel;
 import io.grpc.Server;
-import io.grpc.ServerBuilder;
 import io.grpc.Status;
+import io.grpc.inprocess.InProcessChannelBuilder;
+import io.grpc.inprocess.InProcessServerBuilder;
 import io.grpc.protobuf.StatusProto;
 import io.grpc.stub.StreamObserver;
-import java.io.IOException;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -34,9 +35,12 @@ final class ClientTest {
     var staleOnFirstAllocate = new AtomicBoolean(true);
     var routeVersion = new AtomicInteger(11);
     var allocateCalls = new AtomicInteger();
+    var ownerServerName = InProcessServerBuilder.generateName();
+    var routeServerName = InProcessServerBuilder.generateName();
 
     Server ownerServer =
-        ServerBuilder.forPort(0)
+        InProcessServerBuilder.forName(ownerServerName)
+            .directExecutor()
             .addService(
                 new TimestampServiceGrpc.TimestampServiceImplBase() {
                   @Override
@@ -76,10 +80,9 @@ final class ClientTest {
             .build()
             .start();
 
-    String ownerEndpoint = "127.0.0.1:" + ownerServer.getPort();
-
     Server routeServer =
-        ServerBuilder.forPort(0)
+        InProcessServerBuilder.forName(routeServerName)
+            .directExecutor()
             .addService(
                 new TimelineRouteServiceGrpc.TimelineRouteServiceImplBase() {
                   @Override
@@ -92,7 +95,7 @@ final class ClientTest {
                                 TimelineRoute.newBuilder()
                                     .setTimelineKey(request.getTimelineKey())
                                     .setGeneratorId(7)
-                                    .setOwnerWorkerEndpoint(ownerEndpoint)
+                                    .setOwnerWorkerEndpoint(ownerServerName)
                                     .setEpoch(3)
                                     .setRouteVersion(routeVersion.get())
                                     .setResourceTier(ResourceTier.RESOURCE_TIER_SHARED)
@@ -111,7 +114,7 @@ final class ClientTest {
                                 TimelineRoute.newBuilder()
                                     .setTimelineKey(request.getTimelineKey())
                                     .setGeneratorId(7)
-                                    .setOwnerWorkerEndpoint(ownerEndpoint)
+                                    .setOwnerWorkerEndpoint(ownerServerName)
                                     .setEpoch(3)
                                     .setRouteVersion(routeVersion.get())
                                     .setResourceTier(ResourceTier.RESOURCE_TIER_SHARED)
@@ -123,15 +126,20 @@ final class ClientTest {
             .build()
             .start();
 
-    String routeEndpoint = "127.0.0.1:" + routeServer.getPort();
+    ManagedChannel routeChannel =
+        InProcessChannelBuilder.forName(routeServerName).directExecutor().build();
 
-    try (Client client = new Client(routeEndpoint, "orders.primary")) {
+    try (Client client = new Client(
+        routeChannel,
+        "orders.primary",
+        ignored -> InProcessChannelBuilder.forName(ownerServerName).directExecutor().build())) {
       List<TimestampRange> ranges = client.allocateTimestamps(1);
       assertEquals(1, ranges.size());
       assertEquals(100, ranges.get(0).getStartTso());
       assertEquals(2, allocateCalls.get());
       assertFalse(staleOnFirstAllocate.get());
     } finally {
+      routeChannel.shutdownNow();
       ownerServer.shutdownNow();
       routeServer.shutdownNow();
     }

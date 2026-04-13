@@ -19,7 +19,12 @@ import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 
-public final class Client implements AutoCloseable {
+public class Client implements AutoCloseable {
+  @FunctionalInterface
+  interface AllocationChannelFactory {
+    ManagedChannel create(String ownerWorkerEndpoint);
+  }
+
   private final ManagedChannel routeChannel;
   private ManagedChannel tsoChannel;
   private final TimelineRouteServiceGrpc.TimelineRouteServiceBlockingStub routeStub;
@@ -27,11 +32,30 @@ public final class Client implements AutoCloseable {
   private final ConcurrentHashMap<String, TimelineRoute> cache = new ConcurrentHashMap<>();
   private final AtomicLong requestId = new AtomicLong(1);
   private final String timelineKey;
+  private final AllocationChannelFactory allocationChannelFactory;
 
   public Client(String addr, String timelineKey) {
-    this.routeChannel = ManagedChannelBuilder.forTarget(addr).usePlaintext().build();
+    this(
+        ManagedChannelBuilder.forTarget(addr).usePlaintext().build(),
+        timelineKey,
+        ownerWorkerEndpoint -> ManagedChannelBuilder.forTarget(ownerWorkerEndpoint).usePlaintext().build());
+  }
+
+  Client(ManagedChannel routeChannel, String timelineKey) {
+    this(
+        routeChannel,
+        timelineKey,
+        ownerWorkerEndpoint -> ManagedChannelBuilder.forTarget(ownerWorkerEndpoint).usePlaintext().build());
+  }
+
+  Client(
+      ManagedChannel routeChannel,
+      String timelineKey,
+      AllocationChannelFactory allocationChannelFactory) {
+    this.routeChannel = routeChannel;
     this.routeStub = TimelineRouteServiceGrpc.newBlockingStub(routeChannel);
     this.timelineKey = timelineKey;
+    this.allocationChannelFactory = allocationChannelFactory;
     ensureRoute();
   }
 
@@ -71,7 +95,7 @@ public final class Client implements AutoCloseable {
     if (tsoChannel != null) {
       tsoChannel.shutdownNow();
     }
-    tsoChannel = ManagedChannelBuilder.forTarget(route.getOwnerWorkerEndpoint()).usePlaintext().build();
+    tsoChannel = allocationChannelFactory.create(route.getOwnerWorkerEndpoint());
     tsoStub = TimestampServiceGrpc.newBlockingStub(tsoChannel);
     cache.put(timelineKey, route);
     return route;
