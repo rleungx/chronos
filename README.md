@@ -41,9 +41,9 @@ Advanced Rust configuration should use `ClientConfig` builder methods, not publi
 - Route ensure, route refresh, and stale-route retry are internal client behavior.
 - Route refresh reconnects allocation traffic to the current owner endpoint.
 
-## Examples
+## Client Docs
 
 - Go client: `clients/go/README.md`
 - Java client: `clients/java/README.md`
 - C++ client: `clients/cpp/README.md`
-- Rust: `examples/rust/chronos_client_example.md`
+- Rust example: `examples/rust/chronos_client_example.md`
