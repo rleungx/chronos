@@ -30,7 +30,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use prost::Message;
 use thiserror::Error;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Code, Status};
 
@@ -69,7 +69,6 @@ impl ClientConfig {
         self.request_timeout_ms = request_timeout_ms;
         self
     }
-
 }
 
 #[derive(Debug, Error)]
@@ -102,9 +101,9 @@ impl From<Status> for ClientError {
 /// `allocate_timestamps` as needed. Route ownership changes are handled internally.
 pub struct Client {
     route_client: Mutex<TimelineRouteServiceClient<Channel>>,
-    tso_client: Mutex<TimestampServiceClient<Channel>>,
+    tso_client: RwLock<TimestampServiceClient<Channel>>,
     owner_endpoint: Mutex<String>,
-    route: Mutex<TimelineRoute>,
+    route: RwLock<TimelineRoute>,
     config: ClientConfig,
     request_id: AtomicU64,
 }
@@ -138,10 +137,7 @@ impl Client {
         Self::with_channel(channel, config).await
     }
 
-    pub async fn with_channel(
-        channel: Channel,
-        config: ClientConfig,
-    ) -> Result<Self, ClientError> {
+    pub async fn with_channel(channel: Channel, config: ClientConfig) -> Result<Self, ClientError> {
         let mut route_client = TimelineRouteServiceClient::new(channel.clone());
         let ensured_route = route_client
             .ensure_timeline(tonic::Request::new(EnsureTimelineRequest {
@@ -154,15 +150,14 @@ impl Client {
             .ok_or(ClientError::MissingRoute {
                 operation: "ensure_timeline",
             })?;
-        let tso_client = TimestampServiceClient::new(connect_channel(
-            &ensured_route.owner_worker_endpoint,
-        )?);
+        let tso_client =
+            TimestampServiceClient::new(connect_channel(&ensured_route.owner_worker_endpoint)?);
 
         Ok(Self {
             route_client: Mutex::new(route_client),
-            tso_client: Mutex::new(tso_client),
+            tso_client: RwLock::new(tso_client),
             owner_endpoint: Mutex::new(ensured_route.owner_worker_endpoint.clone()),
-            route: Mutex::new(ensured_route),
+            route: RwLock::new(ensured_route),
             config,
             request_id: AtomicU64::new(1),
         })
@@ -176,12 +171,14 @@ impl Client {
         &self,
         count: u32,
     ) -> Result<Vec<TimestampRange>, ClientError> {
-        let route = self.route.lock().await.clone();
-        match self.allocate_once(&route, count).await {
+        let route = self.route.read().await.clone();
+        let tso_client = self.tso_client.read().await.clone();
+        match self.allocate_once(tso_client, &route, count).await {
             Ok(ranges) => Ok(ranges),
             Err(status) if is_stale_route_error(&status) => {
                 let route = self.refresh_route().await?;
-                self.allocate_once(&route, count)
+                let tso_client = self.tso_client.read().await.clone();
+                self.allocate_once(tso_client, &route, count)
                     .await
                     .map_err(ClientError::from)
             }
@@ -203,8 +200,9 @@ impl Client {
             .ok_or(ClientError::MissingRoute {
                 operation: "get_timeline_route",
             })?;
-        self.ensure_owner_client(&route.owner_worker_endpoint).await?;
-        *self.route.lock().await = route.clone();
+        self.ensure_owner_client(&route.owner_worker_endpoint)
+            .await?;
+        *self.route.write().await = route.clone();
         Ok(route)
     }
 
@@ -215,20 +213,28 @@ impl Client {
         }
 
         let channel = connect_channel(owner_endpoint)?;
-        *self.tso_client.lock().await = TimestampServiceClient::new(channel);
+        *self.tso_client.write().await = TimestampServiceClient::new(channel);
         *current_owner = owner_endpoint.to_string();
         Ok(())
     }
 
     async fn allocate_once(
         &self,
+        mut tso_client: TimestampServiceClient<Channel>,
         route: &TimelineRoute,
         count: u32,
     ) -> Result<Vec<TimestampRange>, Status> {
-        Ok(self
-            .tso_client
-            .lock()
+        self.allocate_with_client(&mut tso_client, route, count)
             .await
+    }
+
+    async fn allocate_with_client(
+        &self,
+        tso_client: &mut TimestampServiceClient<Channel>,
+        route: &TimelineRoute,
+        count: u32,
+    ) -> Result<Vec<TimestampRange>, Status> {
+        Ok(tso_client
             .allocate_timestamps(tonic::Request::new(AllocateTimestampsRequest {
                 timeline_key: route.timeline_key.clone(),
                 count,
@@ -258,9 +264,9 @@ fn normalize_endpoint(endpoint: &str) -> String {
 fn connect_channel(endpoint: &str) -> Result<Channel, ClientError> {
     let normalized = normalize_endpoint(endpoint);
     let endpoint = Endpoint::from_shared(normalized).map_err(|source| ClientError::Endpoint {
-            endpoint: endpoint.to_string(),
-            source,
-        })?;
+        endpoint: endpoint.to_string(),
+        source,
+    })?;
     Ok(endpoint.connect_lazy())
 }
 
@@ -288,14 +294,14 @@ mod tests {
     use prost::Message;
     use tokio::net::TcpListener;
     use tokio_stream::wrappers::TcpListenerStream;
-    use tonic::{Code, Request, Response};
     use tonic::transport::Server;
+    use tonic::{Code, Request, Response};
 
     use crate::metadata::MemoryMetadataStore;
     use crate::proto::v1::{
         timeline_route_service_server::TimelineRouteServiceServer,
-        timestamp_service_server::TimestampServiceServer,
-        AllocateTimestampsResponse, EnsureTimelineRequest, EnsureTimelineResponse, GetTimelineRouteRequest,
+        timestamp_service_server::TimestampServiceServer, AllocateTimestampsResponse,
+        EnsureTimelineRequest, EnsureTimelineResponse, GetTimelineRouteRequest,
         GetTimelineRouteResponse, TimelineRoute,
     };
     use crate::rpc::{TsoRouteService, TsoTimestampService};
@@ -352,7 +358,9 @@ mod tests {
         ) -> Result<Response<GetTimelineRouteResponse>, Status> {
             let mut route = self.route.lock().unwrap().clone();
             route.timeline_key = request.into_inner().timeline_key;
-            Ok(Response::new(GetTimelineRouteResponse { route: Some(route) }))
+            Ok(Response::new(GetTimelineRouteResponse {
+                route: Some(route),
+            }))
         }
 
         async fn ensure_timeline(
@@ -414,8 +422,12 @@ mod tests {
     }
 
     async fn spawn_route_only_server(route: TimelineRoute) -> String {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener should bind");
-        let addr = listener.local_addr().expect("listener should have local addr");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener
+            .local_addr()
+            .expect("listener should have local addr");
         let incoming = TcpListenerStream::new(listener);
         let route_service = FakeRouteService {
             route: Arc::new(StdMutex::new(route)),
@@ -433,8 +445,12 @@ mod tests {
     }
 
     async fn spawn_timestamp_only_server(route: TimelineRoute) -> String {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener should bind");
-        let addr = listener.local_addr().expect("listener should have local addr");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener
+            .local_addr()
+            .expect("listener should have local addr");
         let incoming = TcpListenerStream::new(listener);
         let timestamp_service = FakeTimestampService {
             route: Arc::new(StdMutex::new(route)),
@@ -474,7 +490,7 @@ mod tests {
             .expect("client should connect");
 
         {
-            let mut route = client.route.lock().await;
+            let mut route = client.route.write().await;
             route.route_version += 1;
         }
 
@@ -484,6 +500,36 @@ mod tests {
             .expect("allocation should recover after route refresh");
 
         assert_eq!(ranges.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_allocations_recover_from_shared_stale_cached_route() {
+        let endpoint = spawn_test_server().await;
+        let client = Arc::new(
+            Client::connect(endpoint, "orders.primary")
+                .await
+                .expect("client should connect"),
+        );
+
+        {
+            let mut route = client.route.write().await;
+            route.route_version += 1;
+        }
+
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let client = Arc::clone(&client);
+            tasks.push(tokio::spawn(async move {
+                client
+                    .allocate_timestamps(1)
+                    .await
+                    .expect("allocation should recover after shared stale route");
+            }));
+        }
+
+        for task in tasks {
+            task.await.expect("task should complete");
+        }
     }
 
     #[tokio::test]

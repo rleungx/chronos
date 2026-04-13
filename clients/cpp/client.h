@@ -21,6 +21,7 @@ class Client {
   chronos::tso::v1::TimelineRoute EnsureRouteLocked();
   chronos::tso::v1::TimelineRoute RefreshRouteLocked();
   grpc::Status AllocateOnce(
+      chronos::tso::v1::TimestampService::Stub& tso_stub,
       const chronos::tso::v1::TimelineRoute& route,
       chronos::tso::v1::AllocateTimestampsResponse* response,
       uint32_t count);
@@ -29,7 +30,7 @@ class Client {
   std::shared_ptr<grpc::Channel> route_channel_;
   std::shared_ptr<grpc::Channel> tso_channel_;
   std::unique_ptr<chronos::tso::v1::TimelineRouteService::Stub> route_stub_;
-  std::unique_ptr<chronos::tso::v1::TimestampService::Stub> tso_stub_;
+  std::shared_ptr<chronos::tso::v1::TimestampService::Stub> tso_stub_;
   std::unordered_map<std::string, chronos::tso::v1::TimelineRoute> cache_;
   std::string timeline_key_;
   std::mutex mu_;

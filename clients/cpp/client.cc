@@ -19,18 +19,26 @@ Client::Client(const std::string& addr, const std::string& timeline_key)
 }
 
 std::vector<chronos::tso::v1::TimestampRange> Client::AllocateTimestamps(uint32_t count) {
-  std::lock_guard<std::mutex> lock(mu_);
-  auto route = EnsureRouteLocked();
+  auto route = EnsureRoute();
+  std::shared_ptr<TimestampService::Stub> tso_stub;
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    tso_stub = tso_stub_;
+  }
   AllocateTimestampsResponse response;
-  auto status = AllocateOnce(route, &response, count);
+  auto status = AllocateOnce(*tso_stub, route, &response, count);
   if (status.ok()) {
     return {response.ranges().begin(), response.ranges().end()};
   }
   if (!IsStaleRouteError(status)) {
     throw std::runtime_error(status.error_message());
   }
-  route = RefreshRouteLocked();
-  status = AllocateOnce(route, &response, count);
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    route = RefreshRouteLocked();
+    tso_stub = tso_stub_;
+  }
+  status = AllocateOnce(*tso_stub, route, &response, count);
   if (!status.ok()) {
     throw std::runtime_error(status.error_message());
   }
@@ -70,12 +78,13 @@ TimelineRoute Client::RefreshRouteLocked() {
   }
   auto route = response.route();
   tso_channel_ = grpc::CreateChannel(route.owner_worker_endpoint(), grpc::InsecureChannelCredentials());
-  tso_stub_ = TimestampService::NewStub(tso_channel_);
+  tso_stub_ = std::shared_ptr<TimestampService::Stub>(TimestampService::NewStub(tso_channel_).release());
   cache_[timeline_key_] = route;
   return route;
 }
 
 grpc::Status Client::AllocateOnce(
+    TimestampService::Stub& tso_stub,
     const TimelineRoute& route,
     AllocateTimestampsResponse* response,
     uint32_t count) {
@@ -86,7 +95,7 @@ grpc::Status Client::AllocateOnce(
   request.set_expected_epoch(route.epoch());
   request.set_expected_route_version(route.route_version());
   request.set_client_request_id(route.timeline_key() + "-" + std::to_string(request_id_++));
-  return tso_stub_->AllocateTimestamps(&ctx, request, response);
+  return tso_stub.AllocateTimestamps(&ctx, request, response);
 }
 
 bool Client::IsStaleRouteError(const grpc::Status& status) {

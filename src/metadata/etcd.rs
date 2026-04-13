@@ -120,6 +120,12 @@ fn prefix_range_end(prefix: &str) -> Vec<u8> {
 }
 
 impl EtcdMetadataStore {
+    async fn probe_metadata_runtime(&self) -> Result<(), TsoError> {
+        self.load_timeline("__chronos_startup_probe__").await?;
+        self.load_generator(0).await?;
+        Ok(())
+    }
+
     fn route_watch_task_lock(&self) -> MutexGuard<'_, Option<JoinHandle<()>>> {
         match self.route_watch_task.lock() {
             Ok(guard) => guard,
@@ -133,7 +139,7 @@ impl EtcdMetadataStore {
     /// Official config-driven entrypoint for production/library callers.
     ///
     /// This path applies the shared etcd endpoint contract plus config-driven timeout and mTLS
-    /// wiring before dialing etcd.
+    /// wiring before dialing etcd, then performs a minimal metadata probe before returning.
     pub async fn from_config(config: &TsoConfig, prefix: String) -> Result<Self, TsoError> {
         Self::from_config_endpoints(config, config.etcd_endpoints.clone(), prefix).await
     }
@@ -141,7 +147,8 @@ impl EtcdMetadataStore {
     /// Startup entrypoint when typed startup metadata owns the etcd bootstrap tuple.
     ///
     /// This keeps config-derived timeout and mTLS wiring while making the dial target come from
-    /// the typed startup authority rather than a mirrored config field.
+    /// the typed startup authority rather than a mirrored config field. Like `from_config`, this
+    /// verifies basic metadata RPC reachability before returning.
     pub async fn from_config_with_endpoints(
         config: &TsoConfig,
         endpoints: Vec<String>,
@@ -162,7 +169,12 @@ impl EtcdMetadataStore {
             .validate_authoritative_metadata_store_contract(&endpoints, &prefix)
             .map_err(|error| TsoError::Internal(error.to_string()))?;
         let options = build_etcd_connect_options(config, &endpoints)?;
-        Self::connect_with_options(endpoints, prefix, options).await
+        let store = Self::connect_with_options(endpoints, prefix, options).await?;
+        if let Err(error) = store.probe_metadata_runtime().await {
+            store.shutdown_route_watch().await;
+            return Err(error);
+        }
+        Ok(store)
     }
 
     /// Raw etcd entrypoint for tests or explicitly unchecked callers.

@@ -18,6 +18,7 @@ import io.grpc.protobuf.StatusProto;
 import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 
 public class Client implements AutoCloseable {
   @FunctionalInterface
@@ -26,9 +27,10 @@ public class Client implements AutoCloseable {
   }
 
   private final ManagedChannel routeChannel;
-  private ManagedChannel tsoChannel;
   private final TimelineRouteServiceGrpc.TimelineRouteServiceBlockingStub routeStub;
-  private TimestampServiceGrpc.TimestampServiceBlockingStub tsoStub;
+  private final AtomicReference<ManagedChannel> tsoChannel = new AtomicReference<>();
+  private final AtomicReference<TimestampServiceGrpc.TimestampServiceBlockingStub> tsoStub =
+      new AtomicReference<>();
   private final ConcurrentHashMap<String, TimelineRoute> cache = new ConcurrentHashMap<>();
   private final AtomicLong requestId = new AtomicLong(1);
   private final String timelineKey;
@@ -92,17 +94,19 @@ public class Client implements AutoCloseable {
         routeStub
             .getTimelineRoute(GetTimelineRouteRequest.newBuilder().setTimelineKey(timelineKey).build())
             .getRoute();
-    if (tsoChannel != null) {
-      tsoChannel.shutdownNow();
+    ManagedChannel previous = tsoChannel.getAndSet(null);
+    if (previous != null) {
+      previous.shutdownNow();
     }
-    tsoChannel = allocationChannelFactory.create(route.getOwnerWorkerEndpoint());
-    tsoStub = TimestampServiceGrpc.newBlockingStub(tsoChannel);
+    ManagedChannel nextChannel = allocationChannelFactory.create(route.getOwnerWorkerEndpoint());
+    tsoChannel.set(nextChannel);
+    tsoStub.set(TimestampServiceGrpc.newBlockingStub(nextChannel));
     cache.put(timelineKey, route);
     return route;
   }
 
   private AllocateTimestampsResponse allocateOnce(TimelineRoute route, int count) {
-    return tsoStub.allocateTimestamps(
+    return tsoStub.get().allocateTimestamps(
         AllocateTimestampsRequest.newBuilder()
             .setTimelineKey(route.getTimelineKey())
             .setCount(count)
@@ -136,8 +140,9 @@ public class Client implements AutoCloseable {
 
   @Override
   public synchronized void close() {
-    if (tsoChannel != null) {
-      tsoChannel.shutdownNow();
+    ManagedChannel currentTsoChannel = tsoChannel.getAndSet(null);
+    if (currentTsoChannel != null) {
+      currentTsoChannel.shutdownNow();
     }
     routeChannel.shutdownNow();
   }
