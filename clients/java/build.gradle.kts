@@ -34,7 +34,7 @@ sourceSets {
             setSrcDirs(emptyList<String>())
         }
         proto {
-            srcDir("proto")
+            srcDir(layout.buildDirectory.dir("clientProto"))
             include("tso.proto")
         }
     }
@@ -43,6 +43,11 @@ sourceSets {
             setSrcDirs(emptyList<String>())
         }
     }
+}
+
+val syncRootProto by tasks.registering(Copy::class) {
+    from(layout.projectDirectory.file("../../tso.proto"))
+    into(layout.buildDirectory.dir("clientProto"))
 }
 
 protobuf {
@@ -74,6 +79,7 @@ tasks.test {
 }
 
 tasks.named("generateProto") {
+    dependsOn(syncRootProto)
     mustRunAfter(tasks.named("processResources"))
     mustRunAfter(tasks.named("processTestResources"))
     mustRunAfter(tasks.named("extractIncludeTestProto"))
@@ -82,4 +88,8 @@ tasks.named("generateProto") {
 
 tasks.named("generateTestProto") {
     enabled = false
+}
+
+tasks.named("processResources") {
+    mustRunAfter(syncRootProto)
 }
