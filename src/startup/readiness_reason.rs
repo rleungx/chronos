@@ -51,9 +51,6 @@ pub(crate) fn startup_bootstrap_failure_reason(
         Some(TsoError::InstanceIdentityInUse { .. }) => {
             WorkerReadinessReason::IdentityLeaseAcquireFailed
         }
-        Some(TsoError::ClusterContractMismatch { .. }) => {
-            WorkerReadinessReason::ClusterContractMismatch
-        }
         _ => WorkerReadinessReason::MetadataStartupProbeFailed,
     }
 }

@@ -5,25 +5,23 @@ use crate::proto::v1::{
     timeline_route_service_server::TimelineRouteService,
     timestamp_service_server::TimestampService, AllocateTimestampsRequest,
     AllocateTimestampsResponse, EnsureTimelineRequest, EnsureTimelineResponse,
-    GetTimelineRouteRequest, GetTimelineRouteResponse, WatchTimelineRoutesRequest,
+    GetTimelineRouteRequest, GetTimelineRouteResponse,
 };
 use crate::timeline_proxy::TimelineScopedAllocator;
-use crate::{ResourceTier, TsoControlPlane, TsoDataPlane};
+use crate::{
+    AllocateTimestampsRequest as InternalAllocateTimestampsRequest, ResourceTier, TimestampRange,
+    TsoControlPlane, TsoDataPlane,
+};
 
-use super::{status_mapping, translation, watch_allocate_entry};
+use super::{status_mapping, translation};
 
 pub struct TsoRouteService {
     control_plane: TsoControlPlane,
-    route_cache_ttl_ms: u32,
 }
 
 impl TsoRouteService {
     pub fn new(control_plane: TsoControlPlane) -> Self {
-        let route_cache_ttl_ms = control_plane.route_cache_ttl_ms();
-        Self {
-            control_plane,
-            route_cache_ttl_ms,
-        }
+        Self { control_plane }
     }
 }
 
@@ -49,29 +47,10 @@ impl TimelineRouteService for TsoRouteService {
             .await
         {
             Ok(route) => Ok(Response::new(GetTimelineRouteResponse {
-                route: Some(status_mapping::proto_timeline_route(
-                    route,
-                    self.route_cache_ttl_ms,
-                )),
+                route: Some(status_mapping::proto_timeline_route(route)),
             })),
             Err(e) => Err(translation::map_tso_error(e)),
         }
-    }
-
-    type WatchTimelineRoutesStream = watch_allocate_entry::WatchTimelineRoutesStream;
-
-    async fn watch_timeline_routes(
-        &self,
-        request: Request<WatchTimelineRoutesRequest>,
-    ) -> Result<Response<Self::WatchTimelineRoutesStream>, Status> {
-        Ok(Response::new(
-            watch_allocate_entry::watch_timeline_routes_stream(
-                &self.control_plane,
-                self.route_cache_ttl_ms,
-                request.into_inner(),
-            )
-            .await?,
-        ))
     }
 
     async fn ensure_timeline(
@@ -87,10 +66,7 @@ impl TimelineRouteService for TsoRouteService {
             .await
         {
             Ok(route) => Ok(Response::new(EnsureTimelineResponse {
-                route: Some(status_mapping::proto_timeline_route(
-                    route,
-                    self.route_cache_ttl_ms,
-                )),
+                route: Some(status_mapping::proto_timeline_route(route)),
             })),
             Err(e) => Err(translation::map_tso_error(e)),
         }
@@ -116,13 +92,46 @@ impl TimestampService for TsoTimestampService {
         request: Request<AllocateTimestampsRequest>,
     ) -> Result<Response<AllocateTimestampsResponse>, Status> {
         Ok(Response::new(
-            watch_allocate_entry::allocate_timestamps_response(
-                &self.allocator,
-                request.into_inner(),
-            )
-            .await?,
+            allocate_timestamps_response(&self.allocator, request.into_inner()).await?,
         ))
     }
+}
+
+async fn allocate_timestamps_response(
+    allocator: &TimelineScopedAllocator,
+    request: AllocateTimestampsRequest,
+) -> Result<AllocateTimestampsResponse, Status> {
+    let response = allocator
+        .allocate_timestamps_with_timeout(
+            InternalAllocateTimestampsRequest {
+                timeline_key: request.timeline_key.clone(),
+                count: request.count,
+                expected_epoch: request.expected_epoch,
+                expected_route_version: request.expected_route_version,
+                client_request_id: request.client_request_id,
+            },
+            request.request_timeout_ms,
+        )
+        .await
+        .map_err(translation::map_timeline_proxy_error)?;
+
+    Ok(AllocateTimestampsResponse {
+        timeline_key: request.timeline_key,
+        generator_id: response.generator_id,
+        epoch: response.epoch,
+        route_version: response.route_version,
+        ranges: proto_timestamp_ranges(response.ranges),
+    })
+}
+
+fn proto_timestamp_ranges(ranges: Vec<TimestampRange>) -> Vec<crate::proto::v1::TimestampRange> {
+    ranges
+        .into_iter()
+        .map(|range| crate::proto::v1::TimestampRange {
+            start_tso: range.start_tso,
+            end_tso: range.end_tso,
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -140,5 +149,25 @@ mod tests {
             decode_resource_tier(ProtoResourceTier::Dedicated as i32),
             ResourceTier::Dedicated
         );
+    }
+
+    #[test]
+    fn proto_timestamp_ranges_keep_start_and_end_bounds() {
+        let ranges = proto_timestamp_ranges(vec![
+            TimestampRange {
+                start_tso: 10,
+                end_tso: 19,
+            },
+            TimestampRange {
+                start_tso: 20,
+                end_tso: 29,
+            },
+        ]);
+
+        assert_eq!(ranges.len(), 2);
+        assert_eq!(ranges[0].start_tso, 10);
+        assert_eq!(ranges[0].end_tso, 19);
+        assert_eq!(ranges[1].start_tso, 20);
+        assert_eq!(ranges[1].end_tso, 29);
     }
 }

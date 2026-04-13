@@ -6,5 +6,5 @@ mod startup;
 
 #[tokio::main]
 async fn main() -> AppResult<()> {
-    startup::run().await
+    startup::run_cli_or_service().await
 }

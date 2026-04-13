@@ -32,23 +32,18 @@ struct NormalizedTimelineStatusListRequest {
 pub(super) async fn get_timeline_status_response(
     control_plane: &TsoControlPlane,
     request: GetTimelineStatusRequest,
-    route_cache_ttl_ms: u32,
 ) -> Result<GetTimelineStatusResponse, Status> {
     let status = control_plane
         .get_timeline_status(&request.timeline_key)
         .await
         .map_err(translation::map_tso_error)?;
 
-    Ok(status_mapping::get_timeline_status_response(
-        status,
-        route_cache_ttl_ms,
-    ))
+    Ok(status_mapping::get_timeline_status_response(status))
 }
 
 pub(super) async fn list_timeline_statuses_response(
     control_plane: &TsoControlPlane,
     request: ListTimelineStatusesRequest,
-    route_cache_ttl_ms: u32,
 ) -> Result<ListTimelineStatusesResponse, Status> {
     let request = normalize_timeline_status_list_request(request).map_err(|status| *status)?;
     let page = control_plane
@@ -74,7 +69,6 @@ pub(super) async fn list_timeline_statuses_response(
     Ok(status_mapping::list_timeline_statuses_response(
         page.statuses,
         next_page_token,
-        route_cache_ttl_ms,
     ))
 }
 

@@ -76,10 +76,6 @@ impl TimelineRuntimeState {
         self.route_notifier.clone()
     }
 
-    pub(crate) fn subscribe_route_resets(&self) -> broadcast::Receiver<()> {
-        self.route_reset_notifier.subscribe()
-    }
-
     pub(crate) fn reset_notifier(&self) -> broadcast::Sender<()> {
         self.route_reset_notifier.clone()
     }

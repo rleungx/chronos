@@ -1,14 +1,11 @@
 mod health_handle;
 mod public_mapping;
-mod route_mapping;
 mod route_timestamp_service_facade;
 mod service_facade;
 mod status_mapping;
 mod timeline_status_query;
 mod transfer_adapter;
 mod translation;
-mod watch_allocate_entry;
-mod watch_completeness;
 
 use crate::recovery::duration_since_unix_epoch_or_zero;
 use std::time::SystemTime;

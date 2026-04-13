@@ -4,25 +4,16 @@ mod common_etcd_endpoints;
 mod common_etcd_prefix;
 
 use chronos::{
-    build_commit, build_version,
     metadata::{
         EtcdMetadataStore, GeneratorBatchOp, GeneratorLeaseAuthority, GeneratorRecord,
         MemoryMetadataStore, TimelineAuthority, TimelineBatchOp, TimelineRecord,
     },
-    mixed_version_contract_id, ResourceTier, TimelineLifecycleState, TimelineRoute, TsoError,
+    ResourceTier, TimelineLifecycleState, TimelineRoute, TsoError,
 };
 use common_etcd_endpoints::test_etcd_endpoints;
 use common_etcd_prefix::unique_test_etcd_prefix;
-use etcd_client::Client;
 use std::sync::Arc;
 use tokio::sync::Barrier;
-
-#[derive(Debug, serde::Deserialize)]
-struct ClusterContractRecord {
-    contract_id: String,
-    writer_build_version: String,
-    writer_build_commit: String,
-}
 
 fn timeline_record(
     timeline_key: &str,
@@ -76,21 +67,6 @@ async fn real_etcd_store(label: &str) -> Arc<EtcdMetadataStore> {
         .await
         .expect("etcd store should start"),
     )
-}
-
-async fn read_cluster_contract(prefix: &str) -> ClusterContractRecord {
-    let mut client = Client::connect(test_etcd_endpoints(), None)
-        .await
-        .expect("etcd client should connect");
-    let response = client
-        .get(format!("{prefix}/meta/cluster_contract"), None)
-        .await
-        .expect("cluster contract read should succeed");
-    let kv = response
-        .kvs()
-        .first()
-        .expect("cluster contract key should exist");
-    serde_json::from_slice(kv.value()).expect("cluster contract json should decode")
 }
 
 async fn assert_metadata_cas_semantics<S>(store: Arc<S>, timeline_key: &str)
@@ -321,62 +297,4 @@ async fn etcd_metadata_batch_cas_is_atomic() {
         "batch.timeline.b",
     )
     .await;
-}
-
-#[tokio::test]
-#[ignore = "requires a reachable etcd; set CHRONOS_TEST_ETCD_ENDPOINTS or run one on 127.0.0.1:2379"]
-async fn etcd_cluster_contract_key_is_created_on_connect() {
-    let prefix = unique_test_etcd_prefix("cluster-contract-create");
-    let _store =
-        EtcdMetadataStore::from_raw_endpoints_unchecked(test_etcd_endpoints(), prefix.clone())
-            .await
-            .expect("etcd store should start");
-
-    assert_ne!(build_commit(), "unknown");
-    let record = read_cluster_contract(&prefix).await;
-    assert_eq!(record.contract_id, mixed_version_contract_id());
-    assert_eq!(record.writer_build_version, build_version());
-    assert_eq!(record.writer_build_commit, build_commit());
-}
-
-#[tokio::test]
-#[ignore = "requires a reachable etcd; set CHRONOS_TEST_ETCD_ENDPOINTS or run one on 127.0.0.1:2379"]
-async fn etcd_cluster_contract_mismatch_rejects_connect() {
-    let prefix = unique_test_etcd_prefix("cluster-contract-mismatch");
-    let mut client = Client::connect(test_etcd_endpoints(), None)
-        .await
-        .expect("etcd client should connect");
-    client
-        .put(
-            format!("{prefix}/meta/cluster_contract"),
-            serde_json::to_vec(&serde_json::json!({
-                "contract_id": "future-contract-v9",
-                "writer_build_version": "9.9.9",
-                "writer_build_commit": "deadbeef"
-            }))
-            .expect("contract json should serialize"),
-            None,
-        )
-        .await
-        .expect("prewriting cluster contract should succeed");
-
-    let error = match EtcdMetadataStore::from_raw_endpoints_unchecked(test_etcd_endpoints(), prefix)
-        .await
-    {
-        Ok(_) => panic!("mismatched contract should fail startup"),
-        Err(error) => error,
-    };
-
-    assert!(matches!(
-        error,
-        TsoError::ClusterContractMismatch {
-            cluster_contract_id,
-            local_contract_id,
-            cluster_writer_build_version,
-            cluster_writer_build_commit,
-        } if cluster_contract_id == "future-contract-v9"
-            && local_contract_id == mixed_version_contract_id()
-            && cluster_writer_build_version == "9.9.9"
-            && cluster_writer_build_commit == "deadbeef"
-    ));
 }

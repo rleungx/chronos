@@ -92,15 +92,6 @@ pub enum TsoError {
     GeneratorOwnershipMisconfigured { modulo: u32, remainder: u32 },
     #[error("instance identity already in use: {instance_id}")]
     InstanceIdentityInUse { instance_id: String },
-    #[error(
-        "cluster contract mismatch: cluster {cluster_contract_id} ({cluster_writer_build_version}@{cluster_writer_build_commit}), local {local_contract_id}"
-    )]
-    ClusterContractMismatch {
-        cluster_contract_id: String,
-        local_contract_id: String,
-        cluster_writer_build_version: String,
-        cluster_writer_build_commit: String,
-    },
     #[error("target_generator_id is required when transferring timeline {timeline_key} to a remote owner")]
     TargetGeneratorIdRequired { timeline_key: String },
     #[error("internal error: {0}")]

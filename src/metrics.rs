@@ -255,31 +255,12 @@ pub static TSO_BUILD_INFO: LazyLock<IntGaugeVec> = LazyLock::new(|| {
         &["version", "commit"],
     )
 });
-pub static TSO_MIXED_VERSION_CONTRACT_INFO: LazyLock<IntGaugeVec> = LazyLock::new(|| {
-    register_int_gauge_vec_metric(
-        "tso_mixed_version_contract_info",
-        "Chronos mixed-version contract identity",
-        &["contract_id"],
-    )
-});
-pub static TSO_VERSION_COMPATIBILITY_MISMATCH_TOTAL: LazyLock<IntCounterVec> =
-    LazyLock::new(|| {
-        register_int_counter_vec_metric(
-            "tso_version_compatibility_mismatch_total",
-            "Mixed-version compatibility mismatches observed across Chronos surfaces",
-            &["kind"],
-        )
-    });
-
 pub fn init_build_info_metric() {
     TSO_BUILD_INFO
         .with_label_values(&[
             crate::build_info::build_version(),
             crate::build_info::build_commit(),
         ])
-        .set(1);
-    TSO_MIXED_VERSION_CONTRACT_INFO
-        .with_label_values(&[crate::build_info::mixed_version_contract_id()])
         .set(1);
 }
 
@@ -305,8 +286,11 @@ mod tests {
             1
         );
         assert_eq!(
-            TSO_MIXED_VERSION_CONTRACT_INFO
-                .with_label_values(&[crate::build_info::mixed_version_contract_id()])
+            TSO_BUILD_INFO
+                .with_label_values(&[
+                    crate::build_info::build_version(),
+                    crate::build_info::build_commit(),
+                ])
                 .get(),
             1
         );

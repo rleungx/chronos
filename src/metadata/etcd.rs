@@ -93,13 +93,6 @@ struct RouteOnlyTimelineRecord {
     route: TimelineRoute,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct ClusterContractRecord {
-    contract_id: String,
-    writer_build_version: String,
-    writer_build_commit: String,
-}
-
 fn parse_prev_route(value: &[u8]) -> Option<TimelineRoute> {
     serde_json::from_slice::<RouteOnlyTimelineRecord>(value)
         .ok()
@@ -199,7 +192,6 @@ impl EtcdMetadataStore {
             route_watch_shutdown_tx,
             route_watch_task: StdMutex::new(None),
         };
-        store.enforce_cluster_contract().await?;
         store.spawn_route_watch_loop();
         Ok(store)
     }
@@ -218,90 +210,6 @@ impl EtcdMetadataStore {
 
     fn instance_identity_key(&self, instance_id: &str) -> String {
         keys::instance_identity_key(&self.prefix, instance_id)
-    }
-
-    fn cluster_contract_key(&self) -> String {
-        keys::cluster_contract_key(&self.prefix)
-    }
-
-    fn local_cluster_contract_record() -> ClusterContractRecord {
-        ClusterContractRecord {
-            contract_id: crate::build_info::mixed_version_contract_id().to_owned(),
-            writer_build_version: crate::build_info::build_version().to_owned(),
-            writer_build_commit: crate::build_info::build_commit().to_owned(),
-        }
-    }
-
-    async fn enforce_cluster_contract(&self) -> Result<(), TsoError> {
-        let key = self.cluster_contract_key();
-        let local = Self::local_cluster_contract_record();
-        let context = JsonTxnContext {
-            op_label: "cluster_contract_create",
-            serialize_context: "Cluster contract serialization",
-            txn_context: "Etcd cluster contract create failed",
-            invalid_response_context: "Etcd cluster contract create returned invalid response",
-        };
-
-        match self
-            .get_json_record::<ClusterContractRecord>(
-                key.clone(),
-                "cluster_contract_get",
-                "Cluster contract deserialization",
-            )
-            .await?
-        {
-            Some((record, _)) => self.verify_cluster_contract(&record),
-            None => match self.create_json_record(key, &local, context).await {
-                Ok(_) => Ok(()),
-                Err(TsoError::MetadataAlreadyExists) => {
-                    let record = self
-                        .get_json_record::<ClusterContractRecord>(
-                            self.cluster_contract_key(),
-                            "cluster_contract_get",
-                            "Cluster contract deserialization",
-                        )
-                        .await?
-                        .map(|(record, _)| record)
-                        .ok_or_else(|| {
-                            TsoError::Internal(
-                                "cluster contract create raced but key was not readable"
-                                    .to_string(),
-                            )
-                        })?;
-                    self.verify_cluster_contract(&record)
-                }
-                Err(error) => Err(error),
-            },
-        }
-    }
-
-    fn verify_cluster_contract(&self, record: &ClusterContractRecord) -> Result<(), TsoError> {
-        let local_contract_id = crate::build_info::mixed_version_contract_id();
-        if record.contract_id == local_contract_id {
-            return Ok(());
-        }
-
-        metrics::TSO_VERSION_COMPATIBILITY_MISMATCH_TOTAL
-            .with_label_values(&["cluster_contract"])
-            .inc();
-        warn!(
-            component = "metadata",
-            event = "cluster_contract_mismatch",
-            result = "failure",
-            prefix = %self.prefix,
-            cluster_contract_id = %record.contract_id,
-            cluster_writer_build_version = %record.writer_build_version,
-            cluster_writer_build_commit = %record.writer_build_commit,
-            local_contract_id,
-            local_build_version = crate::build_info::build_version(),
-            local_build_commit = crate::build_info::build_commit(),
-        );
-        Err(TsoError::ClusterContractMismatch {
-            cluster_contract_id: record.contract_id.clone(),
-            local_contract_id: local_contract_id.to_owned(),
-            cluster_writer_build_version: record.writer_build_version.clone(),
-            cluster_writer_build_commit: record.writer_build_commit.clone(),
-        })
     }
 
     async fn acquire_identity_lease_internal(

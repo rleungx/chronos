@@ -1,4 +1,5 @@
 mod build_info;
+pub mod client;
 mod clock;
 mod config;
 mod cursor;
@@ -23,9 +24,8 @@ pub mod tls;
 mod tso_codec;
 mod types;
 
-pub use build_info::{
-    build_commit, build_identity, build_version, mixed_version_contract_id, BuildIdentity,
-};
+pub use build_info::{build_commit, build_identity, build_version, BuildIdentity};
+pub use client::{Client, ClientConfig, ClientError};
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use config::{
     parse_advertise_endpoint_host, TsoConfig, TsoSecurityMode, DEFAULT_ADVERTISE_ENDPOINT,

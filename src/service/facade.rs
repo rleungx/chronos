@@ -172,10 +172,6 @@ impl TsoService {
         &self.config.advertise_endpoint
     }
 
-    pub(crate) fn route_cache_ttl_ms(&self) -> u32 {
-        self.config.route_cache_ttl_ms
-    }
-
     pub(crate) fn max_timeline_proxy_lanes(&self) -> usize {
         self.config.max_timeline_proxy_lanes
     }
@@ -184,10 +180,6 @@ impl TsoService {
         &self,
     ) -> tokio::sync::broadcast::Receiver<crate::TimelineRoute> {
         self.timeline_runtime.subscribe_route_changes()
-    }
-
-    pub(crate) fn subscribe_route_resets(&self) -> tokio::sync::broadcast::Receiver<()> {
-        self.timeline_runtime.subscribe_route_resets()
     }
 
     pub(super) fn metadata_contention_retry_budget(&self) -> Duration {

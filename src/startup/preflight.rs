@@ -26,7 +26,6 @@ pub(crate) fn validate_build_identity_for_profile(
 pub(crate) fn startup_failure_stage(error: &(dyn Error + 'static)) -> &'static str {
     match error.downcast_ref::<TsoError>() {
         Some(TsoError::InstanceIdentityInUse { .. }) => "identity",
-        Some(TsoError::ClusterContractMismatch { .. }) => "contract",
         _ => "metadata",
     }
 }
@@ -167,11 +166,9 @@ pub(crate) fn log_startup_preflight(plan: &ValidatedStartupPlan<'_>) {
         advertise_endpoint = %config.advertise_endpoint,
         build_version = chronos::build_version(),
         build_commit = chronos::build_commit(),
-        mixed_version_contract_id = chronos::mixed_version_contract_id(),
         default_resource_tier = %config.default_resource_tier,
         shared_generators = config.shared_generators,
         warm_generators = config.warm_generators,
-        route_cache_ttl_ms = config.route_cache_ttl_ms,
         max_timeline_proxy_lanes = config.max_timeline_proxy_lanes,
         max_timeline_runtime_entries = config.max_timeline_runtime_entries,
         generator_ownership_modulo = config.generator_ownership_modulo,

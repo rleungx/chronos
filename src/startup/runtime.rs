@@ -202,7 +202,6 @@ pub(crate) fn readiness_reason_label(reason: WorkerReadinessReason) -> &'static 
         WorkerReadinessReason::ShuttingDown => "shutting_down",
         WorkerReadinessReason::Draining => "draining",
         WorkerReadinessReason::OwnershipDrift => "ownership_drift",
-        WorkerReadinessReason::ClusterContractMismatch => "cluster_contract_mismatch",
         WorkerReadinessReason::Unspecified => "unspecified",
     }
 }
@@ -652,29 +651,6 @@ pub(crate) async fn run() -> AppResult<()> {
                         instance_id,
                         advertise_endpoint = %config.advertise_endpoint,
                         worker_id = %config.worker_id
-                    );
-                } else if let Some(TsoError::ClusterContractMismatch {
-                    cluster_contract_id,
-                    local_contract_id,
-                    cluster_writer_build_version,
-                    cluster_writer_build_commit,
-                }) = error.as_ref().downcast_ref::<TsoError>()
-                {
-                    error!(
-                        component = "startup",
-                        event = "cluster_contract_mismatch",
-                        result = "failure",
-                        reason = %error,
-                        readiness_reason = readiness_reason_label(readiness_reason),
-                        startup_stage = stage,
-                        metadata_kind = %startup.metadata_kind(),
-                        worker_id = %config.worker_id,
-                        instance_id = %config.effective_instance_id(),
-                        advertise_endpoint = %config.advertise_endpoint,
-                        cluster_contract_id,
-                        local_contract_id,
-                        cluster_writer_build_version,
-                        cluster_writer_build_commit,
                     );
                 } else {
                     error!(

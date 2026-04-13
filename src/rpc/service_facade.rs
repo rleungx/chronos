@@ -12,8 +12,6 @@ use super::{
     current_timestamp, status_mapping, timeline_status_query, transfer_adapter, HealthStatusHandle,
 };
 
-const TIMELINE_STATUS_ROUTE_CACHE_TTL_MS: u32 = 0;
-
 pub struct TsoControlService {
     control_plane: TsoControlPlane,
     health_status: HealthStatusHandle,
@@ -80,7 +78,6 @@ impl TimelineStatusService for TsoTimelineStatusService {
             timeline_status_query::get_timeline_status_response(
                 &self.control_plane,
                 request.into_inner(),
-                TIMELINE_STATUS_ROUTE_CACHE_TTL_MS,
             )
             .await?,
         ))
@@ -94,7 +91,6 @@ impl TimelineStatusService for TsoTimelineStatusService {
             timeline_status_query::list_timeline_statuses_response(
                 &self.control_plane,
                 request.into_inner(),
-                TIMELINE_STATUS_ROUTE_CACHE_TTL_MS,
             )
             .await?,
         ))
@@ -215,7 +211,6 @@ mod tests {
             timeline.route.owner_worker_endpoint
         );
         assert_eq!(route.resource_tier, ProtoResourceTier::Warm as i32);
-        assert_eq!(route.cache_ttl_ms, 0);
         assert_eq!(status.state, ProtoTimelineState::Active as i32);
         assert_eq!(status.recovery_floor_tso, Some(42));
         assert_eq!(status.issued_upper_bound, Some(88));

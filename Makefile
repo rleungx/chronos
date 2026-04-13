@@ -12,6 +12,8 @@ ETCD_ENDPOINTS ?= 127.0.0.1:2379
 	test-layer-3 \
 	test-layer-4 \
 	test-etcd \
+	test-failover-bench \
+	test-rebalance-bench \
 	test-soak \
 	test-chaos \
 	observability-up \
@@ -51,6 +53,12 @@ test-layer-4:
 	CHRONOS_TEST_ETCD_ENDPOINTS=$(ETCD_ENDPOINTS) bash hack/validate-layer-4.sh
 
 test-etcd: test-layer-4
+
+test-failover-bench:
+	bash hack/failover/failover-etcd.sh
+
+test-rebalance-bench:
+	bash hack/rebalance/rebalance-etcd.sh
 
 test-soak:
 	bash hack/soak/soak-etcd.sh

@@ -1,4 +1,5 @@
 pub(crate) mod bootstrap;
+pub(crate) mod cli;
 pub(crate) mod config;
 pub(crate) mod preflight;
 pub(crate) mod readiness_reason;
@@ -14,6 +15,7 @@ pub(crate) mod transport;
 pub(crate) use bootstrap::build_tso_service;
 #[cfg(test)]
 pub(crate) use bootstrap::run_metadata_startup_probe;
+pub(crate) use cli::run_cli_or_service;
 #[cfg(test)]
 pub(crate) use config::{load_startup_config, load_tso_config};
 #[cfg(test)]
@@ -24,7 +26,6 @@ pub(crate) use preflight::{
 pub(crate) use readiness_reason::{
     startup_bootstrap_failure_reason, startup_preflight_failure_reason, ShutdownTrigger,
 };
-pub(crate) use runtime::run;
 #[cfg(test)]
 pub(crate) use runtime::{
     record_shutdown, record_startup_bootstrap_failure, record_startup_preflight_failure,

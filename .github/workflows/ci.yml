@@ -161,3 +161,93 @@ jobs:
       - name: Reset etcd after chaos job
         if: always()
         run: make etcd-reset
+
+  failover-real-etcd:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    if: github.event_name == 'pull_request' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    env:
+      CHRONOS_BUILD_COMMIT: ${{ github.sha }}
+      RUST_BACKTRACE: 1
+      CHRONOS_ARTIFACT_DIR: ${{ github.workspace }}/artifacts
+      CHRONOS_KEEP_ARTIFACTS_ON_SUCCESS: 1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.94.0
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+      - name: Run etcd-backed failover benchmark
+        run: make test-failover-bench
+      - name: Publish failover summary
+        if: always()
+        run: |
+          if [ -f artifacts/failover/summary.txt ]; then
+            {
+              echo '## Failover benchmark summary'
+              echo ''
+              cat artifacts/failover/summary.txt
+              echo ''
+              echo '### Failover artifact files'
+              ls -1 artifacts/failover
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Upload failover artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chronos-failover-artifacts
+          path: artifacts/failover/
+          if-no-files-found: error
+          retention-days: 14
+      - name: Reset etcd after failover job
+        if: always()
+        run: make etcd-reset
+
+  rebalance-real-etcd:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    if: github.event_name == 'pull_request' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    env:
+      CHRONOS_BUILD_COMMIT: ${{ github.sha }}
+      RUST_BACKTRACE: 1
+      CHRONOS_ARTIFACT_DIR: ${{ github.workspace }}/artifacts
+      CHRONOS_KEEP_ARTIFACTS_ON_SUCCESS: 1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.94.0
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+      - name: Run etcd-backed rebalance benchmark
+        run: make test-rebalance-bench
+      - name: Publish rebalance summary
+        if: always()
+        run: |
+          if [ -f artifacts/rebalance/summary.txt ]; then
+            {
+              echo '## Rebalance benchmark summary'
+              echo ''
+              cat artifacts/rebalance/summary.txt
+              echo ''
+              echo '### Rebalance artifact files'
+              ls -1 artifacts/rebalance
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Upload rebalance artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chronos-rebalance-artifacts
+          path: artifacts/rebalance/
+          if-no-files-found: error
+          retention-days: 14
+      - name: Reset etcd after rebalance job
+        if: always()
+        run: make etcd-reset

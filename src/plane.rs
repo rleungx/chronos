@@ -79,16 +79,6 @@ impl TsoControlPlane {
             .await
     }
 
-    pub(crate) async fn list_timeline_routes(
-        &self,
-        start_after_timeline_key: Option<&str>,
-        limit: usize,
-    ) -> Result<(Vec<TimelineRoute>, Option<String>), TsoError> {
-        self.inner
-            .list_timeline_routes(start_after_timeline_key, limit)
-            .await
-    }
-
     pub async fn renew_timeline_lease(&self, timeline_key: &str) -> Result<(), TsoError> {
         self.inner.renew_timeline_lease(timeline_key).await
     }
@@ -114,20 +104,12 @@ impl TsoControlPlane {
         self.inner.subscribe_route_changes()
     }
 
-    pub(crate) fn subscribe_route_resets(&self) -> broadcast::Receiver<()> {
-        self.inner.subscribe_route_resets()
-    }
-
     pub fn advertise_endpoint(&self) -> &str {
         self.inner.advertise_endpoint()
     }
 
     pub fn health(&self) -> HealthInfo {
         self.inner.health()
-    }
-
-    pub fn route_cache_ttl_ms(&self) -> u32 {
-        self.inner.route_cache_ttl_ms()
     }
 }
 

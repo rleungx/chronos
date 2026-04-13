@@ -267,7 +267,6 @@ fn apply_timing_env(config: &mut TsoConfig) -> AppResult<()> {
         &mut config.shared_jump_ahead_threshold_ms,
     )?;
     apply_parsed_env("CHRONOS_SAFETY_GAP_MS", &mut config.safety_gap_ms)?;
-    apply_parsed_env("CHRONOS_ROUTE_CACHE_TTL_MS", &mut config.route_cache_ttl_ms)?;
     Ok(())
 }
 

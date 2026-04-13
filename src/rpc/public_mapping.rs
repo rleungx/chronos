@@ -2,7 +2,6 @@ use prost::Message;
 use tonic::{Code, Status};
 
 use crate::lifecycle::{TimelineLifecycleContract, TimelinePublicUnavailability};
-use crate::metrics;
 use crate::proto::v1::{ErrorCode, ErrorDetail, OperatorActionBlocker, OperatorActionNextStep};
 use crate::{TimelineLifecycleState, TsoError};
 
@@ -44,17 +43,9 @@ pub(super) fn map_tso_error(err: TsoError) -> Status {
     match err {
         TsoError::TimelineNotFound { .. } => status_with_error_detail(Code::NotFound, err),
         TsoError::RouteVersionMismatch { .. } => {
-            metrics::TSO_VERSION_COMPATIBILITY_MISMATCH_TOTAL
-                .with_label_values(&["route_version"])
-                .inc();
             status_with_error_detail(Code::FailedPrecondition, err)
         }
-        TsoError::EpochMismatch { .. } => {
-            metrics::TSO_VERSION_COMPATIBILITY_MISMATCH_TOTAL
-                .with_label_values(&["epoch"])
-                .inc();
-            status_with_error_detail(Code::FailedPrecondition, err)
-        }
+        TsoError::EpochMismatch { .. } => status_with_error_detail(Code::FailedPrecondition, err),
         TsoError::LeaseExpired { .. } => status_with_error_detail(Code::Unavailable, err),
         TsoError::TimelineNotReady { state, .. } => {
             status_with_error_detail(timeline_not_ready_public_mapping(state).grpc_code, err)
@@ -105,9 +96,6 @@ pub(super) fn map_tso_error(err: TsoError) -> Status {
         TsoError::InstanceIdentityInUse { .. } => {
             status_with_error_detail(Code::AlreadyExists, err)
         }
-        TsoError::ClusterContractMismatch { .. } => {
-            status_with_error_detail(Code::FailedPrecondition, err)
-        }
         TsoError::Internal(_) => status_with_error_detail(Code::Internal, err),
     }
 }
@@ -136,7 +124,6 @@ fn error_detail_code(err: &TsoError) -> ErrorCode {
         TsoError::FailoverRequiresExpiredLease { .. }
         | TsoError::CasFailed
         | TsoError::InstanceIdentityInUse { .. }
-        | TsoError::ClusterContractMismatch { .. }
         | TsoError::FailoverMissingRecoveryFloor { .. }
         | TsoError::TimelineIngressSaturated { .. }
         | TsoError::TimelineRuntimeCacheSaturated { .. }
@@ -288,46 +275,6 @@ mod tests {
             assert_eq!(detail.action_blocker, blocker as i32);
             assert_eq!(detail.next_step, next_step as i32);
         }
-    }
-
-    #[test]
-    fn route_version_mismatch_increments_compatibility_metric() {
-        let before = metrics::TSO_VERSION_COMPATIBILITY_MISMATCH_TOTAL
-            .with_label_values(&["route_version"])
-            .get();
-
-        let status = map_tso_error(TsoError::RouteVersionMismatch {
-            expected: 4,
-            actual: 5,
-        });
-
-        assert_eq!(status.code(), Code::FailedPrecondition);
-        assert!(
-            metrics::TSO_VERSION_COMPATIBILITY_MISMATCH_TOTAL
-                .with_label_values(&["route_version"])
-                .get()
-                > before
-        );
-    }
-
-    #[test]
-    fn epoch_mismatch_increments_compatibility_metric() {
-        let before = metrics::TSO_VERSION_COMPATIBILITY_MISMATCH_TOTAL
-            .with_label_values(&["epoch"])
-            .get();
-
-        let status = map_tso_error(TsoError::EpochMismatch {
-            expected: 7,
-            actual: 8,
-        });
-
-        assert_eq!(status.code(), Code::FailedPrecondition);
-        assert!(
-            metrics::TSO_VERSION_COMPATIBILITY_MISMATCH_TOTAL
-                .with_label_values(&["epoch"])
-                .get()
-                > before
-        );
     }
 
     #[test]

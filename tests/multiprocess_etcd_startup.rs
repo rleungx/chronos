@@ -221,8 +221,6 @@ async fn get_timeline_route(endpoint: SocketAddr, timeline_key: &str) -> Timelin
         .await
         .get_timeline_route(Request::new(GetTimelineRouteRequest {
             timeline_key: timeline_key.to_string(),
-            cached_route_version: None,
-            sdk_instance_id: String::new(),
         }))
         .await
         .expect("get_timeline_route should succeed")

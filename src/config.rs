@@ -158,7 +158,6 @@ pub struct TsoConfig {
     pub max_clock_rewind_ms: u64,
     pub shared_jump_ahead_threshold_ms: u64,
     pub safety_gap_ms: u64,
-    pub route_cache_ttl_ms: u32,
     pub max_timeline_proxy_lanes: usize,
     pub max_timeline_runtime_entries: usize,
 }
@@ -202,7 +201,6 @@ impl Default for TsoConfig {
             max_clock_rewind_ms: 30_000,
             shared_jump_ahead_threshold_ms: 5_000,
             safety_gap_ms: 0,
-            route_cache_ttl_ms: 60_000,
             max_timeline_proxy_lanes: DEFAULT_MAX_TIMELINE_PROXY_LANES,
             max_timeline_runtime_entries: DEFAULT_MAX_TIMELINE_RUNTIME_ENTRIES,
         }

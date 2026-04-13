@@ -33,10 +33,7 @@ pub(super) fn proto_worker_readiness_reason(
     }
 }
 
-pub(super) fn proto_timeline_route(
-    route: TimelineRoute,
-    route_cache_ttl_ms: u32,
-) -> ProtoTimelineRoute {
+pub(super) fn proto_timeline_route(route: TimelineRoute) -> ProtoTimelineRoute {
     ProtoTimelineRoute {
         timeline_key: route.timeline_key,
         generator_id: route.generator_id,
@@ -44,7 +41,6 @@ pub(super) fn proto_timeline_route(
         epoch: route.epoch,
         route_version: route.route_version,
         resource_tier: proto_resource_tier(route.resource_tier),
-        cache_ttl_ms: route_cache_ttl_ms,
     }
 }
 
@@ -63,39 +59,30 @@ pub(super) fn health_response(
         identity_lease_healthy: worker_status.identity_lease_healthy,
         build_version: crate::build_info::build_version().to_string(),
         build_commit: crate::build_info::build_commit().to_string(),
-        mixed_version_contract_id: crate::build_info::mixed_version_contract_id().to_string(),
     }
 }
 
 pub(super) fn get_timeline_status_response(
     status: TimelineStatusSnapshot,
-    route_cache_ttl_ms: u32,
 ) -> GetTimelineStatusResponse {
     GetTimelineStatusResponse {
-        status: Some(proto_timeline_status(status, route_cache_ttl_ms)),
+        status: Some(proto_timeline_status(status)),
     }
 }
 
 pub(super) fn list_timeline_statuses_response(
     statuses: Vec<TimelineStatusSnapshot>,
     next_page_token: String,
-    route_cache_ttl_ms: u32,
 ) -> ListTimelineStatusesResponse {
     ListTimelineStatusesResponse {
-        statuses: statuses
-            .into_iter()
-            .map(|status| proto_timeline_status(status, route_cache_ttl_ms))
-            .collect(),
+        statuses: statuses.into_iter().map(proto_timeline_status).collect(),
         next_page_token,
     }
 }
 
-fn proto_timeline_status(
-    status: TimelineStatusSnapshot,
-    route_cache_ttl_ms: u32,
-) -> ProtoTimelineStatus {
+fn proto_timeline_status(status: TimelineStatusSnapshot) -> ProtoTimelineStatus {
     ProtoTimelineStatus {
-        route: Some(proto_timeline_route(status.route, route_cache_ttl_ms)),
+        route: Some(proto_timeline_route(status.route)),
         state: proto_timeline_state(status.state),
         recovery_floor_tso: status.recovery_floor_tso,
         issued_upper_bound: status.issued_upper_bound,
@@ -180,10 +167,6 @@ mod tests {
         assert_eq!(response.server_time.expect("server_time").seconds, 12);
         assert_eq!(response.build_version, crate::build_info::build_version());
         assert_eq!(response.build_commit, crate::build_info::build_commit());
-        assert_eq!(
-            response.mixed_version_contract_id,
-            crate::build_info::mixed_version_contract_id()
-        );
     }
 
     #[test]
@@ -207,13 +190,12 @@ mod tests {
             failover_readiness: TimelineFailoverReadiness::Eligible,
         };
 
-        let point_read = get_timeline_status_response(status.clone(), 0);
-        let list = list_timeline_statuses_response(vec![status], "next".into(), 0);
+        let point_read = get_timeline_status_response(status.clone());
+        let list = list_timeline_statuses_response(vec![status], "next".into());
         let mapped = point_read.status.expect("status should be present");
         let route = mapped.route.expect("route should be present");
 
         assert_eq!(route.timeline_key, "timeline-a");
-        assert_eq!(route.cache_ttl_ms, 0);
         assert_eq!(
             mapped.state,
             crate::proto::v1::TimelineState::Recovering as i32

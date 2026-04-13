@@ -224,34 +224,6 @@ impl TsoService {
         })
     }
 
-    pub(crate) async fn list_timeline_routes(
-        &self,
-        start_after_timeline_key: Option<&str>,
-        limit: usize,
-    ) -> Result<(Vec<TimelineRoute>, Option<String>), TsoError> {
-        if limit == 0 {
-            return Ok((Vec::new(), None));
-        }
-
-        let page = self
-            .metadata
-            .list_timelines_page(start_after_timeline_key, limit)
-            .await?;
-
-        let next_start_after = page.next_start_after_timeline_key.as_ref().and_then(|_| {
-            page.records
-                .last()
-                .map(|record| record.route.timeline_key.clone())
-        });
-        let routes = page
-            .records
-            .into_iter()
-            .map(|record| record.route)
-            .collect();
-
-        Ok((routes, next_start_after))
-    }
-
     pub async fn load_generator_record(
         &self,
         generator_id: u32,

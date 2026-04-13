@@ -493,7 +493,7 @@ mod tests {
             .timeline_handle(&route.timeline_key)
             .is_some());
 
-        let mut reset_rx = service.subscribe_route_resets();
+        let mut reset_rx = service.timeline_runtime.reset_notifier().subscribe();
         metadata.send_reset();
 
         timeout(TokioDuration::from_millis(500), reset_rx.recv())

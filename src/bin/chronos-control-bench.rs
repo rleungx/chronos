@@ -1,28 +1,36 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::env;
 use std::error::Error;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use dashmap::DashMap;
+use prost::Message;
 use tokio::sync::Barrier;
-use tokio_stream::StreamExt;
 use tonic::transport::Channel;
 use tonic::Request;
+use tonic::Status;
 
 use chronos::proto::v1::{
-    timeline_route_event, timeline_route_service_client::TimelineRouteServiceClient,
-    timeline_status_service_client::TimelineStatusServiceClient, EnsureTimelineRequest,
-    ListTimelineStatusesRequest, ResourceTier, TimelineState, WatchTimelineRoutesRequest,
+    timeline_control_service_client::TimelineControlServiceClient,
+    timeline_route_service_client::TimelineRouteServiceClient,
+    timeline_status_service_client::TimelineStatusServiceClient,
+    timestamp_service_client::TimestampServiceClient, AllocateTimestampsRequest,
+    EnsureTimelineRequest, ErrorCode, ErrorDetail, GetTimelineRouteRequest,
+    ListTimelineStatusesRequest, ResourceTier, TimelineRoute, TimelineState,
+    TimelineTransferReason, TransferTimelineRequest,
 };
 
 type AppResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
+
+const REBALANCE_ALLOCATE_RETRY_ATTEMPTS: usize = 4;
+const REBALANCE_ALLOCATE_RETRY_BACKOFF_MS: u64 = 25;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Scenario {
     StatusScan,
     StatusScanFiltered,
-    WatchAllSnapshot,
-    WatchFilteredSnapshot,
+    AllocateDuringRebalance,
 }
 
 impl Scenario {
@@ -30,10 +38,17 @@ impl Scenario {
         match self {
             Self::StatusScan => "status_scan",
             Self::StatusScanFiltered => "status_scan_filtered",
-            Self::WatchAllSnapshot => "watch_all_snapshot",
-            Self::WatchFilteredSnapshot => "watch_filtered_snapshot",
+            Self::AllocateDuringRebalance => "allocate_during_rebalance",
         }
     }
+}
+
+#[derive(Clone, Debug)]
+struct RouteSnapshot {
+    timeline_key: String,
+    generator_id: u32,
+    epoch: u64,
+    route_version: u64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -45,6 +60,7 @@ struct StatusFilters {
 #[derive(Clone, Debug)]
 struct BenchConfig {
     endpoint: String,
+    timeline_namespace: String,
     scenario: Scenario,
     concurrency: usize,
     timeline_count: usize,
@@ -55,9 +71,9 @@ struct BenchConfig {
     page_size: u32,
     status_filters: StatusFilters,
     filter_states_display: String,
-    watch_filter_keys: Vec<String>,
-    watch_snapshot_timeout_ms: u64,
-    sdk_instance_id: String,
+    allocate_batch: u32,
+    transfer_interval_ms: u64,
+    transfer_target_generators: Vec<u32>,
 }
 
 #[derive(Default)]
@@ -71,45 +87,39 @@ struct StatusWorkerStats {
 }
 
 #[derive(Default)]
-struct WatchWorkerStats {
-    sessions: u64,
-    routes_observed: u64,
-    timeouts: u64,
-    stream_errors: u64,
-    incomplete_keys_total: u64,
-    stream_open_time_us: Vec<u64>,
-    snapshot_transfer_time_us: Vec<u64>,
-    snapshot_end_to_end_time_us: Vec<u64>,
+struct RebalanceWorkerStats {
+    allocate_requests_total: u64,
+    allocate_success_total: u64,
+    allocate_tsos_total: u64,
+    allocate_latencies_us: Vec<u64>,
+    route_refresh_total: u64,
+    route_refresh_latencies_us: Vec<u64>,
+    monotonicity_violations_total: u64,
+    error_counts: HashMap<String, u64>,
 }
 
-struct SnapshotTracker {
-    expected: Arc<HashSet<String>>,
-    seen: HashSet<String>,
+#[derive(Default)]
+struct RebalanceDriverStats {
+    transfer_attempts_total: u64,
+    transfer_success_total: u64,
+    transfer_failed_total: u64,
+    transfer_latencies_us: Vec<u64>,
 }
 
-impl SnapshotTracker {
-    fn new(expected: Arc<HashSet<String>>) -> Self {
-        Self {
-            expected,
-            seen: HashSet::new(),
-        }
-    }
-
-    fn on_route(&mut self, timeline_key: &str) -> bool {
-        if !self.expected.contains(timeline_key) {
-            return false;
-        }
-        self.seen.insert(timeline_key.to_owned());
-        self.is_complete()
-    }
-
-    fn is_complete(&self) -> bool {
-        self.seen.len() == self.expected.len()
-    }
-
-    fn incomplete_count(&self) -> usize {
-        self.expected.len().saturating_sub(self.seen.len())
-    }
+#[derive(Default)]
+struct RebalanceBenchStats {
+    allocate_requests_total: u64,
+    allocate_success_total: u64,
+    allocate_tsos_total: u64,
+    allocate_latencies_us: Vec<u64>,
+    route_refresh_total: u64,
+    route_refresh_latencies_us: Vec<u64>,
+    monotonicity_violations_total: u64,
+    error_counts: HashMap<String, u64>,
+    transfer_attempts_total: u64,
+    transfer_success_total: u64,
+    transfer_failed_total: u64,
+    transfer_latencies_us: Vec<u64>,
 }
 
 fn env_or<T>(key: &str, default: T) -> T
@@ -138,8 +148,7 @@ fn parse_scenario(value: &str) -> AppResult<Scenario> {
     match value.trim().to_ascii_lowercase().as_str() {
         "status_scan" => Ok(Scenario::StatusScan),
         "status_scan_filtered" => Ok(Scenario::StatusScanFiltered),
-        "watch_all_snapshot" => Ok(Scenario::WatchAllSnapshot),
-        "watch_filtered_snapshot" => Ok(Scenario::WatchFilteredSnapshot),
+        "allocate_during_rebalance" => Ok(Scenario::AllocateDuringRebalance),
         other => Err(format!("unsupported control bench scenario: {other}").into()),
     }
 }
@@ -178,17 +187,25 @@ fn parse_filter_states_csv(value: &str) -> AppResult<Vec<i32>> {
     Ok(parsed)
 }
 
-fn parse_csv_list(value: &str) -> Vec<String> {
-    value
-        .split(',')
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-        .collect()
+fn parse_csv_u32_list(value: &str) -> AppResult<Vec<u32>> {
+    let mut parsed = Vec::new();
+    for token in value.split(',') {
+        let trimmed = token.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        parsed.push(
+            trimmed
+                .parse::<u32>()
+                .map_err(|error| format!("invalid u32 value {trimmed}: {error}"))?,
+        );
+    }
+    Ok(parsed)
 }
 
 fn load_config() -> AppResult<BenchConfig> {
     let endpoint = env_or_string("CHRONOS_CONTROL_BENCH_ENDPOINT", "http://[::1]:50051");
+    let timeline_namespace = env_or_string("CHRONOS_CONTROL_BENCH_NAMESPACE", "controlbench");
     let scenario = parse_scenario(&env_or_string(
         "CHRONOS_CONTROL_BENCH_SCENARIO",
         "status_scan",
@@ -206,16 +223,16 @@ fn load_config() -> AppResult<BenchConfig> {
     let page_size = env_or("CHRONOS_CONTROL_BENCH_PAGE_SIZE", 200u32);
     let filter_states_display = env_or_string("CHRONOS_CONTROL_BENCH_FILTER_STATES", "");
     let owner_worker_endpoint = env_or_string("CHRONOS_CONTROL_BENCH_FILTER_OWNER_ENDPOINT", "");
-    let watch_filter_keys = parse_csv_list(&env_or_string(
-        "CHRONOS_CONTROL_BENCH_WATCH_FILTER_KEYS",
-        "",
-    ));
-    let watch_snapshot_timeout_ms =
-        env_or("CHRONOS_CONTROL_BENCH_WATCH_SNAPSHOT_TIMEOUT_MS", 2_000u64);
-    let sdk_instance_id = env_or_string("CHRONOS_CONTROL_BENCH_SDK_INSTANCE_ID", "control-bench");
+    let allocate_batch = env_or("CHRONOS_CONTROL_BENCH_ALLOCATE_BATCH", 1u32);
+    let transfer_interval_ms = env_or("CHRONOS_CONTROL_BENCH_TRANSFER_INTERVAL_MS", 250u64);
+    let transfer_target_generators = parse_csv_u32_list(&env_or_string(
+        "CHRONOS_CONTROL_BENCH_TRANSFER_TARGET_GENERATORS",
+        "0,1,2,3",
+    ))?;
 
     Ok(BenchConfig {
         endpoint,
+        timeline_namespace,
         scenario,
         concurrency,
         timeline_count,
@@ -230,10 +247,46 @@ fn load_config() -> AppResult<BenchConfig> {
                 .then_some(owner_worker_endpoint),
         },
         filter_states_display,
-        watch_filter_keys,
-        watch_snapshot_timeout_ms,
-        sdk_instance_id,
+        allocate_batch,
+        transfer_interval_ms,
+        transfer_target_generators,
     })
+}
+
+fn route_snapshot_from_proto(route: TimelineRoute) -> RouteSnapshot {
+    RouteSnapshot {
+        timeline_key: route.timeline_key,
+        generator_id: route.generator_id,
+        epoch: route.epoch,
+        route_version: route.route_version,
+    }
+}
+
+async fn ensure_seed_routes(
+    config: &BenchConfig,
+    channel: Channel,
+) -> AppResult<Vec<RouteSnapshot>> {
+    let mut client = TimelineRouteServiceClient::new(channel);
+    let mut routes = Vec::with_capacity(config.timeline_count);
+    for idx in 0..config.timeline_count {
+        let timeline_key = format!(
+            "{}.{}.{}",
+            config.timeline_namespace,
+            config.scenario.as_str(),
+            idx
+        );
+        let route = client
+            .ensure_timeline(Request::new(EnsureTimelineRequest {
+                timeline_key,
+                desired_resource_tier: config.resource_tier as i32,
+            }))
+            .await?
+            .into_inner()
+            .route
+            .ok_or("missing route from ensure_timeline")?;
+        routes.push(route_snapshot_from_proto(route));
+    }
+    Ok(routes)
 }
 
 async fn connect_channel(endpoint: String) -> AppResult<Channel> {
@@ -243,22 +296,6 @@ async fn connect_channel(endpoint: String) -> AppResult<Channel> {
         .connect()
         .await
         .map_err(|error| format!("failed to connect bench endpoint {endpoint}: {error}").into())
-}
-
-async fn ensure_seed_timelines(config: &BenchConfig, channel: Channel) -> AppResult<Vec<String>> {
-    let mut client = TimelineRouteServiceClient::new(channel);
-    let mut timeline_keys = Vec::with_capacity(config.timeline_count);
-    for idx in 0..config.timeline_count {
-        let timeline_key = format!("controlbench.{}.{}", config.scenario.as_str(), idx);
-        client
-            .ensure_timeline(Request::new(EnsureTimelineRequest {
-                timeline_key: timeline_key.clone(),
-                desired_resource_tier: config.resource_tier as i32,
-            }))
-            .await?;
-        timeline_keys.push(timeline_key);
-    }
-    Ok(timeline_keys)
 }
 
 async fn list_timeline_statuses_page(
@@ -276,28 +313,6 @@ async fn list_timeline_statuses_page(
         }))
         .await?
         .into_inner())
-}
-
-async fn fetch_all_status_keys(channel: Channel, page_size: u32) -> AppResult<HashSet<String>> {
-    let mut client = TimelineStatusServiceClient::new(channel);
-    let filters = StatusFilters::default();
-    let mut keys = HashSet::new();
-    let mut page_token = String::new();
-
-    loop {
-        let response =
-            list_timeline_statuses_page(&mut client, &filters, page_size, page_token).await?;
-        for status in response.statuses {
-            let route = status.route.ok_or("timeline status missing route")?;
-            keys.insert(route.timeline_key);
-        }
-        if response.next_page_token.is_empty() {
-            break;
-        }
-        page_token = response.next_page_token;
-    }
-
-    Ok(keys)
 }
 
 fn percentile(sorted: &[u64], pct: f64) -> u64 {
@@ -381,169 +396,486 @@ async fn run_status_scan_bench(config: &BenchConfig) -> AppResult<StatusWorkerSt
     Ok(total)
 }
 
-#[derive(Clone)]
-enum WatchScenario {
-    All { expected_keys: Arc<HashSet<String>> },
-    Filtered { expected_keys: Arc<HashSet<String>> },
+fn record_error_count(counts: &mut HashMap<String, u64>, label: &str) {
+    *counts.entry(label.to_string()).or_insert(0) += 1;
 }
 
-impl WatchScenario {
-    fn expected_keys(&self) -> Arc<HashSet<String>> {
-        match self {
-            Self::All { expected_keys } | Self::Filtered { expected_keys } => expected_keys.clone(),
-        }
-    }
-
-    fn build_request(&self, sdk_instance_id: String) -> WatchTimelineRoutesRequest {
-        match self {
-            Self::All { .. } => WatchTimelineRoutesRequest {
-                timeline_keys: Vec::new(),
-                known_route_versions: HashMap::new(),
-                sdk_instance_id,
-            },
-            Self::Filtered { expected_keys } => WatchTimelineRoutesRequest {
-                timeline_keys: expected_keys.iter().cloned().collect(),
-                known_route_versions: expected_keys
-                    .iter()
-                    .cloned()
-                    .map(|timeline_key| (timeline_key, 0))
-                    .collect(),
-                sdk_instance_id,
-            },
-        }
+fn error_code_label(error_code: i32) -> &'static str {
+    match ErrorCode::try_from(error_code).ok() {
+        Some(ErrorCode::NotTimelineOwner) => "not_timeline_owner",
+        Some(ErrorCode::RouteVersionMismatch) => "route_version_mismatch",
+        Some(ErrorCode::EpochMismatch) => "epoch_mismatch",
+        Some(ErrorCode::LeaseExpired) => "lease_expired",
+        Some(ErrorCode::RateLimited) => "rate_limited",
+        Some(ErrorCode::TemporarilyUnavailable) => "temporarily_unavailable",
+        Some(ErrorCode::TimelineNotFound) => "timeline_not_found",
+        Some(ErrorCode::InvalidArgument) => "invalid_argument",
+        Some(ErrorCode::Internal) => "internal",
+        _ => "unknown",
     }
 }
 
-async fn run_watch_snapshot_bench(
+fn is_transient_rebalance_error(detail: Option<&ErrorDetail>) -> bool {
+    matches!(
+        detail.and_then(|detail| ErrorCode::try_from(detail.code).ok()),
+        Some(ErrorCode::LeaseExpired)
+            | Some(ErrorCode::TemporarilyUnavailable)
+            | Some(ErrorCode::RouteVersionMismatch)
+            | Some(ErrorCode::EpochMismatch)
+            | Some(ErrorCode::NotTimelineOwner)
+    )
+}
+
+fn decode_error_detail(status: &Status) -> Option<ErrorDetail> {
+    ErrorDetail::decode(status.details()).ok()
+}
+
+fn count_tsos(response: &chronos::proto::v1::AllocateTimestampsResponse) -> u64 {
+    response
+        .ranges
+        .iter()
+        .map(|range| range.end_tso - range.start_tso + 1)
+        .sum()
+}
+
+fn record_monotonicity(
+    last_end_by_timeline: &mut HashMap<String, u64>,
+    response: &chronos::proto::v1::AllocateTimestampsResponse,
+) -> u64 {
+    let Some(first) = response.ranges.first() else {
+        return 0;
+    };
+    let Some(last) = response.ranges.last() else {
+        return 0;
+    };
+
+    match last_end_by_timeline.get_mut(&response.timeline_key) {
+        Some(previous_end) => {
+            let violation = u64::from(first.start_tso <= *previous_end);
+            if last.end_tso > *previous_end {
+                *previous_end = last.end_tso;
+            }
+            violation
+        }
+        None => {
+            last_end_by_timeline.insert(response.timeline_key.clone(), last.end_tso);
+            0
+        }
+    }
+}
+
+async fn refresh_route(
+    client: &mut TimelineRouteServiceClient<Channel>,
+    timeline_key: &str,
+) -> AppResult<RouteSnapshot> {
+    let route = client
+        .get_timeline_route(Request::new(GetTimelineRouteRequest {
+            timeline_key: timeline_key.to_owned(),
+        }))
+        .await?
+        .into_inner()
+        .route
+        .ok_or("missing route from get_timeline_route")?;
+    Ok(route_snapshot_from_proto(route))
+}
+
+fn next_target_generator(current: u32, targets: &[u32]) -> Option<u32> {
+    if targets.is_empty() {
+        return None;
+    }
+    if let Some(index) = targets.iter().position(|target| *target == current) {
+        if targets.len() == 1 {
+            return Some(current);
+        }
+        return Some(targets[(index + 1) % targets.len()]);
+    }
+    Some(targets[0])
+}
+
+async fn run_allocate_during_rebalance_bench(
     config: &BenchConfig,
-    scenario: WatchScenario,
-) -> AppResult<WatchWorkerStats> {
-    let barrier = Arc::new(Barrier::new(config.concurrency + 1));
+    seeded_routes: &[RouteSnapshot],
+) -> AppResult<RebalanceBenchStats> {
+    if seeded_routes.is_empty() {
+        return Err("allocate_during_rebalance requires seeded timelines".into());
+    }
+    if config.transfer_target_generators.is_empty() {
+        return Err("allocate_during_rebalance requires at least one target generator".into());
+    }
+
+    let allocator_workers = config.concurrency.min(seeded_routes.len());
+    let barrier = Arc::new(Barrier::new(allocator_workers + 2));
     let warmup_until = Instant::now() + Duration::from_secs(config.warmup_secs);
     let measure_until = warmup_until + Duration::from_secs(config.duration_secs);
-    let timeout = Duration::from_millis(config.watch_snapshot_timeout_ms);
-    let mut handles = Vec::with_capacity(config.concurrency);
+    let route_snapshots = Arc::new(DashMap::<String, RouteSnapshot>::new());
+    let route_keys = Arc::new(
+        seeded_routes
+            .iter()
+            .map(|route| route.timeline_key.clone())
+            .collect::<Vec<_>>(),
+    );
+    let seeded_routes_for_driver = seeded_routes.to_vec();
+    for route in seeded_routes {
+        route_snapshots.insert(route.timeline_key.clone(), route.clone());
+    }
 
-    for worker_idx in 0..config.concurrency {
+    let mut worker_handles = Vec::with_capacity(allocator_workers);
+    for worker_idx in 0..allocator_workers {
         let barrier = barrier.clone();
         let endpoint = config.endpoint.clone();
-        let scenario = scenario.clone();
-        let sdk_base = config.sdk_instance_id.clone();
-        handles.push(tokio::spawn(async move {
+        let allocate_batch = config.allocate_batch;
+        let route_snapshots = route_snapshots.clone();
+        let route_keys = route_keys.clone();
+        worker_handles.push(tokio::spawn(async move {
             let channel = connect_channel(endpoint).await?;
-            let mut client = TimelineRouteServiceClient::new(channel);
-            let mut stats = WatchWorkerStats::default();
-            let mut session_ordinal = 0u64;
+            let mut timestamp_client = TimestampServiceClient::new(channel.clone());
+            let mut route_client = TimelineRouteServiceClient::new(channel);
+            let mut stats = RebalanceWorkerStats::default();
+            let mut last_end_by_timeline = HashMap::new();
+            let worker_keys = route_keys
+                .iter()
+                .skip(worker_idx)
+                .step_by(allocator_workers)
+                .cloned()
+                .collect::<Vec<_>>();
+            let mut route_idx = 0usize;
+            let mut request_ordinal = 0u64;
 
             barrier.wait().await;
             loop {
-                let session_start = Instant::now();
-                if session_start >= measure_until {
+                let request_start = Instant::now();
+                if request_start >= measure_until {
                     break;
                 }
 
-                let sdk_instance_id = format!("{sdk_base}-{worker_idx}-{session_ordinal}");
-                session_ordinal = session_ordinal.saturating_add(1);
+                let timeline_key = &worker_keys[route_idx % worker_keys.len()];
+                route_idx = (route_idx + 1) % worker_keys.len();
+                request_ordinal = request_ordinal.saturating_add(1);
+                let route = route_snapshots
+                    .get(timeline_key)
+                    .ok_or("missing route snapshot")?
+                    .clone();
 
-                let request = scenario.build_request(sdk_instance_id);
-                let expected_keys = scenario.expected_keys();
-                let mut tracker = SnapshotTracker::new(expected_keys.clone());
-                let stream_open_start = Instant::now();
-                let stream = match client.watch_timeline_routes(Request::new(request)).await {
-                    Ok(response) => response.into_inner(),
-                    Err(_) => {
-                        if session_start < measure_until && Instant::now() >= warmup_until {
-                            stats.stream_errors += 1;
-                        }
-                        continue;
-                    }
-                };
-                let stream_open_elapsed = stream_open_start.elapsed().as_micros() as u64;
-                let snapshot_transfer_start = Instant::now();
+                let logical_result: Result<chronos::proto::v1::AllocateTimestampsResponse, ()> =
+                    async {
+                        let mut current_route = route.clone();
 
-                let routes_observed =
-                    tokio::time::timeout(timeout, consume_snapshot(stream, &mut tracker)).await;
-                let record_session =
-                    session_start < measure_until && Instant::now() >= warmup_until;
+                        for attempt in 0..=REBALANCE_ALLOCATE_RETRY_ATTEMPTS {
+                            let request = AllocateTimestampsRequest {
+                                timeline_key: current_route.timeline_key.clone(),
+                                count: allocate_batch,
+                                expected_epoch: current_route.epoch,
+                                expected_route_version: current_route.route_version,
+                                client_request_id: format!(
+                                    "rebalance-{worker_idx}-{request_ordinal}-{attempt}"
+                                ),
+                                request_timeout_ms: 0,
+                            };
 
-                match routes_observed {
-                    Ok(Ok(routes_observed)) => {
-                        if record_session {
-                            stats.sessions += 1;
-                            stats.routes_observed += routes_observed;
-                            stats.stream_open_time_us.push(stream_open_elapsed);
-                            stats
-                                .snapshot_transfer_time_us
-                                .push(snapshot_transfer_start.elapsed().as_micros() as u64);
-                            stats
-                                .snapshot_end_to_end_time_us
-                                .push(session_start.elapsed().as_micros() as u64);
+                            match timestamp_client
+                                .allocate_timestamps(Request::new(request))
+                                .await
+                            {
+                                Ok(response) => return Ok(response.into_inner()),
+                                Err(status) => {
+                                    let detail = decode_error_detail(&status);
+                                    record_error_count(
+                                        &mut stats.error_counts,
+                                        detail
+                                            .as_ref()
+                                            .map(|detail| error_code_label(detail.code))
+                                            .unwrap_or("transport_error"),
+                                    );
+
+                                    let refresh_start = Instant::now();
+                                    let refreshed = match refresh_route(
+                                        &mut route_client,
+                                        &current_route.timeline_key,
+                                    )
+                                    .await
+                                    {
+                                        Ok(refreshed) => refreshed,
+                                        Err(_) => {
+                                            record_error_count(
+                                                &mut stats.error_counts,
+                                                "route_refresh_failed",
+                                            );
+                                            return Err(());
+                                        }
+                                    };
+                                    let refresh_elapsed =
+                                        refresh_start.elapsed().as_micros() as u64;
+                                    route_snapshots.insert(
+                                        current_route.timeline_key.clone(),
+                                        refreshed.clone(),
+                                    );
+                                    current_route = refreshed;
+
+                                    if request_start >= warmup_until {
+                                        stats.route_refresh_total += 1;
+                                        stats.route_refresh_latencies_us.push(refresh_elapsed);
+                                    }
+
+                                    if attempt == REBALANCE_ALLOCATE_RETRY_ATTEMPTS {
+                                        return Err(());
+                                    }
+
+                                    if is_transient_rebalance_error(detail.as_ref()) {
+                                        tokio::time::sleep(Duration::from_millis(
+                                            REBALANCE_ALLOCATE_RETRY_BACKOFF_MS,
+                                        ))
+                                        .await;
+                                    }
+                                }
+                            }
                         }
+
+                        Err(())
                     }
-                    Ok(Err(_)) => {
-                        if record_session {
-                            stats.stream_errors += 1;
-                            stats.incomplete_keys_total += tracker.incomplete_count() as u64;
-                        }
+                    .await;
+
+                let elapsed = request_start.elapsed().as_micros() as u64;
+                if request_start >= warmup_until {
+                    stats.allocate_requests_total += 1;
+                    stats.allocate_latencies_us.push(elapsed);
+                }
+
+                if let Ok(response) = logical_result {
+                    if request_start >= warmup_until {
+                        stats.allocate_success_total += 1;
+                        stats.allocate_tsos_total += count_tsos(&response);
+                        stats.monotonicity_violations_total +=
+                            record_monotonicity(&mut last_end_by_timeline, &response);
                     }
-                    Err(_) => {
-                        if record_session {
-                            stats.timeouts += 1;
-                            stats.incomplete_keys_total += tracker.incomplete_count() as u64;
-                        }
+
+                    if let Some(mut route) = route_snapshots.get_mut(&response.timeline_key) {
+                        route.epoch = response.epoch;
+                        route.route_version = response.route_version;
+                        route.generator_id = response.generator_id;
                     }
                 }
             }
 
-            Ok::<WatchWorkerStats, Box<dyn Error + Send + Sync>>(stats)
+            Ok::<RebalanceWorkerStats, Box<dyn Error + Send + Sync>>(stats)
         }));
     }
 
-    barrier.wait().await;
-    let mut total = WatchWorkerStats::default();
-    for handle in handles {
-        let stats = handle.await??;
-        total.sessions += stats.sessions;
-        total.routes_observed += stats.routes_observed;
-        total.timeouts += stats.timeouts;
-        total.stream_errors += stats.stream_errors;
-        total.incomplete_keys_total += stats.incomplete_keys_total;
-        total.stream_open_time_us.extend(stats.stream_open_time_us);
-        total
-            .snapshot_transfer_time_us
-            .extend(stats.snapshot_transfer_time_us);
-        total
-            .snapshot_end_to_end_time_us
-            .extend(stats.snapshot_end_to_end_time_us);
-    }
-    Ok(total)
-}
+    let barrier_driver = barrier.clone();
+    let endpoint = config.endpoint.clone();
+    let route_keys_for_driver = route_keys.clone();
+    let transfer_targets = config.transfer_target_generators.clone();
+    let transfer_interval_ms = config.transfer_interval_ms;
+    let driver_handle = tokio::spawn(async move {
+        let channel = connect_channel(endpoint).await?;
+        let mut control_client = TimelineControlServiceClient::new(channel);
+        let mut driver_routes = seeded_routes_for_driver
+            .iter()
+            .map(|route| (route.timeline_key.clone(), route.clone()))
+            .collect::<HashMap<_, _>>();
+        let mut stats = RebalanceDriverStats::default();
+        let mut transfer_idx = 0usize;
 
-async fn consume_snapshot(
-    mut stream: tonic::Streaming<chronos::proto::v1::TimelineRouteEvent>,
-    tracker: &mut SnapshotTracker,
-) -> AppResult<u64> {
-    if tracker.is_complete() {
-        return Ok(0);
-    }
+        barrier_driver.wait().await;
+        let mut next_tick = Instant::now();
+        loop {
+            next_tick += Duration::from_millis(transfer_interval_ms);
+            tokio::time::sleep_until(tokio::time::Instant::from_std(next_tick)).await;
+            let transfer_start = Instant::now();
+            if transfer_start >= measure_until {
+                break;
+            }
 
-    let mut routes_observed = 0u64;
-    while let Some(event) = stream.next().await {
-        let event = event?;
-        match event.event {
-            Some(timeline_route_event::Event::Route(route)) => {
-                routes_observed += 1;
-                if tracker.on_route(&route.timeline_key) {
-                    return Ok(routes_observed);
+            let timeline_key = &route_keys_for_driver[transfer_idx % route_keys_for_driver.len()];
+            transfer_idx = (transfer_idx + 1) % route_keys_for_driver.len();
+            let current = driver_routes
+                .get(timeline_key)
+                .ok_or("missing driver route snapshot")?
+                .clone();
+            let Some(target_generator_id) =
+                next_target_generator(current.generator_id, &transfer_targets)
+            else {
+                continue;
+            };
+
+            let result = control_client
+                .transfer_timeline(Request::new(TransferTimelineRequest {
+                    timeline_key: timeline_key.clone(),
+                    target_generator_id: Some(target_generator_id),
+                    target_worker_id: None,
+                    reason: TimelineTransferReason::Rebalance as i32,
+                }))
+                .await;
+            let elapsed = transfer_start.elapsed().as_micros() as u64;
+
+            if transfer_start >= warmup_until {
+                stats.transfer_attempts_total += 1;
+            }
+
+            match result {
+                Ok(response) => {
+                    let response = response.into_inner();
+                    if transfer_start >= warmup_until {
+                        stats.transfer_success_total += 1;
+                        stats.transfer_latencies_us.push(elapsed);
+                    }
+                    if let Some(route) = driver_routes.get_mut(timeline_key) {
+                        route.generator_id = response.new_generator_id;
+                        route.epoch = response.new_epoch;
+                        route.route_version = response.route_version;
+                    }
+                }
+                Err(_) => {
+                    if transfer_start >= warmup_until {
+                        stats.transfer_failed_total += 1;
+                    }
                 }
             }
-            Some(timeline_route_event::Event::Tombstone(_)) => {}
-            Some(timeline_route_event::Event::Keepalive(_)) => {}
-            None => {}
+        }
+
+        Ok::<RebalanceDriverStats, Box<dyn Error + Send + Sync>>(stats)
+    });
+
+    barrier.wait().await;
+
+    let mut total = RebalanceBenchStats::default();
+    for handle in worker_handles {
+        let stats = handle.await??;
+        total.allocate_requests_total += stats.allocate_requests_total;
+        total.allocate_success_total += stats.allocate_success_total;
+        total.allocate_tsos_total += stats.allocate_tsos_total;
+        total
+            .allocate_latencies_us
+            .extend(stats.allocate_latencies_us);
+        total.route_refresh_total += stats.route_refresh_total;
+        total
+            .route_refresh_latencies_us
+            .extend(stats.route_refresh_latencies_us);
+        total.monotonicity_violations_total += stats.monotonicity_violations_total;
+        for (label, count) in stats.error_counts {
+            *total.error_counts.entry(label).or_insert(0) += count;
         }
     }
 
-    Err("watch stream ended before snapshot completed".into())
+    let driver_stats = driver_handle.await??;
+    total.transfer_attempts_total += driver_stats.transfer_attempts_total;
+    total.transfer_success_total += driver_stats.transfer_success_total;
+    total.transfer_failed_total += driver_stats.transfer_failed_total;
+    total
+        .transfer_latencies_us
+        .extend(driver_stats.transfer_latencies_us);
+
+    Ok(total)
+}
+
+fn print_rebalance_summary(config: &BenchConfig, stats: RebalanceBenchStats) {
+    let elapsed = config.duration_secs as f64;
+    let mut allocate_latencies = stats.allocate_latencies_us;
+    let mut transfer_latencies = stats.transfer_latencies_us;
+    let mut refresh_latencies = stats.route_refresh_latencies_us;
+    allocate_latencies.sort_unstable();
+    transfer_latencies.sort_unstable();
+    refresh_latencies.sort_unstable();
+
+    println!("scenario={}", config.scenario.as_str());
+    println!("endpoint={}", config.endpoint);
+    println!("timeline_namespace={}", config.timeline_namespace);
+    println!("concurrency={}", config.concurrency);
+    println!("timeline_count={}", config.timeline_count);
+    println!("duration_secs={}", config.duration_secs);
+    println!("warmup_secs={}", config.warmup_secs);
+    println!("allocate_batch={}", config.allocate_batch);
+    println!("transfer_interval_ms={}", config.transfer_interval_ms);
+    println!(
+        "transfer_target_generators={}",
+        config
+            .transfer_target_generators
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    println!("allocate_requests_total={}", stats.allocate_requests_total);
+    println!("allocate_success_total={}", stats.allocate_success_total);
+    println!(
+        "allocate_failed_total={}",
+        stats
+            .allocate_requests_total
+            .saturating_sub(stats.allocate_success_total)
+    );
+    println!("allocate_tsos_total={}", stats.allocate_tsos_total);
+    println!(
+        "allocate_req_per_sec={:.2}",
+        stats.allocate_requests_total as f64 / elapsed
+    );
+    println!(
+        "allocate_success_per_sec={:.2}",
+        stats.allocate_success_total as f64 / elapsed
+    );
+    println!(
+        "allocate_tso_per_sec={:.2}",
+        stats.allocate_tsos_total as f64 / elapsed
+    );
+    println!(
+        "allocate_latency_p50_us={}",
+        percentile(&allocate_latencies, 0.50)
+    );
+    println!(
+        "allocate_latency_p95_us={}",
+        percentile(&allocate_latencies, 0.95)
+    );
+    println!(
+        "allocate_latency_p99_us={}",
+        percentile(&allocate_latencies, 0.99)
+    );
+    println!(
+        "allocate_latency_max_us={}",
+        allocate_latencies.last().copied().unwrap_or(0)
+    );
+    println!("route_refresh_total={}", stats.route_refresh_total);
+    println!(
+        "route_refresh_p50_us={}",
+        percentile(&refresh_latencies, 0.50)
+    );
+    println!(
+        "route_refresh_p95_us={}",
+        percentile(&refresh_latencies, 0.95)
+    );
+    println!(
+        "route_refresh_p99_us={}",
+        percentile(&refresh_latencies, 0.99)
+    );
+    println!(
+        "route_refresh_max_us={}",
+        refresh_latencies.last().copied().unwrap_or(0)
+    );
+    println!("transfer_attempts_total={}", stats.transfer_attempts_total);
+    println!("transfer_success_total={}", stats.transfer_success_total);
+    println!("transfer_failed_total={}", stats.transfer_failed_total);
+    println!(
+        "transfer_latency_p50_us={}",
+        percentile(&transfer_latencies, 0.50)
+    );
+    println!(
+        "transfer_latency_p95_us={}",
+        percentile(&transfer_latencies, 0.95)
+    );
+    println!(
+        "transfer_latency_p99_us={}",
+        percentile(&transfer_latencies, 0.99)
+    );
+    println!(
+        "transfer_latency_max_us={}",
+        transfer_latencies.last().copied().unwrap_or(0)
+    );
+    println!(
+        "monotonicity_violations_total={}",
+        stats.monotonicity_violations_total
+    );
+    let mut error_labels = stats.error_counts.into_iter().collect::<Vec<_>>();
+    error_labels.sort_by(|left, right| left.0.cmp(&right.0));
+    for (label, count) in error_labels {
+        println!("allocate_error_{}_total={}", label, count);
+    }
 }
 
 fn print_status_summary(config: &BenchConfig, stats: StatusWorkerStats) {
@@ -555,6 +887,7 @@ fn print_status_summary(config: &BenchConfig, stats: StatusWorkerStats) {
 
     println!("scenario={}", config.scenario.as_str());
     println!("endpoint={}", config.endpoint);
+    println!("timeline_namespace={}", config.timeline_namespace);
     println!("concurrency={}", config.concurrency);
     println!("timeline_count={}", config.timeline_count);
     println!("duration_secs={}", config.duration_secs);
@@ -591,129 +924,23 @@ fn print_status_summary(config: &BenchConfig, stats: StatusWorkerStats) {
     );
 }
 
-fn print_watch_summary(
-    config: &BenchConfig,
-    expected_keys: &HashSet<String>,
-    stats: WatchWorkerStats,
-) {
-    let elapsed = config.duration_secs as f64;
-    let mut stream_open_times = stats.stream_open_time_us;
-    let mut snapshot_transfer_times = stats.snapshot_transfer_time_us;
-    let mut snapshot_end_to_end_times = stats.snapshot_end_to_end_time_us;
-    stream_open_times.sort_unstable();
-    snapshot_transfer_times.sort_unstable();
-    snapshot_end_to_end_times.sort_unstable();
-
-    println!("scenario={}", config.scenario.as_str());
-    println!("endpoint={}", config.endpoint);
-    println!("concurrency={}", config.concurrency);
-    println!("timeline_count={}", config.timeline_count);
-    println!("duration_secs={}", config.duration_secs);
-    println!("warmup_secs={}", config.warmup_secs);
-    println!("expected_keys={}", expected_keys.len());
-    println!("sessions={}", stats.sessions);
-    println!("routes_observed={}", stats.routes_observed);
-    println!("timeouts={}", stats.timeouts);
-    println!("stream_errors={}", stats.stream_errors);
-    println!("incomplete_keys_total={}", stats.incomplete_keys_total);
-    println!("sessions_per_sec={:.2}", stats.sessions as f64 / elapsed);
-    println!(
-        "stream_open_p50_us={}",
-        percentile(&stream_open_times, 0.50)
-    );
-    println!(
-        "stream_open_p95_us={}",
-        percentile(&stream_open_times, 0.95)
-    );
-    println!(
-        "stream_open_p99_us={}",
-        percentile(&stream_open_times, 0.99)
-    );
-    println!(
-        "stream_open_max_us={}",
-        stream_open_times.last().copied().unwrap_or(0)
-    );
-    println!(
-        "snapshot_transfer_p50_us={}",
-        percentile(&snapshot_transfer_times, 0.50)
-    );
-    println!(
-        "snapshot_transfer_p95_us={}",
-        percentile(&snapshot_transfer_times, 0.95)
-    );
-    println!(
-        "snapshot_transfer_p99_us={}",
-        percentile(&snapshot_transfer_times, 0.99)
-    );
-    println!(
-        "snapshot_transfer_max_us={}",
-        snapshot_transfer_times.last().copied().unwrap_or(0)
-    );
-    println!(
-        "snapshot_end_to_end_p50_us={}",
-        percentile(&snapshot_end_to_end_times, 0.50)
-    );
-    println!(
-        "snapshot_end_to_end_p95_us={}",
-        percentile(&snapshot_end_to_end_times, 0.95)
-    );
-    println!(
-        "snapshot_end_to_end_p99_us={}",
-        percentile(&snapshot_end_to_end_times, 0.99)
-    );
-    println!(
-        "snapshot_end_to_end_max_us={}",
-        snapshot_end_to_end_times.last().copied().unwrap_or(0)
-    );
-}
-
 #[tokio::main]
 async fn main() -> AppResult<()> {
     let config = load_config()?;
     let seed_channel = connect_channel(config.endpoint.clone()).await?;
-    let seeded_keys = if config.seed_timelines {
-        ensure_seed_timelines(&config, seed_channel.clone()).await?
+    let seeded_routes = if config.seed_timelines {
+        ensure_seed_routes(&config, seed_channel.clone()).await?
     } else {
         Vec::new()
     };
-
     match config.scenario {
         Scenario::StatusScan | Scenario::StatusScanFiltered => {
             let stats = run_status_scan_bench(&config).await?;
             print_status_summary(&config, stats);
         }
-        Scenario::WatchAllSnapshot => {
-            let expected_keys =
-                Arc::new(fetch_all_status_keys(seed_channel.clone(), config.page_size).await?);
-            let stats = run_watch_snapshot_bench(
-                &config,
-                WatchScenario::All {
-                    expected_keys: expected_keys.clone(),
-                },
-            )
-            .await?;
-            print_watch_summary(&config, &expected_keys, stats);
-        }
-        Scenario::WatchFilteredSnapshot => {
-            let expected_keys: HashSet<String> = if !config.watch_filter_keys.is_empty() {
-                config.watch_filter_keys.iter().cloned().collect()
-            } else if !seeded_keys.is_empty() {
-                seeded_keys.into_iter().collect()
-            } else {
-                return Err(
-                    "watch_filtered_snapshot requires seeded timelines or CHRONOS_CONTROL_BENCH_WATCH_FILTER_KEYS"
-                        .into(),
-                );
-            };
-            let expected_keys = Arc::new(expected_keys);
-            let stats = run_watch_snapshot_bench(
-                &config,
-                WatchScenario::Filtered {
-                    expected_keys: expected_keys.clone(),
-                },
-            )
-            .await?;
-            print_watch_summary(&config, &expected_keys, stats);
+        Scenario::AllocateDuringRebalance => {
+            let stats = run_allocate_during_rebalance_bench(&config, &seeded_routes).await?;
+            print_rebalance_summary(&config, stats);
         }
     }
 
@@ -732,12 +959,8 @@ mod tests {
             Scenario::StatusScanFiltered
         );
         assert_eq!(
-            parse_scenario("watch_all_snapshot").unwrap(),
-            Scenario::WatchAllSnapshot
-        );
-        assert_eq!(
-            parse_scenario("watch_filtered_snapshot").unwrap(),
-            Scenario::WatchFilteredSnapshot
+            parse_scenario("allocate_during_rebalance").unwrap(),
+            Scenario::AllocateDuringRebalance
         );
     }
 
@@ -754,22 +977,21 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_tracker_completes_only_after_all_expected_routes() {
-        let expected = Arc::new(HashSet::from([
-            "timeline-a".to_string(),
-            "timeline-b".to_string(),
-        ]));
-        let mut tracker = SnapshotTracker::new(expected);
-
-        assert!(!tracker.on_route("timeline-a"));
-        assert!(!tracker.on_route("timeline-a"));
-        assert!(tracker.on_route("timeline-b"));
-    }
-
-    #[test]
     fn percentile_handles_empty_and_simple_slices() {
         assert_eq!(percentile(&[], 0.95), 0);
         assert_eq!(percentile(&[10, 20, 30], 0.50), 20);
         assert_eq!(percentile(&[10, 20, 30], 0.99), 30);
+    }
+
+    #[test]
+    fn parse_csv_u32_list_parses_and_skips_empty_entries() {
+        assert_eq!(parse_csv_u32_list("1, 2,,3").unwrap(), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn next_target_generator_rotates_and_avoids_current_when_possible() {
+        assert_eq!(next_target_generator(1, &[0, 1, 2]), Some(2));
+        assert_eq!(next_target_generator(9, &[0, 1, 2]), Some(0));
+        assert_eq!(next_target_generator(4, &[4]), Some(4));
     }
 }

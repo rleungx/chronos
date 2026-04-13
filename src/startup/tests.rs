@@ -17,7 +17,6 @@ use chronos::rpc::{
     TsoTimestampService,
 };
 use chronos::{SystemClock, TsoError};
-use etcd_client::Client;
 use futures::FutureExt;
 use std::env;
 use std::net::SocketAddr;
@@ -45,34 +44,12 @@ use rustls::{ClientConfig, ServerConfig};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
-#[derive(Debug, serde::Deserialize)]
-struct ClusterContractRecord {
-    contract_id: String,
-    writer_build_version: String,
-    writer_build_commit: String,
-}
-
 fn parsed_test_etcd_endpoints() -> Vec<String> {
     test_etcd_endpoints()
         .split(',')
         .map(|endpoint| endpoint.trim().to_string())
         .filter(|endpoint| !endpoint.is_empty())
         .collect()
-}
-
-async fn read_cluster_contract(prefix: &str) -> ClusterContractRecord {
-    let mut client = Client::connect(parsed_test_etcd_endpoints(), None)
-        .await
-        .expect("etcd client should connect");
-    let response = client
-        .get(format!("{prefix}/meta/cluster_contract"), None)
-        .await
-        .expect("cluster contract read should succeed");
-    let kv = response
-        .kvs()
-        .first()
-        .expect("cluster contract key should exist");
-    serde_json::from_slice(kv.value()).expect("cluster contract json should decode")
 }
 
 fn explicit_required_config() -> TsoConfig {
@@ -225,24 +202,6 @@ fn build_test_mtls_acceptor(fixture: &MetricsTlsFixture) -> TlsAcceptor {
 }
 
 #[test]
-fn load_tso_config_reads_route_cache_ttl_variants_from_env() {
-    let _guard = ENV_LOCK.lock().unwrap();
-    clear_tso_env();
-    unsafe { env::set_var("CHRONOS_ROUTE_CACHE_TTL_MS", "1234") };
-
-    let config = load_tso_config().unwrap();
-    assert_eq!(config.route_cache_ttl_ms, 1234);
-
-    clear_tso_env();
-    unsafe { env::set_var("CHRONOS_ROUTE_CACHE_TTL_MS", "0") };
-
-    let config = load_tso_config().unwrap();
-    assert_eq!(config.route_cache_ttl_ms, 0);
-
-    clear_tso_env();
-}
-
-#[test]
 fn startup_preflight_allows_derived_instance_id() {
     let _guard = ENV_LOCK.lock().unwrap();
     clear_tso_env();
@@ -273,7 +232,6 @@ fn production_profile_requires_auditable_build_commit() {
         chronos::BuildIdentity {
             version: chronos::build_version(),
             commit: "unknown",
-            mixed_version_contract_id: chronos::mixed_version_contract_id(),
         },
     )
     .unwrap_err();
@@ -291,7 +249,6 @@ fn production_profile_accepts_known_build_commit() {
         chronos::BuildIdentity {
             version: chronos::build_version(),
             commit: "deadbeef",
-            mixed_version_contract_id: chronos::mixed_version_contract_id(),
         },
     )
     .unwrap();
@@ -306,7 +263,6 @@ fn non_production_profile_allows_unknown_build_commit() {
         chronos::BuildIdentity {
             version: chronos::build_version(),
             commit: "unknown",
-            mixed_version_contract_id: chronos::mixed_version_contract_id(),
         },
     )
     .unwrap();
@@ -1096,20 +1052,6 @@ fn startup_failure_stage_classifies_identity_conflict() {
 }
 
 #[test]
-fn startup_failure_stage_classifies_cluster_contract_mismatch() {
-    let error = TsoError::ClusterContractMismatch {
-        cluster_contract_id: "cluster-contract-v2".into(),
-        local_contract_id: chronos::mixed_version_contract_id().into(),
-        cluster_writer_build_version: "9.9.9".into(),
-        cluster_writer_build_commit: "deadbeef".into(),
-    };
-    assert_eq!(
-        startup_failure_stage(&error as &(dyn std::error::Error + 'static)),
-        "contract"
-    );
-}
-
-#[test]
 fn startup_preflight_failure_uses_machine_readable_reason() {
     assert_eq!(
         startup_preflight_failure_reason(),
@@ -1125,20 +1067,6 @@ fn startup_bootstrap_failure_maps_identity_conflict_to_machine_readable_reason()
     assert_eq!(
         startup_bootstrap_failure_reason(&error as &(dyn std::error::Error + 'static)),
         WorkerReadinessReason::IdentityLeaseAcquireFailed
-    );
-}
-
-#[test]
-fn startup_bootstrap_failure_maps_cluster_contract_mismatch_to_machine_readable_reason() {
-    let error = TsoError::ClusterContractMismatch {
-        cluster_contract_id: "cluster-contract-v2".into(),
-        local_contract_id: chronos::mixed_version_contract_id().into(),
-        cluster_writer_build_version: "9.9.9".into(),
-        cluster_writer_build_commit: "deadbeef".into(),
-    };
-    assert_eq!(
-        startup_bootstrap_failure_reason(&error as &(dyn std::error::Error + 'static)),
-        WorkerReadinessReason::ClusterContractMismatch
     );
 }
 
@@ -1954,111 +1882,6 @@ async fn etcd_startup_failure_after_identity_lease_revokes_lease() {
     })
     .await
     .expect("identity lease should be revoked after startup failure");
-
-    clear_tso_env();
-}
-
-#[tokio::test]
-#[ignore = "requires a reachable etcd; set CHRONOS_TEST_ETCD_ENDPOINTS or run one on 127.0.0.1:2379"]
-async fn etcd_cluster_contract_key_is_created_on_binary_startup() {
-    clear_tso_env();
-    let unique_prefix = unique_test_etcd_prefix("cluster-contract-startup");
-
-    let startup = etcd_startup_config(
-        TsoConfig {
-            metadata_kind: "etcd".into(),
-            worker_id: "worker-a".into(),
-            instance_id: "instance-contract".into(),
-            advertise_endpoint: "endpoint-a:50051".into(),
-            etcd_endpoints: parsed_test_etcd_endpoints(),
-            lease_ttl_ms: 5_000,
-            ..explicit_required_config()
-        },
-        unique_prefix.clone(),
-    );
-
-    let (service, identity_lease) = tokio::time::timeout(
-        Duration::from_secs(5),
-        build_tso_service(&startup, Arc::new(SystemClock)),
-    )
-    .await
-    .expect("binary startup timed out")
-    .expect("binary startup should succeed");
-
-    assert_ne!(chronos::build_commit(), "unknown");
-    let record = read_cluster_contract(&unique_prefix).await;
-    assert_eq!(record.contract_id, chronos::mixed_version_contract_id());
-    assert_eq!(record.writer_build_version, chronos::build_version());
-    assert_eq!(record.writer_build_commit, chronos::build_commit());
-
-    if let Some(mut identity_lease) = identity_lease {
-        identity_lease.shutdown().await;
-    }
-    service.shutdown().await;
-    clear_tso_env();
-}
-
-#[tokio::test]
-#[ignore = "requires a reachable etcd; set CHRONOS_TEST_ETCD_ENDPOINTS or run one on 127.0.0.1:2379"]
-async fn etcd_cluster_contract_mismatch_rejects_binary_startup() {
-    clear_tso_env();
-    let unique_prefix = unique_test_etcd_prefix("cluster-contract-startup-mismatch");
-    let mut client = Client::connect(parsed_test_etcd_endpoints(), None)
-        .await
-        .expect("etcd client should connect");
-    client
-        .put(
-            format!("{unique_prefix}/meta/cluster_contract"),
-            serde_json::to_vec(&serde_json::json!({
-                "contract_id": "future-contract-v9",
-                "writer_build_version": "9.9.9",
-                "writer_build_commit": "deadbeef"
-            }))
-            .expect("contract json should serialize"),
-            None,
-        )
-        .await
-        .expect("prewriting cluster contract should succeed");
-
-    let startup = etcd_startup_config(
-        TsoConfig {
-            metadata_kind: "etcd".into(),
-            worker_id: "worker-a".into(),
-            instance_id: "instance-contract".into(),
-            advertise_endpoint: "endpoint-a:50051".into(),
-            etcd_endpoints: parsed_test_etcd_endpoints(),
-            lease_ttl_ms: 5_000,
-            ..explicit_required_config()
-        },
-        unique_prefix,
-    );
-
-    let error = match tokio::time::timeout(
-        Duration::from_secs(5),
-        build_tso_service(&startup, Arc::new(SystemClock)),
-    )
-    .await
-    .expect("binary startup timed out")
-    {
-        Ok(_) => panic!("mismatched contract should fail binary startup"),
-        Err(error) => error,
-    };
-
-    let error = error
-        .downcast::<chronos::TsoError>()
-        .expect("expected TsoError");
-    assert!(matches!(
-        *error,
-        chronos::TsoError::ClusterContractMismatch {
-            ref cluster_contract_id,
-            ref local_contract_id,
-            ref cluster_writer_build_version,
-            ref cluster_writer_build_commit,
-        } if cluster_contract_id == "future-contract-v9"
-            && local_contract_id == chronos::mixed_version_contract_id()
-            && cluster_writer_build_version == "9.9.9"
-            && cluster_writer_build_commit == "deadbeef"
-    ));
 
     clear_tso_env();
 }
