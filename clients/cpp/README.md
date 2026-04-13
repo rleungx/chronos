@@ -7,6 +7,14 @@
 - `Client client(addr, timeline_key)`
 - `client.AllocateTimestamps(count)`
 
+## Build and test
+
+```bash
+cmake -S clients/cpp -B clients/cpp/build
+cmake --build clients/cpp/build
+ctest --test-dir clients/cpp/build --output-on-failure
+```
+
 ## Behavior
 
 - The client ensures the bound timeline on first connect

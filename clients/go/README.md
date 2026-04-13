@@ -2,19 +2,21 @@
 
 `chronos` is the Go application-facing Chronos client.
 
-This package is covered by local Go tests, including a fake gRPC server that exercises
-client initialization, allocation, and stale-route refresh behavior.
+## Public shape
 
-## Intended usage
-
-1. Create one client bound to one timeline
-2. Call `AllocateTimestamps`
-3. Close the client when done
-
-Applications should not call internal routing RPCs directly.
+- `client, err := chronos.New(ctx, addr, timelineKey)`
+- `defer client.Close()`
+- `client.AllocateTimestamps(ctx, count)`
 
 Advanced configuration should use `NewWithOptions(...)` and package options such as
 `WithDesiredResourceTier(...)` and `WithRequestTimeoutMs(...)`.
+
+## Build and test
+
+```bash
+cd clients/go
+go test ./...
+```
 
 ## Minimal example
 

@@ -8,6 +8,14 @@
 - `client.allocateTimestamps(count)`
 - `client.close()`
 
+## Build and test
+
+```bash
+cd clients/java
+source ~/.zshrc
+gradle test
+```
+
 ## Behavior
 
 - The client ensures the bound timeline on first connect

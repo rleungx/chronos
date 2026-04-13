@@ -43,10 +43,7 @@ Advanced Rust configuration should use `ClientConfig` builder methods, not publi
 
 ## Examples
 
-- Go client package: `clients/go`
-- Go package README: `clients/go/README.md`
-- Java client implementation: `clients/java/src/main/java/chronos/client/Client.java`
-- Java client README: `clients/java/README.md`
-- C++ client implementation: `clients/cpp/client.h`, `clients/cpp/client.cc`
-- C++ client README: `clients/cpp/README.md`
+- Go client: `clients/go/README.md`
+- Java client: `clients/java/README.md`
+- C++ client: `clients/cpp/README.md`
 - Rust: `examples/rust/chronos_client_example.md`
