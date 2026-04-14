@@ -413,6 +413,7 @@ mod tests {
             .clone();
         let lease_allocator = allocator.clone();
         let prune_allocator = allocator.clone();
+        let (lease_started_tx, lease_started_rx) = std::sync::mpsc::channel();
         let (lease_task, prune_task) = {
             let _lifecycle = serializer
                 .lifecycle
@@ -420,13 +421,17 @@ mod tests {
                 .expect("timeline serializer lifecycle lock poisoned");
 
             let lease_task = tokio::task::spawn_blocking(move || {
+                lease_started_tx
+                    .send(())
+                    .expect("lease start signal should send");
                 lease_allocator.serializer_for("proxy.unit.race")
             });
-            std::thread::yield_now();
+            lease_started_rx
+                .recv()
+                .expect("lease task should reach blocked state");
 
             let prune_task =
                 tokio::task::spawn_blocking(move || prune_allocator.prune_one_idle_serializer());
-            std::thread::yield_now();
 
             (lease_task, prune_task)
         };

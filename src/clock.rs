@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::MutexGuard;
-use std::time::SystemTime;
+use std::sync::{LazyLock, MutexGuard};
+use std::time::{Instant, SystemTime};
 
 use crate::recovery::{duration_since_unix_epoch_or_zero, record_recovery_event};
 use crate::{checked_physical_ms_from_unix_ms, TsoUnixMsBoundary, MAX_PHYSICAL_MS};
@@ -12,7 +12,20 @@ pub trait Clock: Send + Sync {
 #[derive(Debug, Default)]
 pub struct SystemClock;
 
+#[derive(Debug)]
+struct SystemClockBase {
+    base_relative_ms: u64,
+    base_instant: Instant,
+}
+
 static SYSTEM_CLOCK_LAST_NOW_MS: AtomicU64 = AtomicU64::new(0);
+static SYSTEM_CLOCK_BASE: LazyLock<SystemClockBase> = LazyLock::new(|| SystemClockBase {
+    base_relative_ms: relative_ms_from_unix_ms(
+        duration_since_unix_epoch_or_zero(SystemTime::now(), "clock", "system_clock_now_ms")
+            .as_millis() as u64,
+    ),
+    base_instant: Instant::now(),
+});
 
 fn relative_ms_from_unix_ms(unix_ms: u64) -> u64 {
     match checked_physical_ms_from_unix_ms(unix_ms) {
@@ -36,14 +49,26 @@ fn clamp_monotonic_ms(previous_ms: u64, observed_ms: u64) -> u64 {
     previous_ms.max(observed_ms)
 }
 
+fn monotonic_relative_ms(base_relative_ms: u64, elapsed_ms: u64) -> u64 {
+    base_relative_ms
+        .saturating_add(elapsed_ms)
+        .min(MAX_PHYSICAL_MS + 1)
+}
+
 impl Clock for SystemClock {
     fn now_ms(&self) -> u64 {
+        let base = &*SYSTEM_CLOCK_BASE;
         let unix_ms =
             duration_since_unix_epoch_or_zero(SystemTime::now(), "clock", "system_clock_now_ms")
                 .as_millis() as u64;
         let observed_ms = relative_ms_from_unix_ms(unix_ms);
-        let previous_ms = SYSTEM_CLOCK_LAST_NOW_MS.fetch_max(observed_ms, Ordering::AcqRel);
-        clamp_monotonic_ms(previous_ms, observed_ms)
+        let monotonic_ms = monotonic_relative_ms(
+            base.base_relative_ms,
+            base.base_instant.elapsed().as_millis() as u64,
+        );
+        let candidate_ms = observed_ms.max(monotonic_ms);
+        let previous_ms = SYSTEM_CLOCK_LAST_NOW_MS.fetch_max(candidate_ms, Ordering::AcqRel);
+        clamp_monotonic_ms(previous_ms, candidate_ms)
     }
 }
 
@@ -170,6 +195,24 @@ mod tests {
         assert_eq!(clamp_monotonic_ms(100, 80), 100);
         assert_eq!(clamp_monotonic_ms(100, 100), 100);
         assert_eq!(clamp_monotonic_ms(100, 120), 120);
+    }
+
+    #[test]
+    fn monotonic_relative_ms_advances_during_wall_clock_rewind_window() {
+        assert_eq!(monotonic_relative_ms(100, 0), 100);
+        assert_eq!(monotonic_relative_ms(100, 25), 125);
+    }
+
+    #[test]
+    fn monotonic_relative_ms_stays_failed_closed_at_capacity_horizon() {
+        assert_eq!(
+            monotonic_relative_ms(MAX_PHYSICAL_MS, 5),
+            MAX_PHYSICAL_MS + 1
+        );
+        assert_eq!(
+            monotonic_relative_ms(MAX_PHYSICAL_MS + 1, 50),
+            MAX_PHYSICAL_MS + 1
+        );
     }
 
     #[test]

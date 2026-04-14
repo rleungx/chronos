@@ -13,6 +13,7 @@ pub const DEFAULT_METRICS_BIND_ADDR: &str = "127.0.0.1:9898";
 pub const DEFAULT_METADATA_KIND: &str = "memory";
 pub const DEFAULT_MAX_TIMELINE_PROXY_LANES: usize = 4_096;
 pub const DEFAULT_MAX_TIMELINE_RUNTIME_ENTRIES: usize = 4_096;
+pub const DEFAULT_MAX_CONCURRENT_TIMELINE_LOADS: usize = 64;
 pub const DEFAULT_MAX_BATCH_PER_REQUEST: u32 = 4_096;
 pub const PRODUCTION_MAX_BATCH_PER_REQUEST: u32 = 4_096;
 pub const PRODUCTION_MAX_TIMELINE_PROXY_LANES: usize = 4_096;
@@ -78,6 +79,8 @@ pub enum TsoConfigValidationError {
     ZeroMaxTimelineProxyLanes,
     #[error("max_timeline_runtime_entries must be greater than 0")]
     ZeroMaxTimelineRuntimeEntries,
+    #[error("max_concurrent_timeline_loads must be greater than 0")]
+    ZeroMaxConcurrentTimelineLoads,
     #[error("default resource tier {resource_tier} has no configured generators")]
     MissingDefaultTierCapacity { resource_tier: ResourceTier },
     #[error("{0}")]
@@ -160,6 +163,7 @@ pub struct TsoConfig {
     pub safety_gap_ms: u64,
     pub max_timeline_proxy_lanes: usize,
     pub max_timeline_runtime_entries: usize,
+    pub max_concurrent_timeline_loads: usize,
 }
 
 impl Default for TsoConfig {
@@ -203,6 +207,7 @@ impl Default for TsoConfig {
             safety_gap_ms: 0,
             max_timeline_proxy_lanes: DEFAULT_MAX_TIMELINE_PROXY_LANES,
             max_timeline_runtime_entries: DEFAULT_MAX_TIMELINE_RUNTIME_ENTRIES,
+            max_concurrent_timeline_loads: DEFAULT_MAX_CONCURRENT_TIMELINE_LOADS,
         }
     }
 }
@@ -442,6 +447,9 @@ impl TsoConfig {
         }
         if self.max_timeline_runtime_entries == 0 {
             return Err(TsoConfigValidationError::ZeroMaxTimelineRuntimeEntries);
+        }
+        if self.max_concurrent_timeline_loads == 0 {
+            return Err(TsoConfigValidationError::ZeroMaxConcurrentTimelineLoads);
         }
 
         match self.default_resource_tier {
@@ -926,6 +934,16 @@ mod tests {
         assert_eq!(
             config.validate_for_startup(),
             Err(TsoConfigValidationError::ZeroMaxTimelineRuntimeEntries)
+        );
+    }
+
+    #[test]
+    fn validate_for_startup_rejects_zero_concurrent_timeline_load_limit() {
+        let mut config = valid_config();
+        config.max_concurrent_timeline_loads = 0;
+        assert_eq!(
+            config.validate_for_startup(),
+            Err(TsoConfigValidationError::ZeroMaxConcurrentTimelineLoads)
         );
     }
 

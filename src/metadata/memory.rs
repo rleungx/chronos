@@ -1,14 +1,17 @@
 use std::{
     collections::HashSet,
     hash::Hash,
-    sync::{Arc, RwLock},
+    sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard},
 };
+
+#[cfg(test)]
+use std::sync::MutexGuard as StdMutexGuard;
 
 use async_trait::async_trait;
 use dashmap::DashMap;
 use tokio::{sync::broadcast, sync::Mutex};
 
-use crate::{metrics, TimelineRoute, TsoError};
+use crate::{metrics, recovery::record_recovery_event, TimelineRoute, TsoError};
 
 use super::{
     types::{collect_timeline_route_update, RouteUpdateSignal},
@@ -110,12 +113,74 @@ impl MemoryMetadataStore {
             .send(RouteUpdateSignal::Route(route.clone()));
     }
 
+    fn sorted_timeline_keys_read(&self) -> RwLockReadGuard<'_, Option<Arc<[String]>>> {
+        match self.sorted_timeline_keys.read() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                record_recovery_event(
+                    "metadata",
+                    "memory_sorted_timeline_keys_read",
+                    "rwlock_poisoned",
+                );
+                poisoned.into_inner()
+            }
+        }
+    }
+
+    fn sorted_timeline_keys_write(&self) -> RwLockWriteGuard<'_, Option<Arc<[String]>>> {
+        match self.sorted_timeline_keys.write() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                record_recovery_event(
+                    "metadata",
+                    "memory_sorted_timeline_keys_write",
+                    "rwlock_poisoned",
+                );
+                poisoned.into_inner()
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn timeline_batch_cas_hook_lock(
+        &self,
+    ) -> StdMutexGuard<'_, Option<tokio::sync::oneshot::Sender<()>>> {
+        match self.timeline_batch_cas_acquired.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                record_recovery_event(
+                    "metadata",
+                    "memory_timeline_batch_cas_hook",
+                    "mutex_poisoned",
+                );
+                poisoned.into_inner()
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn generator_batch_cas_hook_lock(
+        &self,
+    ) -> StdMutexGuard<'_, Option<tokio::sync::oneshot::Sender<()>>> {
+        match self.generator_batch_cas_acquired.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                record_recovery_event(
+                    "metadata",
+                    "memory_generator_batch_cas_hook",
+                    "mutex_poisoned",
+                );
+                poisoned.into_inner()
+            }
+        }
+    }
+
     fn invalidate_sorted_timeline_keys(&self) {
-        *self.sorted_timeline_keys.write().unwrap() = None;
+        *self.sorted_timeline_keys_write() = None;
     }
 
     fn sorted_timeline_keys(&self) -> Arc<[String]> {
-        if let Some(keys) = self.sorted_timeline_keys.read().unwrap().as_ref().cloned() {
+        if let Some(keys) = self.sorted_timeline_keys_read().as_ref().cloned() {
             return keys;
         }
 
@@ -127,20 +192,20 @@ impl MemoryMetadataStore {
         timeline_keys.sort_unstable();
         let timeline_keys: Arc<[String]> = timeline_keys.into();
 
-        let mut cached = self.sorted_timeline_keys.write().unwrap();
+        let mut cached = self.sorted_timeline_keys_write();
         cached.get_or_insert_with(|| timeline_keys.clone()).clone()
     }
 
     #[cfg(test)]
     fn arm_timeline_batch_cas_hook(&self) -> tokio::sync::oneshot::Receiver<()> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        *self.timeline_batch_cas_acquired.lock().unwrap() = Some(tx);
+        *self.timeline_batch_cas_hook_lock() = Some(tx);
         rx
     }
 
     #[cfg(test)]
     fn notify_timeline_batch_cas_acquired(&self) {
-        if let Some(tx) = self.timeline_batch_cas_acquired.lock().unwrap().take() {
+        if let Some(tx) = self.timeline_batch_cas_hook_lock().take() {
             let _ = tx.send(());
         }
     }
@@ -148,13 +213,13 @@ impl MemoryMetadataStore {
     #[cfg(test)]
     fn arm_generator_batch_cas_hook(&self) -> tokio::sync::oneshot::Receiver<()> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        *self.generator_batch_cas_acquired.lock().unwrap() = Some(tx);
+        *self.generator_batch_cas_hook_lock() = Some(tx);
         rx
     }
 
     #[cfg(test)]
     fn notify_generator_batch_cas_acquired(&self) {
-        if let Some(tx) = self.generator_batch_cas_acquired.lock().unwrap().take() {
+        if let Some(tx) = self.generator_batch_cas_hook_lock().take() {
             let _ = tx.send(());
         }
     }
@@ -474,10 +539,11 @@ impl ControlPlaneStore for MemoryMetadataStore {}
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::{panic, panic::AssertUnwindSafe};
 
     use tokio::time::{timeout, Duration};
 
-    use crate::{ResourceTier, TimelineLifecycleState, TimelineRoute};
+    use crate::{metrics, ResourceTier, TimelineLifecycleState, TimelineRoute};
 
     use super::*;
 
@@ -550,6 +616,38 @@ mod tests {
 
         assert_eq!(timeline_keys, vec!["timeline-b", "timeline-c"]);
         assert_eq!(page.next_start_after_timeline_key, None);
+    }
+
+    #[test]
+    fn sorted_timeline_key_cache_recovers_after_rwlock_poison() {
+        let store = MemoryMetadataStore::new();
+        let before = metrics::TSO_RECOVERY_EVENTS_TOTAL
+            .with_label_values(&[
+                "metadata",
+                "memory_sorted_timeline_keys_write",
+                "rwlock_poisoned",
+            ])
+            .get();
+
+        let _ = panic::catch_unwind(AssertUnwindSafe(|| {
+            let _guard = store.sorted_timeline_keys.write().unwrap();
+            panic!("poison sorted timeline keys");
+        }));
+
+        store.invalidate_sorted_timeline_keys();
+        let keys = store.sorted_timeline_keys();
+
+        assert!(keys.is_empty());
+        assert!(
+            metrics::TSO_RECOVERY_EVENTS_TOTAL
+                .with_label_values(&[
+                    "metadata",
+                    "memory_sorted_timeline_keys_write",
+                    "rwlock_poisoned"
+                ])
+                .get()
+                > before
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

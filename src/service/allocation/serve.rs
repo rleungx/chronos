@@ -31,6 +31,10 @@ impl TsoService {
         let timeline_ready = Self::timeline_is_ready(cached_state);
 
         if owner_matches && route_matches_request {
+            self.validate_batch_for_route(request.count, &cached_route)?;
+        }
+
+        if owner_matches && route_matches_request {
             let authority_matches = self
                 .cached_timeline_matches_authority(
                     &request.timeline_key,
@@ -115,7 +119,7 @@ impl TsoService {
             request.count,
             timeline_state.last_issued_tso,
             now_ms,
-            self.config.max_future_borrow_ms,
+            self.effective_future_borrow_ms_for_route(&timeline_state.route),
             self.config.max_clock_rewind_ms,
             issued_upper_bound,
         ) {

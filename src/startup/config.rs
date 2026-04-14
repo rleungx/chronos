@@ -236,6 +236,10 @@ fn apply_capacity_env(config: &mut TsoConfig) -> AppResult<()> {
         "CHRONOS_MAX_TIMELINE_RUNTIME_ENTRIES",
         &mut config.max_timeline_runtime_entries,
     )?;
+    apply_parsed_env(
+        "CHRONOS_MAX_CONCURRENT_TIMELINE_LOADS",
+        &mut config.max_concurrent_timeline_loads,
+    )?;
     if let Ok(value) = env::var("CHRONOS_DEFAULT_RESOURCE_TIER") {
         config.default_resource_tier = parse_resource_tier(&value)?;
     }

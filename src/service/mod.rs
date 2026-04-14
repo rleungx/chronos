@@ -10,6 +10,7 @@ mod worker_readiness;
 use std::cmp::max;
 use std::sync::Arc;
 
+use tokio::sync::Semaphore;
 use tokio::time::Instant;
 
 use crate::metadata::{ControlPlaneStore, GeneratorRecord};
@@ -34,6 +35,7 @@ pub struct TsoService {
     pub(super) generator_runtime: GeneratorRuntimeState,
     pub(super) timeline_runtime: TimelineRuntimeState,
     timeline_load_coordinator: TimelineLoadCoordinator,
+    timeline_load_limiter: Arc<Semaphore>,
     generator_lease_coordinator: GeneratorLeaseCoordinator,
     metadata_contention: MetadataContentionCoordinator,
     background: BackgroundCoordinator,

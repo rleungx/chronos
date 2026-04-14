@@ -68,6 +68,11 @@ impl TsoService {
         timeline_key: &str,
     ) -> Result<Option<(TimelineRecord, u64)>, TsoError> {
         let _flight = self.acquire_timeline_load_singleflight(timeline_key).await;
+        let _permit = self
+            .timeline_load_limiter
+            .acquire()
+            .await
+            .map_err(|_| TsoError::Internal("timeline load limiter closed".into()))?;
         self.metadata.load_timeline(timeline_key).await
     }
 }

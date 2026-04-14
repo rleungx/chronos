@@ -15,6 +15,32 @@ use crate::{
 use super::TsoService;
 
 impl TsoService {
+    fn validate_batch_for_route(&self, count: u32, route: &TimelineRoute) -> Result<(), TsoError> {
+        let max = match route.resource_tier {
+            ResourceTier::Shared => self
+                .config
+                .max_batch_per_request
+                .min(crate::SEQUENCE_CAPACITY),
+            ResourceTier::Warm | ResourceTier::Dedicated => self.config.max_batch_per_request,
+        };
+
+        if count > max {
+            return Err(TsoError::BatchTooLarge {
+                requested: count,
+                max,
+            });
+        }
+        Ok(())
+    }
+
+    fn effective_future_borrow_ms_for_route(&self, route: &TimelineRoute) -> u64 {
+        match route.resource_tier {
+            ResourceTier::Shared | ResourceTier::Warm | ResourceTier::Dedicated => {
+                self.config.max_future_borrow_ms
+            }
+        }
+    }
+
     pub async fn ensure_timeline(&self, timeline_key: &str) -> Result<TimelineRoute, TsoError> {
         self.ensure_timeline_with_tier(timeline_key, self.config.default_resource_tier)
             .await
@@ -161,6 +187,7 @@ impl TsoService {
                     owner_worker_endpoint: timeline_record.route.owner_worker_endpoint,
                 });
             }
+            self.validate_batch_for_route(request.count, &timeline_record.route)?;
 
             let (timeline_record, _revision) = match self
                 .activate_local_timeline_record(&request.timeline_key, timeline_record, revision)
@@ -262,8 +289,8 @@ mod tests {
         MemoryMetadataStore, RouteUpdateSource, TimelineAuthority, TimelineBatchOp, TimelineRecord,
     };
     use crate::{
-        AllocateTimestampsRequest, Clock, ManualClock, TimelineLifecycleState, TsoConfig, TsoError,
-        TsoSecurityMode, TsoService,
+        AllocateTimestampsRequest, Clock, ManualClock, ResourceTier, TimelineLifecycleState,
+        TsoConfig, TsoError, TsoSecurityMode, TsoService,
     };
 
     #[derive(Clone)]
@@ -649,6 +676,12 @@ mod tests {
         }
     }
 
+    fn with_worker(mut config: TsoConfig, worker_id: &str) -> TsoConfig {
+        config.worker_id = worker_id.to_owned();
+        config.advertise_endpoint = format!("{worker_id}:50051");
+        required_test_config(config)
+    }
+
     #[tokio::test]
     async fn allocation_recovering_local_timeline_activates_and_upserts_cache() {
         let clock = Arc::new(ManualClock::new(22_000));
@@ -773,6 +806,88 @@ mod tests {
 
         assert_eq!(first.await.unwrap().unwrap(), route);
         assert_eq!(second.await.unwrap().unwrap(), route);
+        assert_eq!(metadata.max_parallel_loads(), 1);
+    }
+
+    #[tokio::test]
+    async fn distinct_cold_cache_timeline_loads_respect_global_load_limit() {
+        let clock = Arc::new(ManualClock::new(22_600));
+        let inner = Arc::new(MemoryMetadataStore::new());
+        let route_a = crate::TimelineRoute {
+            timeline_key: "allocation.timeline-load.limit.a".into(),
+            generator_id: 7,
+            owner_worker_endpoint: "127.0.0.1:59999".into(),
+            epoch: 1,
+            route_version: 1,
+            resource_tier: crate::ResourceTier::Shared,
+        };
+        let route_b = crate::TimelineRoute {
+            timeline_key: "allocation.timeline-load.limit.b".into(),
+            generator_id: 8,
+            owner_worker_endpoint: "127.0.0.1:59999".into(),
+            epoch: 1,
+            route_version: 1,
+            resource_tier: crate::ResourceTier::Shared,
+        };
+        for route in [&route_a, &route_b] {
+            inner
+                .create_timeline(
+                    &route.timeline_key,
+                    &TimelineRecord {
+                        route: route.clone(),
+                        state: TimelineLifecycleState::Active,
+                        recovery_floor_tso: None,
+                        issued_upper_bound: None,
+                        last_graceful_issued: None,
+                        lease_expire_at_ms: None,
+                        updated_at_ms: clock.now_ms(),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        let (load_started_tx, load_started_rx) = oneshot::channel();
+        let (release_load_tx, release_load_rx) = oneshot::channel();
+        let metadata = Arc::new(BlockingTimelineLoadStore::new(
+            inner,
+            load_started_tx,
+            release_load_rx,
+        ));
+        let service = TsoService::new(
+            required_test_config(TsoConfig {
+                max_concurrent_timeline_loads: 1,
+                ..TsoConfig::default()
+            }),
+            clock,
+            metadata.clone(),
+        )
+        .unwrap();
+
+        metadata.arm_blocking_load();
+
+        let first_service = service.clone();
+        let first_key = route_a.timeline_key.clone();
+        let first = tokio::spawn(async move { first_service.ensure_timeline(&first_key).await });
+
+        load_started_rx
+            .await
+            .expect("the first cold-cache load should enter metadata");
+        assert_eq!(metadata.active_loads(), 1);
+
+        let second_service = service.clone();
+        let second_key = route_b.timeline_key.clone();
+        let second = tokio::spawn(async move { second_service.ensure_timeline(&second_key).await });
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert_eq!(metadata.active_loads(), 1);
+        assert_eq!(metadata.max_parallel_loads(), 1);
+        assert!(!second.is_finished());
+
+        release_load_tx.send(()).unwrap();
+
+        assert_eq!(first.await.unwrap().unwrap(), route_a);
+        assert_eq!(second.await.unwrap().unwrap(), route_b);
         assert_eq!(metadata.max_parallel_loads(), 1);
     }
 
@@ -1206,6 +1321,85 @@ mod tests {
             .expect_err("allocation should still fail immediately on large clock rewind");
 
         assert_eq!(error, TsoError::ClockBackwards { delta_ms: 25 });
+    }
+
+    #[tokio::test]
+    async fn shared_tier_rejects_batches_above_single_ms_capacity() {
+        let service = TsoService::new(
+            with_worker(
+                TsoConfig {
+                    max_batch_per_request: crate::SEQUENCE_CAPACITY + 32,
+                    ..TsoConfig::default()
+                },
+                "worker-a",
+            ),
+            Arc::new(ManualClock::new(50_000)),
+            Arc::new(MemoryMetadataStore::new()),
+        )
+        .unwrap();
+
+        let route = service
+            .ensure_timeline("shared.noisy-neighbor")
+            .await
+            .unwrap();
+        assert_eq!(route.resource_tier, ResourceTier::Shared);
+
+        let error = service
+            .allocate_timestamps(AllocateTimestampsRequest {
+                timeline_key: route.timeline_key.clone(),
+                count: crate::SEQUENCE_CAPACITY + 1,
+                expected_epoch: route.epoch,
+                expected_route_version: route.route_version,
+                client_request_id: "shared-batch-cap".into(),
+            })
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            TsoError::BatchTooLarge {
+                requested: crate::SEQUENCE_CAPACITY + 1,
+                max: crate::SEQUENCE_CAPACITY,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn dedicated_tier_keeps_global_batch_limit() {
+        let global_limit = crate::SEQUENCE_CAPACITY + 32;
+        let service = TsoService::new(
+            with_worker(
+                TsoConfig {
+                    default_resource_tier: ResourceTier::Dedicated,
+                    max_batch_per_request: global_limit,
+                    max_future_borrow_ms: 2_000,
+                    ..TsoConfig::default()
+                },
+                "worker-a",
+            ),
+            Arc::new(ManualClock::new(51_000)),
+            Arc::new(MemoryMetadataStore::new()),
+        )
+        .unwrap();
+
+        let route = service
+            .ensure_timeline("dedicated.batch-limit")
+            .await
+            .unwrap();
+        assert_eq!(route.resource_tier, ResourceTier::Dedicated);
+
+        let response = service
+            .allocate_timestamps(AllocateTimestampsRequest {
+                timeline_key: route.timeline_key.clone(),
+                count: global_limit,
+                expected_epoch: route.epoch,
+                expected_route_version: route.route_version,
+                client_request_id: "dedicated-global-cap".into(),
+            })
+            .await
+            .unwrap();
+
+        assert!(!response.ranges.is_empty());
     }
 
     #[tokio::test]
