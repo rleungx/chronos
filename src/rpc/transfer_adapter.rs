@@ -3,7 +3,7 @@ use tonic::Status;
 use crate::proto::v1::{
     TimelineState as ProtoTimelineState, TransferTimelineRequest, TransferTimelineResponse,
 };
-use crate::{TimelineLifecycleState, TimelineRoute, TransferReason, TsoControlPlane};
+use crate::{TimelineLifecycleState, TimelineRoute, TransferReason, TsoControlPlane, TsoError};
 
 use super::translation;
 
@@ -11,11 +11,12 @@ pub(super) async fn transfer_timeline_response(
     control_plane: &TsoControlPlane,
     request: TransferTimelineRequest,
 ) -> Result<TransferTimelineResponse, Status> {
-    let request = normalize_transfer_request(control_plane.advertise_endpoint(), request);
+    let request = normalize_transfer_request(control_plane.advertise_endpoint(), request)
+        .map_err(translation::map_tso_error)?;
     let (route, old_generator_id, state) = control_plane
         .transfer_timeline_for_rpc(
             &request.timeline_key,
-            request.target_owner,
+            request.target_owner_endpoint,
             request.target_generator_id,
             request.reason,
         )
@@ -32,7 +33,7 @@ pub(super) async fn transfer_timeline_response(
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct NormalizedTransferTimelineRequest {
     timeline_key: String,
-    target_owner: String,
+    target_owner_endpoint: String,
     target_generator_id: Option<u32>,
     reason: TransferReason,
 }
@@ -40,25 +41,41 @@ struct NormalizedTransferTimelineRequest {
 fn normalize_transfer_request(
     advertise_endpoint: &str,
     request: TransferTimelineRequest,
-) -> NormalizedTransferTimelineRequest {
-    NormalizedTransferTimelineRequest {
+) -> Result<NormalizedTransferTimelineRequest, TsoError> {
+    Ok(NormalizedTransferTimelineRequest {
         timeline_key: request.timeline_key,
-        target_owner: resolve_target_owner(advertise_endpoint, request.target_worker_id),
+        target_owner_endpoint: resolve_target_owner_endpoint(
+            advertise_endpoint,
+            request.target_worker_id,
+        )?,
         target_generator_id: request.target_generator_id,
-        reason: parse_transfer_reason(request.reason),
+        reason: parse_transfer_reason(request.reason)?,
+    })
+}
+
+fn resolve_target_owner_endpoint(
+    advertise_endpoint: &str,
+    target_worker_id: Option<String>,
+) -> Result<String, TsoError> {
+    match target_worker_id {
+        Some(target_worker_id) => {
+            let target_owner_endpoint = target_worker_id.trim();
+            if target_owner_endpoint.is_empty() {
+                return Err(TsoError::InvalidTargetOwnerEndpoint);
+            }
+            Ok(target_owner_endpoint.to_owned())
+        }
+        None => Ok(advertise_endpoint.to_string()),
     }
 }
 
-fn resolve_target_owner(advertise_endpoint: &str, target_worker_id: Option<String>) -> String {
-    target_worker_id.unwrap_or_else(|| advertise_endpoint.to_string())
-}
-
-fn parse_transfer_reason(reason: i32) -> TransferReason {
+fn parse_transfer_reason(reason: i32) -> Result<TransferReason, TsoError> {
     match reason {
-        1 => TransferReason::Rebalance,
-        2 => TransferReason::Hotspot,
-        3 => TransferReason::Failover,
-        _ => TransferReason::Manual,
+        1 => Ok(TransferReason::Rebalance),
+        2 => Ok(TransferReason::Hotspot),
+        3 => Ok(TransferReason::Failover),
+        4 => Ok(TransferReason::Manual),
+        _ => Err(TsoError::InvalidTransferReason { value: reason }),
     }
 }
 
@@ -100,14 +117,47 @@ mod tests {
                 timeline_key: "timeline-a".into(),
                 target_generator_id: Some(7),
                 target_worker_id: None,
-                reason: 0,
+                reason: 4,
             },
-        );
+        )
+        .unwrap();
 
         assert_eq!(normalized.timeline_key, "timeline-a");
-        assert_eq!(normalized.target_owner, "worker-a:50051");
+        assert_eq!(normalized.target_owner_endpoint, "worker-a:50051");
         assert_eq!(normalized.target_generator_id, Some(7));
         assert_eq!(normalized.reason, TransferReason::Manual);
+    }
+
+    #[test]
+    fn normalize_transfer_request_rejects_blank_target_owner_endpoint() {
+        let error = normalize_transfer_request(
+            "worker-a:50051",
+            TransferTimelineRequest {
+                timeline_key: "timeline-a".into(),
+                target_generator_id: Some(7),
+                target_worker_id: Some("   ".into()),
+                reason: 4,
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, TsoError::InvalidTargetOwnerEndpoint));
+    }
+
+    #[test]
+    fn normalize_transfer_request_rejects_invalid_transfer_reason() {
+        let error = normalize_transfer_request(
+            "worker-a:50051",
+            TransferTimelineRequest {
+                timeline_key: "timeline-a".into(),
+                target_generator_id: Some(7),
+                target_worker_id: None,
+                reason: 0,
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, TsoError::InvalidTransferReason { value: 0 }));
     }
 
     #[test]

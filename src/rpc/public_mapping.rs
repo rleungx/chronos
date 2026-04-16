@@ -59,6 +59,9 @@ pub(super) fn map_tso_error(err: TsoError) -> Status {
         TsoError::FailoverRequiresExpiredLease { .. } => {
             status_with_error_detail(Code::FailedPrecondition, err)
         }
+        TsoError::FailoverLeaseExpiryUnknown { .. } => {
+            status_with_error_detail(Code::FailedPrecondition, err)
+        }
         TsoError::FailoverMissingRecoveryFloor { .. } => {
             status_with_error_detail(Code::FailedPrecondition, err)
         }
@@ -72,13 +75,23 @@ pub(super) fn map_tso_error(err: TsoError) -> Status {
             status_with_error_detail(Code::FailedPrecondition, err)
         }
         TsoError::ClockBackwards { .. } => status_with_error_detail(Code::Internal, err),
-        TsoError::BatchTooLarge { .. } | TsoError::InvalidCount => {
+        TsoError::BatchTooLarge { .. }
+        | TsoError::InvalidCount
+        | TsoError::InvalidResourceTier { .. }
+        | TsoError::InvalidTargetOwnerEndpoint
+        | TsoError::InvalidTransferReason { .. } => {
             status_with_error_detail(Code::InvalidArgument, err)
         }
         TsoError::TargetGeneratorIdRequired { .. } => {
             status_with_error_detail(Code::InvalidArgument, err)
         }
         TsoError::SharedGeneratorJumpAheadTooLarge { .. } => {
+            status_with_error_detail(Code::FailedPrecondition, err)
+        }
+        TsoError::UnsafeRemoteTransferTarget { .. } => {
+            status_with_error_detail(Code::FailedPrecondition, err)
+        }
+        TsoError::RecoveryCatchupBudgetExceeded { .. } => {
             status_with_error_detail(Code::FailedPrecondition, err)
         }
         TsoError::FutureBorrowExceeded { .. } => {
@@ -92,6 +105,7 @@ pub(super) fn map_tso_error(err: TsoError) -> Status {
         TsoError::TsoOverflow => status_with_error_detail(Code::OutOfRange, err),
         TsoError::MetadataAlreadyExists => status_with_error_detail(Code::AlreadyExists, err),
         TsoError::CasFailed => status_with_error_detail(Code::Aborted, err),
+        TsoError::ServiceShuttingDown => status_with_error_detail(Code::Unavailable, err),
         TsoError::RequestCancelled => status_with_error_detail(Code::DeadlineExceeded, err),
         TsoError::InstanceIdentityInUse { .. } => {
             status_with_error_detail(Code::AlreadyExists, err)
@@ -113,8 +127,12 @@ fn error_detail_code(err: &TsoError) -> ErrorCode {
         | TsoError::GeneratorNotOwnedByThisWorker { .. } => ErrorCode::NotTimelineOwner,
         TsoError::BatchTooLarge { .. }
         | TsoError::InvalidCount
+        | TsoError::InvalidResourceTier { .. }
+        | TsoError::InvalidTargetOwnerEndpoint
+        | TsoError::InvalidTransferReason { .. }
         | TsoError::TargetGeneratorIdRequired { .. }
         | TsoError::SharedGeneratorJumpAheadTooLarge { .. }
+        | TsoError::RecoveryCatchupBudgetExceeded { .. }
         | TsoError::GeneratorOwnershipMisconfigured { .. }
         | TsoError::GeneratorIdOutOfRange { .. }
         | TsoError::TsoOverflow => ErrorCode::InvalidArgument,
@@ -122,11 +140,14 @@ fn error_detail_code(err: &TsoError) -> ErrorCode {
         | TsoError::IssuedUpperBoundExceeded { .. }
         | TsoError::GeneratorPoolExhausted => ErrorCode::RateLimited,
         TsoError::FailoverRequiresExpiredLease { .. }
+        | TsoError::FailoverLeaseExpiryUnknown { .. }
         | TsoError::CasFailed
+        | TsoError::UnsafeRemoteTransferTarget { .. }
         | TsoError::InstanceIdentityInUse { .. }
         | TsoError::FailoverMissingRecoveryFloor { .. }
         | TsoError::TimelineIngressSaturated { .. }
         | TsoError::TimelineRuntimeCacheSaturated { .. }
+        | TsoError::ServiceShuttingDown
         | TsoError::RequestCancelled => ErrorCode::TemporarilyUnavailable,
         TsoError::TimelineNotReady { state, .. } => {
             timeline_not_ready_public_mapping(*state).detail_code
@@ -335,6 +356,20 @@ mod tests {
                 TsoError::RequestCancelled,
                 Code::DeadlineExceeded,
                 ErrorCode::TemporarilyUnavailable,
+            ),
+            (
+                TsoError::ServiceShuttingDown,
+                Code::Unavailable,
+                ErrorCode::TemporarilyUnavailable,
+            ),
+            (
+                TsoError::RecoveryCatchupBudgetExceeded {
+                    generator_id: 7,
+                    required_jump_ms: 99,
+                    budget_ms: 50,
+                },
+                Code::FailedPrecondition,
+                ErrorCode::InvalidArgument,
             ),
             (
                 TsoError::InstanceIdentityInUse {
