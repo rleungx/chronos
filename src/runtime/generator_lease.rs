@@ -242,6 +242,10 @@ impl GeneratorRuntimeState {
         self.leases.remove(&generator_id);
     }
 
+    pub(crate) fn clear_leases(&self) {
+        self.leases.clear();
+    }
+
     pub(crate) fn claimed_generator_for_timeline(&self, timeline_key: &str) -> Option<u32> {
         self.dedicated_claims
             .iter()
@@ -274,6 +278,10 @@ impl GeneratorRuntimeState {
                 self.dedicated_claims.remove(&generator_id);
             }
         }
+    }
+
+    pub(crate) fn clear_dedicated_claims(&self) {
+        self.dedicated_claims.clear();
     }
 }
 

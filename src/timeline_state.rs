@@ -10,6 +10,7 @@ pub(crate) fn build_timeline_state(
         route: timeline_record.route.clone(),
         state: timeline_record.state,
         last_issued_tso: recovered_last_issued_tso,
+        recovery_floor_tso: recovered_last_issued_tso,
         last_graceful_issued: timeline_record.last_graceful_issued,
         revision,
     }

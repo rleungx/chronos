@@ -11,6 +11,7 @@ pub(crate) struct TimelineState {
     pub(crate) route: TimelineRoute,
     pub(crate) state: TimelineLifecycleState,
     pub(crate) last_issued_tso: Option<u64>,
+    pub(crate) recovery_floor_tso: Option<u64>,
     pub(crate) last_graceful_issued: Option<u64>,
     pub(crate) revision: u64,
 }
@@ -102,6 +103,7 @@ mod tests {
             route: sample_route(timeline_key, route_version),
             state: TimelineLifecycleState::Active,
             last_issued_tso: Some(41),
+            recovery_floor_tso: Some(41),
             last_graceful_issued: Some(40),
             revision: 9,
         }))

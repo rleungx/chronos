@@ -389,6 +389,7 @@ mod tests {
             },
             state: TimelineLifecycleState::Active,
             last_issued_tso: None,
+            recovery_floor_tso: None,
             last_graceful_issued: None,
             revision: 1,
         }))
