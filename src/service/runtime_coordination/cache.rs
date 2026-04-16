@@ -8,6 +8,7 @@ use tracing::{debug, warn};
 use crate::metadata::{RouteUpdateSignal, TimelineRecord};
 use crate::metrics;
 use crate::planning::recovered_timeline_floor_tso;
+use crate::service::endpoints_match;
 use crate::timeline_state::build_timeline_state;
 use crate::{ResourceTier, TimelineRoute, TsoError};
 
@@ -23,7 +24,10 @@ fn should_clear_timeline_cache_for_route_update(
         && cached_route.generator_id == updated_route.generator_id
         && cached_route.epoch == updated_route.epoch
         && cached_route.resource_tier == updated_route.resource_tier
-        && cached_route.owner_worker_endpoint == updated_route.owner_worker_endpoint;
+        && endpoints_match(
+            &cached_route.owner_worker_endpoint,
+            &updated_route.owner_worker_endpoint,
+        );
 
     !same_route_target && updated_route.route_version >= cached_route.route_version
 }
@@ -87,6 +91,9 @@ impl TsoService {
         cached_timeline_state.last_issued_tso = cached_timeline_state
             .last_issued_tso
             .max(recovered_timeline_floor_tso(timeline_record));
+        cached_timeline_state.recovery_floor_tso = cached_timeline_state
+            .recovery_floor_tso
+            .max(recovered_timeline_floor_tso(timeline_record));
         cached_timeline_state.last_graceful_issued = timeline_record.last_graceful_issued;
         cached_timeline_state.revision = revision;
         drop(cached_timeline_state);
@@ -114,6 +121,13 @@ impl TsoService {
         };
 
         if should_clear {
+            let cached_route = {
+                let cached_timeline_state = cached_timeline_state_handle.lock().await;
+                cached_timeline_state.route.clone()
+            };
+            if cached_route.resource_tier == ResourceTier::Dedicated {
+                self.release_dedicated(cached_route.generator_id, &cached_route.timeline_key);
+            }
             self.clear_timeline_cache(&updated_route.timeline_key);
         }
     }
@@ -186,6 +200,7 @@ impl TsoService {
                         reason = "broadcast_lagged"
                     );
                     service.timeline_runtime.clear();
+                    service.clear_dedicated_claims();
                     let _ = route_reset_notifier.send(());
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
@@ -406,6 +421,18 @@ mod tests {
         assert!(should_clear_timeline_cache_for_route_update(
             &cached,
             &route(8, 4)
+        ));
+    }
+
+    #[test]
+    fn cache_update_treats_equivalent_owner_endpoint_forms_as_same_route() {
+        let cached = route(7, 3);
+        let mut updated = cached.clone();
+        updated.route_version = 4;
+        updated.owner_worker_endpoint = " WORKER-A:50051 ".into();
+
+        assert!(!should_clear_timeline_cache_for_route_update(
+            &cached, &updated
         ));
     }
 

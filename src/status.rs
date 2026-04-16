@@ -1,4 +1,5 @@
 use crate::metadata::{GeneratorRecord, TimelineRecord};
+use crate::service::endpoints_match;
 use crate::{HealthInfo, TimelineLifecycleState, TimelineRoute, TsoConfig};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,7 +116,10 @@ pub(crate) fn matched_generator_record<'a>(
 ) -> Option<&'a GeneratorRecord> {
     generator.filter(|generator| {
         generator.generator_id == timeline.route.generator_id
-            && generator.owner_worker_endpoint == timeline.route.owner_worker_endpoint
+            && endpoints_match(
+                &generator.owner_worker_endpoint,
+                &timeline.route.owner_worker_endpoint,
+            )
     })
 }
 
@@ -192,6 +196,7 @@ mod tests {
 
     fn sample_timeline_record() -> TimelineRecord {
         TimelineRecord {
+            schema_version: 1,
             route: sample_route(),
             state: TimelineLifecycleState::Active,
             recovery_floor_tso: None,
@@ -204,6 +209,7 @@ mod tests {
 
     fn sample_generator_record() -> GeneratorRecord {
         GeneratorRecord {
+            schema_version: 1,
             generator_id: 7,
             owner_worker_endpoint: "worker-a:50051".into(),
             owner_instance_id: "instance-a".into(),
@@ -373,6 +379,15 @@ mod tests {
 
         assert!(matched_generator_record(&timeline, Some(&mismatched_generator)).is_none());
         assert!(matched_generator_record(&timeline, Some(&sample_generator_record())).is_some());
+    }
+
+    #[test]
+    fn matched_generator_accepts_equivalent_owner_endpoint_forms() {
+        let timeline = sample_timeline_record();
+        let mut generator = sample_generator_record();
+        generator.owner_worker_endpoint = " WORKER-A:50051 ".into();
+
+        assert!(matched_generator_record(&timeline, Some(&generator)).is_some());
     }
 
     #[test]

@@ -8,6 +8,7 @@ use std::collections::HashMap;
 
 use crate::lifecycle::{TimelineLifecycleContract, TimelineServingReadiness};
 use crate::metadata::{GeneratorRecord, TimelineRecord};
+use crate::service::endpoints_match;
 use crate::status::{
     build_timeline_status_snapshot, TimelineStatusListPage, TimelineStatusSnapshot,
 };
@@ -23,7 +24,7 @@ impl TsoService {
     ) -> bool {
         (states.is_empty() || states.contains(&timeline.state))
             && owner_worker_endpoint
-                .map(|endpoint| timeline.route.owner_worker_endpoint == endpoint)
+                .map(|endpoint| endpoints_match(&timeline.route.owner_worker_endpoint, endpoint))
                 .unwrap_or(true)
     }
 

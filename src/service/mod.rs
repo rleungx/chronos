@@ -8,9 +8,11 @@ mod transfer;
 mod worker_readiness;
 
 use std::cmp::max;
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
 
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
 
 use crate::metadata::{ControlPlaneStore, GeneratorRecord};
@@ -40,6 +42,7 @@ pub struct TsoService {
     metadata_contention: MetadataContentionCoordinator,
     background: BackgroundCoordinator,
     ownership_drift: OwnershipDriftTracker,
+    shutdown_gate: AtomicBool,
 }
 
 impl TsoService {
@@ -59,7 +62,7 @@ impl TsoService {
     }
 
     pub(super) fn is_local_endpoint(&self, owner_endpoint: &str) -> bool {
-        owner_endpoint == self.config.advertise_endpoint
+        endpoints_match(owner_endpoint, &self.config.advertise_endpoint)
     }
 
     pub(super) fn local_instance_id(&self) -> &str {
@@ -82,6 +85,40 @@ impl TsoService {
             Err(TsoError::RequestCancelled)
         } else {
             Ok(())
+        }
+    }
+
+    pub(super) fn reject_new_work_if_shutting_down(&self) -> Result<(), TsoError> {
+        if self.shutdown_gate.load(AtomicOrdering::Acquire) {
+            Err(TsoError::ServiceShuttingDown)
+        } else {
+            Ok(())
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn request_local_shutdown_gate(&self) {
+        self.shutdown_gate.store(true, AtomicOrdering::Release);
+    }
+
+    pub(super) async fn acquire_timeline_load_permit(
+        &self,
+        cancellation: Option<RequestCancellation>,
+    ) -> Result<OwnedSemaphorePermit, TsoError> {
+        let limiter = self.timeline_load_limiter.clone();
+        let deadline = tokio::time::Instant::now() + self.metadata_contention_retry_budget();
+        if let Some(cancellation) = cancellation {
+            tokio::select! {
+                permit = limiter.acquire_owned() => permit
+                    .map_err(|_| TsoError::Internal("timeline load limiter closed".into())),
+                _ = cancellation.cancelled() => Err(TsoError::RequestCancelled),
+                _ = tokio::time::sleep_until(deadline) => Err(TsoError::RequestCancelled),
+            }
+        } else {
+            tokio::time::timeout_at(deadline, limiter.acquire_owned())
+                .await
+                .map_err(|_| TsoError::RequestCancelled)?
+                .map_err(|_| TsoError::Internal("timeline load limiter closed".into()))
         }
     }
 
@@ -216,5 +253,42 @@ impl TsoService {
     pub(super) fn release_dedicated(&self, generator_id: u32, timeline_key: &str) {
         self.generator_runtime
             .release_dedicated(generator_id, timeline_key);
+    }
+
+    pub(super) fn clear_dedicated_claims(&self) {
+        self.generator_runtime.clear_dedicated_claims();
+    }
+}
+
+pub(crate) fn endpoints_match(left: &str, right: &str) -> bool {
+    let left = left.trim();
+    let right = right.trim();
+    if left == right || left.eq_ignore_ascii_case(right) {
+        return true;
+    }
+
+    match (left.parse::<SocketAddr>(), right.parse::<SocketAddr>()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::endpoints_match;
+
+    #[test]
+    fn endpoints_match_accepts_trimmed_and_case_insensitive_host_forms() {
+        assert!(endpoints_match(" worker-a:50051 ", "WORKER-A:50051"));
+    }
+
+    #[test]
+    fn endpoints_match_accepts_equivalent_socket_addrs() {
+        assert!(endpoints_match("127.0.0.1:50051", "127.0.0.1:50051"));
+    }
+
+    #[test]
+    fn endpoints_match_rejects_different_endpoints() {
+        assert!(!endpoints_match("worker-a:50051", "worker-b:50051"));
     }
 }
