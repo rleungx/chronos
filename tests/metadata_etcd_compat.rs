@@ -21,6 +21,7 @@ fn timeline_record(
     lease_expire_at_ms: u64,
 ) -> TimelineRecord {
     TimelineRecord {
+        schema_version: 1,
         route: TimelineRoute {
             timeline_key: timeline_key.to_string(),
             generator_id,
@@ -47,6 +48,7 @@ fn generator_record(
     generator_lease_token: u64,
 ) -> GeneratorRecord {
     GeneratorRecord {
+        schema_version: 1,
         generator_id,
         owner_worker_endpoint: "worker-1".to_string(),
         owner_instance_id: owner_instance_id.to_string(),

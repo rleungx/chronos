@@ -240,21 +240,28 @@ impl TimelineAuthority for MemoryMetadataStore {
         let _timer = metrics::TSO_METADATA_LATENCY
             .with_label_values(&["get"])
             .start_timer();
-        Ok(self
-            .records
+        self.records
             .get(timeline_key)
-            .map(|entry| entry.value().clone()))
+            .map(|entry| {
+                let (record, revision) = entry.value().clone();
+                record.validate_schema_version()?;
+                Ok((record, revision))
+            })
+            .transpose()
     }
 
     async fn list_timelines(&self) -> Result<Vec<TimelineRecord>, TsoError> {
         let _timer = metrics::TSO_METADATA_LATENCY
             .with_label_values(&["list"])
             .start_timer();
-        Ok(self
-            .records
+        self.records
             .iter()
-            .map(|entry| entry.value().0.clone())
-            .collect())
+            .map(|entry| {
+                let record = entry.value().0.clone();
+                record.validate_schema_version()?;
+                Ok(record)
+            })
+            .collect()
     }
 
     async fn list_timelines_page(
@@ -281,7 +288,9 @@ impl TimelineAuthority for MemoryMetadataStore {
         let mut page_records = Vec::with_capacity(limit + 1);
         for timeline_key in timeline_keys.iter().skip(start_index).take(limit + 1) {
             if let Some(record) = self.records.get(timeline_key.as_str()) {
-                page_records.push(record.value().0.clone());
+                let record = record.value().0.clone();
+                record.validate_schema_version()?;
+                page_records.push(record);
             }
         }
         let next_start_after_timeline_key = (page_records.len() > limit)
@@ -302,11 +311,13 @@ impl TimelineAuthority for MemoryMetadataStore {
         let _timer = metrics::TSO_METADATA_LATENCY
             .with_label_values(&["create"])
             .start_timer();
+        record.validate_schema_version()?;
+        let stamped = record.stamped_for_persistence();
         let revision =
-            Self::create_entry(&self.records, timeline_key.to_string(), record, "create")?;
+            Self::create_entry(&self.records, timeline_key.to_string(), &stamped, "create")?;
         self.invalidate_sorted_timeline_keys();
         let mut route_updates = Vec::with_capacity(1);
-        collect_timeline_route_update(None, record, &mut route_updates);
+        collect_timeline_route_update(None, &stamped, &mut route_updates);
         for route_update in route_updates {
             self.publish_route_update(&route_update);
         }
@@ -322,6 +333,8 @@ impl TimelineAuthority for MemoryMetadataStore {
         let _timer = metrics::TSO_METADATA_LATENCY
             .with_label_values(&["cas"])
             .start_timer();
+        record.validate_schema_version()?;
+        let stamped = record.stamped_for_persistence();
         let _cas_guard = self.timeline_cas_lock.lock().await;
         let revision = if let Some(mut entry) = self.records.get_mut(timeline_key) {
             let (current_record, current_revision) = entry.value();
@@ -333,10 +346,10 @@ impl TimelineAuthority for MemoryMetadataStore {
             }
 
             let mut route_updates = Vec::with_capacity(1);
-            collect_timeline_route_update(Some(current_record), record, &mut route_updates);
-            let timeline_key_changed = record.route.timeline_key != timeline_key;
+            collect_timeline_route_update(Some(current_record), &stamped, &mut route_updates);
+            let timeline_key_changed = stamped.route.timeline_key != timeline_key;
             let new_revision = *current_revision + 1;
-            *entry.value_mut() = (record.clone(), new_revision);
+            *entry.value_mut() = (stamped.clone(), new_revision);
             drop(entry);
 
             if timeline_key_changed {
@@ -371,6 +384,7 @@ impl TimelineAuthority for MemoryMetadataStore {
         self.notify_timeline_batch_cas_acquired();
         let mut seen_timeline_keys = HashSet::with_capacity(operations.len());
         for operation in operations {
+            operation.record.validate_schema_version()?;
             if !seen_timeline_keys.insert(operation.timeline_key.as_str()) {
                 metrics::TSO_METADATA_ERRORS_TOTAL
                     .with_label_values(&["cas_batch"])
@@ -435,10 +449,14 @@ impl GeneratorLeaseAuthority for MemoryMetadataStore {
         let _timer = metrics::TSO_METADATA_LATENCY
             .with_label_values(&["get_generator"])
             .start_timer();
-        Ok(self
-            .generators
+        self.generators
             .get(&generator_id)
-            .map(|entry| entry.value().clone()))
+            .map(|entry| {
+                let (record, revision) = entry.value().clone();
+                record.validate_schema_version()?;
+                Ok((record, revision))
+            })
+            .transpose()
     }
 
     async fn create_generator(
@@ -449,7 +467,9 @@ impl GeneratorLeaseAuthority for MemoryMetadataStore {
         let _timer = metrics::TSO_METADATA_LATENCY
             .with_label_values(&["create_generator"])
             .start_timer();
-        Self::create_entry(&self.generators, generator_id, record, "create_generator")
+        record.validate_schema_version()?;
+        let stamped = record.stamped_for_persistence();
+        Self::create_entry(&self.generators, generator_id, &stamped, "create_generator")
     }
 
     async fn compare_exchange_generator(
@@ -461,12 +481,14 @@ impl GeneratorLeaseAuthority for MemoryMetadataStore {
         let _timer = metrics::TSO_METADATA_LATENCY
             .with_label_values(&["cas_generator"])
             .start_timer();
+        record.validate_schema_version()?;
+        let stamped = record.stamped_for_persistence();
         let _cas_guard = self.generator_cas_lock.lock().await;
         Self::cas_entry(
             &self.generators,
             &generator_id,
             expected_revision,
-            record,
+            &stamped,
             "cas_generator",
             TsoError::TimelineNotFound {
                 timeline_key: format!("generator:{}", generator_id),
@@ -549,6 +571,7 @@ mod tests {
 
     fn sample_record(timeline_key: &str, generator_id: u32) -> TimelineRecord {
         TimelineRecord {
+            schema_version: 1,
             route: TimelineRoute {
                 timeline_key: timeline_key.to_string(),
                 generator_id,
@@ -733,6 +756,7 @@ mod tests {
             .create_generator(
                 1,
                 &GeneratorRecord {
+                    schema_version: 1,
                     generator_id: 1,
                     owner_worker_endpoint: "worker-a:50051".into(),
                     owner_instance_id: "worker-a#1".into(),
@@ -749,6 +773,7 @@ mod tests {
             .create_generator(
                 2,
                 &GeneratorRecord {
+                    schema_version: 1,
                     generator_id: 2,
                     owner_worker_endpoint: "worker-b:50051".into(),
                     owner_instance_id: "worker-b#1".into(),
@@ -763,6 +788,7 @@ mod tests {
             .unwrap();
 
         let next_a = GeneratorRecord {
+            schema_version: 1,
             generator_id: 1,
             owner_worker_endpoint: "worker-a:50051".into(),
             owner_instance_id: "worker-a#2".into(),
@@ -773,6 +799,7 @@ mod tests {
             updated_at_ms: 2,
         };
         let next_b = GeneratorRecord {
+            schema_version: 1,
             generator_id: 2,
             owner_worker_endpoint: "worker-b:50051".into(),
             owner_instance_id: "worker-b#2".into(),
@@ -783,6 +810,7 @@ mod tests {
             updated_at_ms: 2,
         };
         let conflicting_b = GeneratorRecord {
+            schema_version: 1,
             generator_id: 2,
             owner_worker_endpoint: "worker-b:50051".into(),
             owner_instance_id: "worker-b#3".into(),

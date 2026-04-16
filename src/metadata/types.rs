@@ -4,6 +4,12 @@ use tokio::sync::broadcast;
 
 use crate::{TimelineLifecycleState, TimelineRoute, TsoError};
 
+pub const CURRENT_METADATA_SCHEMA_VERSION: u32 = 1;
+
+fn default_metadata_schema_version() -> u32 {
+    CURRENT_METADATA_SCHEMA_VERSION
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RouteUpdateSignal {
     Route(TimelineRoute),
@@ -12,6 +18,8 @@ pub enum RouteUpdateSignal {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TimelineRecord {
+    #[serde(default = "default_metadata_schema_version")]
+    pub schema_version: u32,
     pub route: TimelineRoute,
     #[serde(default = "default_timeline_state")]
     pub state: TimelineLifecycleState,
@@ -26,6 +34,8 @@ pub struct TimelineRecord {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GeneratorRecord {
+    #[serde(default = "default_metadata_schema_version")]
+    pub schema_version: u32,
     pub generator_id: u32,
     pub owner_worker_endpoint: String,
     #[serde(default)]
@@ -41,6 +51,44 @@ pub struct GeneratorRecord {
 
 fn default_timeline_state() -> TimelineLifecycleState {
     TimelineLifecycleState::Active
+}
+
+impl TimelineRecord {
+    pub fn validate_schema_version(&self) -> Result<(), TsoError> {
+        if self.schema_version == CURRENT_METADATA_SCHEMA_VERSION {
+            Ok(())
+        } else {
+            Err(TsoError::Internal(format!(
+                "unsupported timeline metadata schema_version {}",
+                self.schema_version
+            )))
+        }
+    }
+
+    pub fn stamped_for_persistence(&self) -> Self {
+        let mut record = self.clone();
+        record.schema_version = CURRENT_METADATA_SCHEMA_VERSION;
+        record
+    }
+}
+
+impl GeneratorRecord {
+    pub fn validate_schema_version(&self) -> Result<(), TsoError> {
+        if self.schema_version == CURRENT_METADATA_SCHEMA_VERSION {
+            Ok(())
+        } else {
+            Err(TsoError::Internal(format!(
+                "unsupported generator metadata schema_version {}",
+                self.schema_version
+            )))
+        }
+    }
+
+    pub fn stamped_for_persistence(&self) -> Self {
+        let mut record = self.clone();
+        record.schema_version = CURRENT_METADATA_SCHEMA_VERSION;
+        record
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -249,6 +297,7 @@ mod tests {
 
     fn sample_record(route: TimelineRoute) -> TimelineRecord {
         TimelineRecord {
+            schema_version: 1,
             route,
             state: TimelineLifecycleState::Active,
             recovery_floor_tso: None,
@@ -294,5 +343,16 @@ mod tests {
 
         assert!(timeline_route_changed(Some(&previous), &next));
         assert!(!timeline_route_changed(Some(&next), &next));
+    }
+
+    #[test]
+    fn timeline_record_rejects_unknown_schema_version() {
+        let mut record = sample_record(sample_route(7, 1));
+        record.schema_version = CURRENT_METADATA_SCHEMA_VERSION + 1;
+
+        assert!(matches!(
+            record.validate_schema_version(),
+            Err(TsoError::Internal(_))
+        ));
     }
 }
