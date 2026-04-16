@@ -1,3 +1,4 @@
+use crate::service::endpoints_match;
 use crate::TsoError;
 
 pub(super) fn validate_transfer_target(
@@ -6,7 +7,9 @@ pub(super) fn validate_transfer_target(
     target_owner_endpoint: &str,
     target_generator_id: Option<u32>,
 ) -> Result<(), TsoError> {
-    if target_owner_endpoint != local_advertise_endpoint && target_generator_id.is_none() {
+    if !endpoints_match(target_owner_endpoint, local_advertise_endpoint)
+        && target_generator_id.is_none()
+    {
         return Err(TsoError::TargetGeneratorIdRequired {
             timeline_key: timeline_key.to_owned(),
         });
@@ -33,6 +36,10 @@ mod tests {
     fn local_target_or_explicit_remote_generator_passes_validation() {
         assert!(
             validate_transfer_target("worker-a:50051", "timeline-a", "worker-a:50051", None)
+                .is_ok()
+        );
+        assert!(
+            validate_transfer_target("worker-a:50051", "timeline-a", " WORKER-A:50051 ", None)
                 .is_ok()
         );
         assert!(validate_transfer_target(

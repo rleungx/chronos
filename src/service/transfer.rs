@@ -12,6 +12,7 @@ use crate::planning::{
     should_release_previous_dedicated_generator_after_route_change, TransferPlan,
 };
 use crate::timeline_state::build_timeline_state;
+use crate::service::endpoints_match;
 use crate::{ResourceTier, TimelineLifecycleState, TimelineRoute, TransferReason, TsoError};
 use telemetry::{
     log_failover_blocked, log_transfer_completed, log_transfer_failed,
@@ -45,6 +46,40 @@ struct TransferCompletion<'a> {
 }
 
 impl TsoService {
+    async fn validate_recovery_catchup_budget_for_target(
+        &self,
+        timeline_key: &str,
+        owner_endpoint: &str,
+        generator_id: u32,
+        reason: TransferReason,
+        safe_floor: Option<u64>,
+    ) -> Result<(), TsoError> {
+        let Some(recovery_floor_tso) = safe_floor else {
+            return Ok(());
+        };
+
+        let required_jump_ms = self
+            .required_jump_ms_for_generator(generator_id, recovery_floor_tso)
+            .await?;
+        if required_jump_ms <= self.config.recovery_catchup_budget_ms {
+            return Ok(());
+        }
+
+        let error = TsoError::RecoveryCatchupBudgetExceeded {
+            generator_id,
+            required_jump_ms,
+            budget_ms: self.config.recovery_catchup_budget_ms,
+        };
+        log_transfer_failed(
+            timeline_key,
+            owner_endpoint,
+            Some(generator_id),
+            reason,
+            &error,
+        );
+        Err(error)
+    }
+
     fn release_claimed_dedicated_if_needed(
         &self,
         timeline_key: &str,
@@ -79,7 +114,13 @@ impl TsoService {
 
         if transfer.reason == TransferReason::Failover {
             if let Some((generator_record, _)) = previous_generator_record.as_ref() {
-                let exp = generator_record.lease_expire_at_ms.unwrap_or(0);
+                let Some(exp) = generator_record.lease_expire_at_ms else {
+                    let blocker = FailoverBlocker::LeaseNotExpired;
+                    log_failover_blocked(timeline_key, old_generator_id, None, blocker);
+                    return Err(TsoError::FailoverLeaseExpiryUnknown {
+                        timeline_key: timeline_key.to_owned(),
+                    });
+                };
                 if !crate::lease_expired_with_safety_gap(exp, now, self.config.safety_gap_ms) {
                     let blocker = FailoverBlocker::LeaseNotExpired;
                     log_failover_blocked(timeline_key, old_generator_id, Some(exp), blocker);
@@ -185,6 +226,24 @@ impl TsoService {
             }
         }
 
+        if let Err(error) = self
+            .validate_recovery_catchup_budget_for_target(
+                timeline_key,
+                &transfer.owner_endpoint,
+                new_generator_id,
+                transfer.reason,
+                safe_floor,
+            )
+            .await
+        {
+            self.release_claimed_dedicated_if_needed(
+                timeline_key,
+                previous_route,
+                claimed_dedicated,
+            );
+            return Err(error);
+        }
+
         if self.is_local_endpoint(&transfer.owner_endpoint)
             && !self.owns_generator_id(new_generator_id)
         {
@@ -206,6 +265,59 @@ impl TsoService {
                 &error,
             );
             return Err(error);
+        }
+
+        if !self.is_local_endpoint(&transfer.owner_endpoint) && transfer.generator_id.is_some() {
+            if self.config.generator_ownership_modulo > 1 && self.owns_generator_id(new_generator_id) {
+                self.release_claimed_dedicated_if_needed(
+                    timeline_key,
+                    previous_route,
+                    claimed_dedicated,
+                );
+                let error = TsoError::UnsafeRemoteTransferTarget {
+                    generator_id: new_generator_id,
+                    target_owner_endpoint: transfer.owner_endpoint.clone(),
+                };
+                log_transfer_failed(
+                    timeline_key,
+                    &transfer.owner_endpoint,
+                    Some(new_generator_id),
+                    transfer.reason,
+                    &error,
+                );
+                return Err(error);
+            }
+
+            if let Some((generator_record, _)) = self.metadata.load_generator(new_generator_id).await?
+            {
+                let lease_is_active = generator_record.lease_expire_at_ms.is_some_and(|exp| {
+                    !crate::lease_expired_with_safety_gap(exp, self.clock.now_ms(), self.config.safety_gap_ms)
+                });
+                if lease_is_active
+                    && !endpoints_match(
+                        &generator_record.owner_worker_endpoint,
+                        &transfer.owner_endpoint,
+                    )
+                {
+                    self.release_claimed_dedicated_if_needed(
+                        timeline_key,
+                        previous_route,
+                        claimed_dedicated,
+                    );
+                    let error = TsoError::UnsafeRemoteTransferTarget {
+                        generator_id: new_generator_id,
+                        target_owner_endpoint: transfer.owner_endpoint.clone(),
+                    };
+                    log_transfer_failed(
+                        timeline_key,
+                        &transfer.owner_endpoint,
+                        Some(new_generator_id),
+                        transfer.reason,
+                        &error,
+                    );
+                    return Err(error);
+                }
+            }
         }
 
         Ok(TransferTargetSelection {
@@ -445,8 +557,11 @@ impl TsoService {
 mod tests {
     use std::sync::Arc;
 
-    use crate::metadata::MemoryMetadataStore;
-    use crate::{ManualClock, ResourceTier, TsoConfig, TsoSecurityMode, TsoService};
+    use crate::metadata::{GeneratorLeaseAuthority, MemoryMetadataStore};
+    use crate::{
+        ManualClock, ResourceTier, TransferReason, TsoConfig, TsoError, TsoSecurityMode,
+        TsoService,
+    };
 
     fn required_test_config(config: TsoConfig) -> TsoConfig {
         TsoConfig {
@@ -527,5 +642,145 @@ mod tests {
         );
 
         drop(busy_handle);
+    }
+
+    #[tokio::test]
+    async fn failover_requires_known_previous_generator_lease_expiry() {
+        let clock = Arc::new(ManualClock::new(31_000));
+        let metadata = Arc::new(MemoryMetadataStore::new());
+        let service = TsoService::new(with_worker(TsoConfig::default(), "worker-a"), clock, metadata)
+            .unwrap();
+
+        let route = service
+            .ensure_timeline("transfer-failover-missing-lease")
+            .await
+            .unwrap();
+
+        service
+            .metadata
+            .compare_exchange_generator(
+                route.generator_id,
+                1,
+                &crate::metadata::GeneratorRecord {
+                    schema_version: 1,
+                    generator_id: route.generator_id,
+                    owner_worker_endpoint: route.owner_worker_endpoint.clone(),
+                    owner_instance_id: service.health().instance_id,
+                    generator_lease_token: 1,
+                    lease_expire_at_ms: None,
+                    last_issued_tso: Some(10),
+                    issued_upper_bound: Some(20),
+                    updated_at_ms: 10,
+                },
+            )
+            .await
+            .unwrap();
+
+        let error = service
+            .transfer_timeline_for_rpc(
+                &route.timeline_key,
+                "worker-b:50051".to_string(),
+                Some(route.generator_id),
+                TransferReason::Failover,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, TsoError::FailoverLeaseExpiryUnknown { .. }));
+    }
+
+    #[tokio::test]
+    async fn remote_transfer_rejects_generator_owned_by_this_worker_partition() {
+        let clock = Arc::new(ManualClock::new(31_000));
+        let metadata = Arc::new(MemoryMetadataStore::new());
+        let service = TsoService::new(
+            with_worker(
+                TsoConfig {
+                    generator_ownership_modulo: 2,
+                    generator_ownership_remainder: 0,
+                    shared_generators: 8,
+                    shared_jump_ahead_threshold_ms: u64::MAX,
+                    recovery_catchup_budget_ms: u64::MAX,
+                    ..TsoConfig::default()
+                },
+                "worker-a",
+            ),
+            clock,
+            metadata,
+        )
+        .unwrap();
+
+        let route = service.ensure_timeline("transfer-unsafe-remote").await.unwrap();
+        let error = service
+            .transfer_timeline_for_rpc(
+                &route.timeline_key,
+                "worker-b:50051".to_string(),
+                Some(route.generator_id),
+                TransferReason::Manual,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, TsoError::UnsafeRemoteTransferTarget { .. }),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_transfer_rejects_generator_with_active_conflicting_owner() {
+        let clock = Arc::new(ManualClock::new(31_000));
+        let metadata = Arc::new(MemoryMetadataStore::new());
+        let service = TsoService::new(
+            with_worker(
+                TsoConfig {
+                    generator_ownership_modulo: 2,
+                    generator_ownership_remainder: 0,
+                    shared_generators: 8,
+                    shared_jump_ahead_threshold_ms: u64::MAX,
+                    recovery_catchup_budget_ms: u64::MAX,
+                    ..TsoConfig::default()
+                },
+                "worker-a",
+            ),
+            clock,
+            metadata.clone(),
+        )
+        .unwrap();
+
+        let route = service.ensure_timeline("transfer-remote-owner-conflict").await.unwrap();
+        let conflicting_generator_id = route.generator_id + 1;
+        metadata
+            .create_generator(
+                conflicting_generator_id,
+                &crate::metadata::GeneratorRecord {
+                    schema_version: 1,
+                    generator_id: conflicting_generator_id,
+                    owner_worker_endpoint: "worker-c:50051".into(),
+                    owner_instance_id: "instance-c".into(),
+                    generator_lease_token: 1,
+                    lease_expire_at_ms: Some(31_500),
+                    last_issued_tso: Some(10),
+                    issued_upper_bound: Some(20),
+                    updated_at_ms: 10,
+                },
+            )
+            .await
+            .unwrap();
+
+        let error = service
+            .transfer_timeline_for_rpc(
+                &route.timeline_key,
+                "worker-b:50051".to_string(),
+                Some(conflicting_generator_id),
+                TransferReason::Manual,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, TsoError::UnsafeRemoteTransferTarget { .. }),
+            "unexpected error: {error:?}"
+        );
     }
 }

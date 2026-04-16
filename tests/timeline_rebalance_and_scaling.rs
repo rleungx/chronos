@@ -17,7 +17,8 @@ use chronos::{
     decode_tso, encode_tso,
     metadata::{EtcdMetadataStore, GeneratorLeaseAuthority, MemoryMetadataStore},
     AllocateTimestampsRequest, AllocateTimestampsResponse, ManualClock, ResourceTier,
-    TimelineRoute, TransferReason, TsoConfig, TsoError, TsoService, MAX_PHYSICAL_MS,
+    TimelineLifecycleState, TimelineRoute, TransferReason, TsoConfig, TsoError, TsoService,
+    MAX_PHYSICAL_MS,
     SEQUENCE_CAPACITY,
 };
 
@@ -1652,6 +1653,134 @@ async fn failover_recovery_floor_survives_remote_restart_before_first_allocation
 
     assert!(first_last < resumed);
     assert!(persisted_recovery_floor < resumed);
+}
+
+#[tokio::test]
+async fn failover_recovery_floor_uses_recovery_catchup_budget_when_future_borrow_is_tight() {
+    let base = TsoConfig {
+        lease_ttl_ms: 5,
+        generator_lease_ttl_ms: 5,
+        generator_maintenance_interval_ms: 1,
+        max_future_borrow_ms: 10,
+        recovery_catchup_budget_ms: 2_000,
+        ..TsoConfig::default()
+    };
+    let shared_generators = base.shared_generators;
+    let metadata = Arc::new(MemoryMetadataStore::new());
+    let mut config_a = with_worker(base.clone(), "worker-a");
+    config_a.max_future_borrow_ms = base.max_future_borrow_ms;
+    config_a.recovery_catchup_budget_ms = base.recovery_catchup_budget_ms;
+    let mut config_b = with_worker(base.clone(), "worker-b");
+    config_b.max_future_borrow_ms = base.max_future_borrow_ms;
+    config_b.recovery_catchup_budget_ms = base.recovery_catchup_budget_ms;
+
+    let fast_clock = Arc::new(ManualClock::new(30_000));
+    let service_a = TsoService::new(config_a, fast_clock.clone(), metadata.clone()).unwrap();
+
+    let route_a = service_a
+        .ensure_timeline("failover.recovery.catchup.timeline")
+        .await
+        .unwrap();
+    let before = service_a
+        .allocate_timestamps(request(&route_a, "before-catchup-failover".to_owned(), 1))
+        .await
+        .unwrap();
+    let before_last = before.ranges.last().unwrap().end_tso;
+
+    fast_clock.advance(1_000);
+    let target_generator_id = (route_a.generator_id + 1) % shared_generators;
+    let transferred = service_a
+        .control_plane()
+        .transfer_timeline_for_rpc(
+            &route_a.timeline_key,
+            worker_endpoint("worker-b"),
+            Some(target_generator_id),
+            TransferReason::Failover,
+        )
+        .await
+        .unwrap()
+        .0;
+
+    let slow_clock = Arc::new(ManualClock::new(30_050));
+    let service_b = TsoService::new(config_b, slow_clock, metadata).unwrap();
+    let after = service_b
+        .allocate_timestamps(request(
+            &transferred,
+            "after-catchup-failover".to_owned(),
+            1,
+        ))
+        .await
+        .unwrap();
+    let resumed = after.ranges[0].start_tso;
+
+    assert!(before_last < resumed);
+}
+
+#[tokio::test]
+async fn failover_rejects_transfer_beyond_recovery_catchup_budget() {
+    let base = TsoConfig {
+        lease_ttl_ms: 5,
+        generator_lease_ttl_ms: 5,
+        generator_maintenance_interval_ms: 1,
+        max_future_borrow_ms: 10,
+        recovery_catchup_budget_ms: 50,
+        ..TsoConfig::default()
+    };
+    let shared_generators = base.shared_generators;
+    let metadata = Arc::new(MemoryMetadataStore::new());
+    let mut config_a = with_worker(base.clone(), "worker-a");
+    config_a.max_future_borrow_ms = base.max_future_borrow_ms;
+    config_a.recovery_catchup_budget_ms = base.recovery_catchup_budget_ms;
+    let mut config_b = with_worker(base.clone(), "worker-b");
+    config_b.max_future_borrow_ms = base.max_future_borrow_ms;
+    config_b.recovery_catchup_budget_ms = base.recovery_catchup_budget_ms;
+    let fast_clock = Arc::new(ManualClock::new(31_000));
+    let service_a = TsoService::new(config_a, fast_clock.clone(), metadata.clone()).unwrap();
+
+    let route_a = service_a
+        .ensure_timeline("failover.recovery.catchup.limit")
+        .await
+        .unwrap();
+    service_a
+        .allocate_timestamps(request(&route_a, "before-catchup-limit".to_owned(), 1))
+        .await
+        .unwrap();
+
+    fast_clock.advance(1_000);
+    let forced_upper_bound = encode_tso(32_000, route_a.generator_id, SEQUENCE_CAPACITY - 1)
+        .expect("forced recovery floor should encode");
+    overwrite_generator_record(&metadata, route_a.generator_id, |record| {
+        record.issued_upper_bound = Some(forced_upper_bound);
+        record.lease_expire_at_ms = Some(31_999);
+    })
+    .await;
+    let target_generator_id = (route_a.generator_id + 1) % shared_generators;
+    let transferred = service_a
+        .control_plane()
+        .transfer_timeline_for_rpc(
+            &route_a.timeline_key,
+            worker_endpoint("worker-b"),
+            Some(target_generator_id),
+            TransferReason::Failover,
+        )
+        .await
+        .unwrap()
+        .0;
+
+    let slow_clock = Arc::new(ManualClock::new(31_050));
+    let service_b = TsoService::new(config_b, slow_clock, metadata).unwrap();
+    let error = service_b
+        .allocate_timestamps(request(&transferred, "after-catchup-limit".to_owned(), 1))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        TsoError::TimelineNotReady {
+            state: TimelineLifecycleState::Recovering,
+            ..
+        }
+    ));
 }
 
 #[tokio::test]
