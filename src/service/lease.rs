@@ -61,47 +61,56 @@ impl TsoService {
             match self.metadata.load_generator(generator_id).await? {
                 Some((record, revision)) => {
                     let now_ms = self.clock.now_ms();
-                    let exp = record.lease_expire_at_ms.unwrap_or(0);
+                    let lease_expire_at_ms = record.lease_expire_at_ms;
                     let generator_floor_tso = generator_recovery_floor_tso(&record);
-                    if self.is_local_generator_owner(&record) && exp > now_ms {
-                        if let Some(generator_floor_tso) = generator_floor_tso {
-                            self.lookup_generator(generator_id)?
-                                .init_after_floor(generator_floor_tso)?;
-                        }
-                        self.generator_runtime.upsert_lease(
-                            generator_id,
-                            crate::runtime::GeneratorLeaseState {
-                                revision,
-                                owner_instance_id: record.owner_instance_id.clone(),
-                                generator_lease_token: record.generator_lease_token,
-                                lease_expire_at_ms: exp,
-                                last_persisted_tso: generator_floor_tso,
-                                issued_upper_bound: record.issued_upper_bound,
-                            },
-                        );
-                        self.clear_generator_ownership_drift(generator_id);
-                        return Ok(());
-                    }
-
                     if self.is_local_generator_owner(&record) {
+                        let Some(lease_expire_at_ms) = lease_expire_at_ms else {
+                            self.clear_generator_ownership_drift(generator_id);
+                            return Err(TsoError::GeneratorLeaseExpired { generator_id });
+                        };
+                        if lease_expire_at_ms > now_ms {
+                            if let Some(generator_floor_tso) = generator_floor_tso {
+                                self.lookup_generator(generator_id)?
+                                    .init_after_floor(generator_floor_tso)?;
+                            }
+                            self.generator_runtime.upsert_lease(
+                                generator_id,
+                                crate::runtime::GeneratorLeaseState {
+                                    revision,
+                                    owner_instance_id: record.owner_instance_id.clone(),
+                                    generator_lease_token: record.generator_lease_token,
+                                    lease_expire_at_ms,
+                                    last_persisted_tso: generator_floor_tso,
+                                    issued_upper_bound: record.issued_upper_bound,
+                                },
+                            );
+                            self.clear_generator_ownership_drift(generator_id);
+                            return Ok(());
+                        }
                         self.clear_generator_ownership_drift(generator_id);
                         return Err(TsoError::GeneratorLeaseExpired { generator_id });
                     }
 
-                    if self.is_local_endpoint(&record.owner_worker_endpoint) && exp > now_ms {
-                        self.observe_contended_local_generator_ownership_drift(
-                            generator_id,
-                            &record.owner_instance_id,
-                            exp,
-                            now_ms,
-                        );
+                    if let Some(exp) = lease_expire_at_ms.filter(|exp| *exp > now_ms) {
+                        if self.is_local_endpoint(&record.owner_worker_endpoint) {
+                            self.observe_contended_local_generator_ownership_drift(
+                                generator_id,
+                                &record.owner_instance_id,
+                                exp,
+                                now_ms,
+                            );
+                        } else {
+                            self.clear_generator_ownership_drift(generator_id);
+                        }
                     } else {
                         self.clear_generator_ownership_drift(generator_id);
                     }
 
-                    if crate::lease_expired_with_safety_gap(exp, now_ms, self.config.safety_gap_ms)
-                    {
+                    if lease_expire_at_ms.is_some_and(|exp| {
+                        crate::lease_expired_with_safety_gap(exp, now_ms, self.config.safety_gap_ms)
+                    }) {
                         let mut record = record;
+                        let new_lease_expire_at_ms = now_ms + self.config.generator_lease_ttl_ms;
                         if let Some(generator_floor_tso) = generator_floor_tso {
                             let floor_cursor =
                                 crate::next_cursor_after(generator_floor_tso, generator_id)?;
@@ -117,8 +126,7 @@ impl TsoService {
                         record.owner_instance_id = self.local_instance_id().to_owned();
                         record.generator_lease_token =
                             record.generator_lease_token.saturating_add(1).max(1);
-                        record.lease_expire_at_ms =
-                            Some(now_ms + self.config.generator_lease_ttl_ms);
+                        record.lease_expire_at_ms = Some(new_lease_expire_at_ms);
                         record.updated_at_ms = now_ms;
                         match self
                             .metadata
@@ -138,7 +146,7 @@ impl TsoService {
                                         revision: new_rev,
                                         owner_instance_id: record.owner_instance_id.clone(),
                                         generator_lease_token: record.generator_lease_token,
-                                        lease_expire_at_ms: record.lease_expire_at_ms.unwrap_or(0),
+                                        lease_expire_at_ms: new_lease_expire_at_ms,
                                         last_persisted_tso: record.last_issued_tso,
                                         issued_upper_bound: record.issued_upper_bound,
                                     },
@@ -167,12 +175,14 @@ impl TsoService {
                 }
                 None => {
                     let now_ms = self.clock.now_ms();
+                    let lease_expire_at_ms = now_ms + self.config.generator_lease_ttl_ms;
                     let record = GeneratorRecord {
+                        schema_version: 1,
                         generator_id,
                         owner_worker_endpoint: self.config.advertise_endpoint.clone(),
                         owner_instance_id: self.local_instance_id().to_owned(),
                         generator_lease_token: 1,
-                        lease_expire_at_ms: Some(now_ms + self.config.generator_lease_ttl_ms),
+                        lease_expire_at_ms: Some(lease_expire_at_ms),
                         last_issued_tso: None,
                         issued_upper_bound: self
                             .compute_generator_upper_bound(generator_id, now_ms),
@@ -186,7 +196,7 @@ impl TsoService {
                                     revision,
                                     owner_instance_id: record.owner_instance_id.clone(),
                                     generator_lease_token: record.generator_lease_token,
-                                    lease_expire_at_ms: record.lease_expire_at_ms.unwrap_or(0),
+                                    lease_expire_at_ms,
                                     last_persisted_tso: None,
                                     issued_upper_bound: record.issued_upper_bound,
                                 },
@@ -242,7 +252,13 @@ impl TsoService {
                 timeline_key: timeline_key.to_owned(),
             })?;
         let now_ms = self.clock.now_ms();
-        let exp = record.lease_expire_at_ms.unwrap_or(0);
+        let Some(exp) = record.lease_expire_at_ms else {
+            crate::metrics::TSO_LEASE_EXPIRED_TOTAL.inc();
+            self.clear_generator_ownership_drift(generator_id);
+            return Err(TsoError::LeaseExpired {
+                timeline_key: timeline_key.to_owned(),
+            });
+        };
         if !self.is_local_generator_owner(&record) || exp <= now_ms {
             crate::metrics::TSO_LEASE_EXPIRED_TOTAL.inc();
             if self.is_local_endpoint(&record.owner_worker_endpoint) && exp > now_ms {
@@ -323,13 +339,15 @@ impl TsoService {
 
         let next_upper_bound =
             self.compute_generator_upper_bound(generator_id, plan.next_upper_bound_base_ms());
+        let refreshed_lease_expire_at_ms = now_ms + ttl;
 
         let record = GeneratorRecord {
+            schema_version: 1,
             generator_id,
             owner_worker_endpoint: self.config.advertise_endpoint.clone(),
             owner_instance_id: lease_state.owner_instance_id.clone(),
             generator_lease_token: lease_state.generator_lease_token,
-            lease_expire_at_ms: Some(now_ms + ttl),
+            lease_expire_at_ms: Some(refreshed_lease_expire_at_ms),
             last_issued_tso: plan.candidate_last(),
             issued_upper_bound: plan.record_issued_upper_bound(next_upper_bound),
             updated_at_ms: now_ms,
@@ -346,7 +364,7 @@ impl TsoService {
                         revision: new_rev,
                         owner_instance_id: record.owner_instance_id.clone(),
                         generator_lease_token: record.generator_lease_token,
-                        lease_expire_at_ms: record.lease_expire_at_ms.unwrap_or(0),
+                        lease_expire_at_ms: refreshed_lease_expire_at_ms,
                         last_persisted_tso: plan.candidate_last(),
                         issued_upper_bound: record.issued_upper_bound,
                     },
@@ -407,13 +425,15 @@ impl TsoService {
 
             let next_upper_bound =
                 self.compute_generator_upper_bound(generator_id, plan.next_upper_bound_base_ms());
+            let refreshed_lease_expire_at_ms = now_ms + ttl;
 
             let record = GeneratorRecord {
+                schema_version: 1,
                 generator_id,
                 owner_worker_endpoint: self.config.advertise_endpoint.clone(),
                 owner_instance_id: lease_state.owner_instance_id.clone(),
                 generator_lease_token: lease_state.generator_lease_token,
-                lease_expire_at_ms: Some(now_ms + ttl),
+                lease_expire_at_ms: Some(refreshed_lease_expire_at_ms),
                 last_issued_tso: plan.candidate_last(),
                 issued_upper_bound: plan.record_issued_upper_bound(next_upper_bound),
                 updated_at_ms: now_ms,
@@ -429,7 +449,7 @@ impl TsoService {
                     revision: 0,
                     owner_instance_id: record.owner_instance_id.clone(),
                     generator_lease_token: record.generator_lease_token,
-                    lease_expire_at_ms: record.lease_expire_at_ms.unwrap_or(0),
+                    lease_expire_at_ms: refreshed_lease_expire_at_ms,
                     last_persisted_tso: plan.candidate_last(),
                     issued_upper_bound: record.issued_upper_bound,
                 },
@@ -561,6 +581,7 @@ mod tests {
         ) -> Result<Option<(GeneratorRecord, u64)>, TsoError> {
             Ok(Some((
                 GeneratorRecord {
+                    schema_version: 1,
                     generator_id,
                     owner_worker_endpoint: "remote-endpoint".into(),
                     owner_instance_id: "remote-instance".into(),
@@ -672,6 +693,7 @@ mod tests {
         ) -> Result<Option<(GeneratorRecord, u64)>, TsoError> {
             Ok(Some((
                 GeneratorRecord {
+                    schema_version: 1,
                     generator_id,
                     owner_worker_endpoint: "remote-endpoint".into(),
                     owner_instance_id: "remote-instance".into(),
@@ -790,6 +812,7 @@ mod tests {
             self.load_calls.fetch_add(1, Ordering::AcqRel);
             Ok(Some((
                 GeneratorRecord {
+                    schema_version: 1,
                     generator_id,
                     owner_worker_endpoint: "remote-endpoint".into(),
                     owner_instance_id: "remote-instance".into(),
@@ -908,6 +931,7 @@ mod tests {
 
             Ok(Some((
                 GeneratorRecord {
+                    schema_version: 1,
                     generator_id,
                     owner_worker_endpoint: "remote-endpoint".into(),
                     owner_instance_id: "remote-instance".into(),
@@ -1083,6 +1107,7 @@ mod tests {
             .create_generator(
                 0,
                 &GeneratorRecord {
+                    schema_version: 1,
                     generator_id: 0,
                     owner_worker_endpoint: "127.0.0.1:50051".into(),
                     owner_instance_id: "other-instance".into(),
@@ -1114,6 +1139,7 @@ mod tests {
         let clock = Arc::new(ManualClock::new(100));
         let metadata = Arc::new(MemoryMetadataStore::new());
         let record = GeneratorRecord {
+            schema_version: 1,
             generator_id: 0,
             owner_worker_endpoint: "127.0.0.1:50051".into(),
             owner_instance_id: "other-instance".into(),
@@ -1159,6 +1185,7 @@ mod tests {
         let clock = Arc::new(ManualClock::new(100));
         let metadata = Arc::new(MemoryMetadataStore::new());
         let record = GeneratorRecord {
+            schema_version: 1,
             generator_id: 0,
             owner_worker_endpoint: "127.0.0.1:50051".into(),
             owner_instance_id: "other-instance".into(),
@@ -1210,6 +1237,7 @@ mod tests {
         let clock = Arc::new(ManualClock::new(100));
         let metadata = Arc::new(MemoryMetadataStore::new());
         let record = GeneratorRecord {
+            schema_version: 1,
             generator_id: 0,
             owner_worker_endpoint: "127.0.0.1:50051".into(),
             owner_instance_id: "other-instance".into(),

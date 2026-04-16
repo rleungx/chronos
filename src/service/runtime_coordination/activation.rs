@@ -1,5 +1,6 @@
 use crate::lifecycle::{TimelineLifecycleContract, TimelineServingReadiness};
 use crate::metadata::TimelineRecord;
+use crate::planning::recovered_timeline_floor_tso;
 use crate::{TimelineLifecycleState, TsoError};
 use tokio::time::Instant;
 
@@ -28,6 +29,16 @@ impl TsoService {
                 }
                 TimelineServingReadiness::RequiresActivation => {
                     debug_assert!(lifecycle.should_activate_locally());
+                    if let Some(recovery_floor_tso) = recovered_timeline_floor_tso(&record) {
+                        let recovery_physical_ms =
+                            crate::decode_tso(recovery_floor_tso).physical_ms;
+                        let now_ms = self.clock.now_ms();
+                        if recovery_physical_ms
+                            > now_ms.saturating_add(self.config.recovery_catchup_budget_ms)
+                        {
+                            return Ok((record, revision));
+                        }
+                    }
                     self.ensure_generator_lease(record.route.generator_id)
                         .await?;
                 }
@@ -143,6 +154,7 @@ mod tests {
         ) -> Result<Option<(GeneratorRecord, u64)>, TsoError> {
             Ok(Some((
                 GeneratorRecord {
+                    schema_version: 1,
                     generator_id,
                     owner_worker_endpoint: "127.0.0.1:50052".into(),
                     owner_instance_id: "activation-instance".into(),
@@ -204,6 +216,7 @@ mod tests {
             resource_tier: ResourceTier::Shared,
         };
         let record = TimelineRecord {
+            schema_version: 1,
             route: route.clone(),
             state: TimelineLifecycleState::Recovering,
             recovery_floor_tso: None,

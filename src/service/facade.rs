@@ -1,7 +1,7 @@
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
 
 use tokio::sync::Semaphore;
@@ -79,6 +79,7 @@ impl TsoService {
             metadata_contention: MetadataContentionCoordinator::new(contention_jitter_seed),
             background,
             ownership_drift: super::worker_readiness::OwnershipDriftTracker::default(),
+            shutdown_gate: AtomicBool::new(false),
         });
 
         {
@@ -125,6 +126,7 @@ impl TsoService {
         if !self.background.begin_shutdown() {
             return;
         }
+        self.request_local_shutdown_gate();
 
         info!(
             component = "shutdown",
@@ -138,6 +140,7 @@ impl TsoService {
         );
         self.best_effort_persist_runtime_before_shutdown().await;
         self.background.drain_tasks().await;
+        self.invalidate_local_runtime_after_shutdown();
         self.metadata.shutdown().await;
         info!(
             component = "shutdown",
@@ -152,27 +155,23 @@ impl TsoService {
     }
 
     async fn best_effort_persist_runtime_before_shutdown(&self) {
-        let timelines = match self.metadata.list_timelines().await {
-            Ok(timelines) => timelines,
-            Err(error) => {
-                warn!(
-                    component = "shutdown",
-                    event = "runtime_flush_skipped",
-                    result = "degraded",
-                    reason = %error,
-                    advertise_endpoint = %self.config.advertise_endpoint,
-                    metadata_kind = %self.config.metadata_kind
-                );
-                return;
-            }
-        };
+        let (local_timelines, local_generator_ids, candidates) =
+            match self.collect_shutdown_inventory().await {
+                Ok(inventory) => inventory,
+                Err(error) => {
+                    warn!(
+                        component = "shutdown",
+                        event = "runtime_flush_skipped",
+                        result = "degraded",
+                        reason = %error,
+                        advertise_endpoint = %self.config.advertise_endpoint,
+                        metadata_kind = %self.config.metadata_kind
+                    );
+                    return;
+                }
+            };
 
-        let mut local_generator_ids = HashSet::new();
-        for timeline in &timelines {
-            if !self.is_local_endpoint(&timeline.route.owner_worker_endpoint) {
-                continue;
-            }
-            local_generator_ids.insert(timeline.route.generator_id);
+        for timeline in &local_timelines {
             if let Err(error) = self
                 .best_effort_persist_local_timeline_floor(&timeline.route.timeline_key)
                 .await
@@ -202,16 +201,82 @@ impl TsoService {
             }
         }
 
-        self.best_effort_transfer_local_timelines_before_shutdown(&timelines)
+        self.best_effort_transfer_local_timelines_before_shutdown(&local_timelines, &candidates)
             .await;
+    }
+
+    fn invalidate_local_runtime_after_shutdown(&self) {
+        self.generator_runtime.clear_leases();
+        self.generator_runtime.clear_dedicated_claims();
+        self.timeline_runtime.clear();
+    }
+
+    async fn collect_shutdown_inventory(
+        &self,
+    ) -> Result<
+        (
+            Vec<TimelineRecord>,
+            HashSet<u32>,
+            ShutdownTransferCandidates,
+        ),
+        TsoError,
+    > {
+        let mut local_timelines = Vec::new();
+        let mut local_generator_ids = HashSet::new();
+        let mut candidates = ShutdownTransferCandidates::default();
+        let mut seen_candidates = HashSet::new();
+        let mut cursor = None;
+        let page_size = self.config.max_timeline_runtime_entries.clamp(1, 256);
+
+        loop {
+            let page = self
+                .metadata
+                .list_timelines_page(cursor.as_deref(), page_size)
+                .await?;
+            if page.records.is_empty() {
+                break;
+            }
+
+            for timeline in page.records {
+                if self.is_local_endpoint(&timeline.route.owner_worker_endpoint) {
+                    local_generator_ids.insert(timeline.route.generator_id);
+                    local_timelines.push(timeline);
+                    continue;
+                }
+
+                let dedupe_key = (
+                    timeline.route.owner_worker_endpoint.clone(),
+                    timeline.route.generator_id,
+                );
+                if !seen_candidates.insert(dedupe_key) {
+                    continue;
+                }
+
+                let candidate = (
+                    timeline.route.owner_worker_endpoint.clone(),
+                    timeline.route.generator_id,
+                );
+                match timeline.route.resource_tier {
+                    ResourceTier::Shared => candidates.shared.push(candidate),
+                    ResourceTier::Warm => candidates.warm.push(candidate),
+                    ResourceTier::Dedicated => candidates.dedicated.push(candidate),
+                }
+            }
+
+            cursor = page.next_start_after_timeline_key;
+            if cursor.is_none() {
+                break;
+            }
+        }
+
+        Ok((local_timelines, local_generator_ids, candidates))
     }
 
     async fn best_effort_transfer_local_timelines_before_shutdown(
         &self,
         timelines: &[TimelineRecord],
+        candidates: &ShutdownTransferCandidates,
     ) {
-        let candidates =
-            Self::shutdown_transfer_candidates(timelines, self.config.advertise_endpoint.as_str());
         if candidates.shared.is_empty()
             && candidates.warm.is_empty()
             && candidates.dedicated.is_empty()
@@ -225,7 +290,7 @@ impl TsoService {
                 continue;
             }
             let Some((target_endpoint, target_generator_id)) = Self::shutdown_transfer_target(
-                &candidates,
+                candidates,
                 timeline.route.resource_tier,
                 &mut transfer_state,
             ) else {
@@ -252,30 +317,6 @@ impl TsoService {
                 );
             }
         }
-    }
-
-    fn shutdown_transfer_candidates(
-        timelines: &[TimelineRecord],
-        local_endpoint: &str,
-    ) -> ShutdownTransferCandidates {
-        let mut seen = HashSet::new();
-        let mut candidates = ShutdownTransferCandidates::default();
-        for timeline in timelines {
-            let route = &timeline.route;
-            if route.owner_worker_endpoint == local_endpoint {
-                continue;
-            }
-            let dedupe_key = (route.owner_worker_endpoint.clone(), route.generator_id);
-            if seen.insert(dedupe_key) {
-                let candidate = (route.owner_worker_endpoint.clone(), route.generator_id);
-                match route.resource_tier {
-                    ResourceTier::Shared => candidates.shared.push(candidate),
-                    ResourceTier::Warm => candidates.warm.push(candidate),
-                    ResourceTier::Dedicated => candidates.dedicated.push(candidate),
-                }
-            }
-        }
-        candidates
     }
 
     fn shutdown_transfer_target(
@@ -482,6 +523,25 @@ mod tests {
         assert_ne!(first, second);
     }
 
+    #[tokio::test]
+    async fn service_new_uses_effective_instance_id_when_config_instance_is_blank() {
+        let config = required_test_config(TsoConfig {
+            advertise_endpoint: "worker-a:50051".into(),
+            ..TsoConfig::default()
+        });
+
+        let service = TsoService::new(
+            config,
+            Arc::new(ManualClock::new(1_000)),
+            Arc::new(MemoryMetadataStore::new()),
+        )
+        .unwrap();
+
+        assert!(service.health().instance_id.starts_with("worker-a:50051#"));
+
+        service.shutdown().await;
+    }
+
     #[test]
     fn service_new_rejects_default_worker_id_for_etcd_metadata() {
         let config = TsoConfig {
@@ -549,6 +609,93 @@ mod tests {
             .unwrap();
         assert_eq!(after.last_graceful_issued, Some(last_issued));
         assert_eq!(after.recovery_floor_tso, Some(last_issued));
+    }
+
+    #[tokio::test]
+    async fn service_shutdown_blocks_new_ensure_and_allocate_work() {
+        let clock = Arc::new(ManualClock::new(40_500));
+        let metadata = Arc::new(MemoryMetadataStore::new());
+        let service = TsoService::new(
+            with_worker(TsoConfig::default(), "worker-a"),
+            clock,
+            metadata,
+        )
+        .unwrap();
+
+        let route = service
+            .ensure_timeline("shutdown.gate.timeline")
+            .await
+            .unwrap();
+
+        service.shutdown().await;
+
+        assert_eq!(
+            service
+                .ensure_timeline("shutdown.gate.new")
+                .await
+                .unwrap_err(),
+            TsoError::ServiceShuttingDown
+        );
+        assert_eq!(
+            service
+                .allocate_timestamps(AllocateTimestampsRequest {
+                    timeline_key: route.timeline_key.clone(),
+                    count: 1,
+                    expected_epoch: route.epoch,
+                    expected_route_version: route.route_version,
+                    client_request_id: "shutdown-gate".into(),
+                })
+                .await
+                .unwrap_err(),
+            TsoError::ServiceShuttingDown
+        );
+    }
+
+    #[tokio::test]
+    async fn service_shutdown_clears_local_runtime_and_cached_leases() {
+        let clock = Arc::new(ManualClock::new(40_750));
+        let metadata = Arc::new(MemoryMetadataStore::new());
+        let service = TsoService::new(
+            with_worker(TsoConfig::default(), "worker-a"),
+            clock,
+            metadata,
+        )
+        .unwrap();
+
+        let route = service
+            .ensure_timeline("shutdown.clear-runtime")
+            .await
+            .unwrap();
+        service
+            .allocate_timestamps(AllocateTimestampsRequest {
+                timeline_key: route.timeline_key.clone(),
+                count: 1,
+                expected_epoch: route.epoch,
+                expected_route_version: route.route_version,
+                client_request_id: "shutdown-clear-runtime".into(),
+            })
+            .await
+            .unwrap();
+
+        assert!(service
+            .timeline_runtime
+            .timeline_handle(&route.timeline_key)
+            .is_some());
+        assert!(service
+            .generator_runtime
+            .lease_state(route.generator_id)
+            .is_some());
+
+        service.shutdown().await;
+
+        assert!(service
+            .timeline_runtime
+            .timeline_handle(&route.timeline_key)
+            .is_none());
+        assert!(service
+            .generator_runtime
+            .lease_state(route.generator_id)
+            .is_none());
     }
 
     #[tokio::test]

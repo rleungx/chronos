@@ -67,12 +67,17 @@ impl TsoService {
         &self,
         timeline_key: &str,
     ) -> Result<Option<(TimelineRecord, u64)>, TsoError> {
-        let _flight = self.acquire_timeline_load_singleflight(timeline_key).await;
-        let _permit = self
-            .timeline_load_limiter
-            .acquire()
+        self.load_timeline_with_singleflight_and_cancellation(timeline_key, None)
             .await
-            .map_err(|_| TsoError::Internal("timeline load limiter closed".into()))?;
+    }
+
+    pub(in crate::service) async fn load_timeline_with_singleflight_and_cancellation(
+        &self,
+        timeline_key: &str,
+        cancellation: Option<crate::plane::RequestCancellation>,
+    ) -> Result<Option<(TimelineRecord, u64)>, TsoError> {
+        let _flight = self.acquire_timeline_load_singleflight(timeline_key).await;
+        let _permit = self.acquire_timeline_load_permit(cancellation).await?;
         self.metadata.load_timeline(timeline_key).await
     }
 }
