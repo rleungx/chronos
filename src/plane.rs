@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, Notify};
 
 use crate::{
     AllocateTimestampsRequest, AllocateTimestampsResponse, HealthInfo, ResourceTier,
@@ -11,6 +11,7 @@ use crate::{
 #[derive(Clone, Default)]
 pub(crate) struct RequestCancellation {
     cancelled: Arc<AtomicBool>,
+    notify: Arc<Notify>,
 }
 
 impl RequestCancellation {
@@ -20,10 +21,18 @@ impl RequestCancellation {
 
     pub(crate) fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
+        self.notify.notify_waiters();
     }
 
     pub(crate) fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Acquire)
+    }
+
+    pub(crate) async fn cancelled(&self) {
+        if self.is_cancelled() {
+            return;
+        }
+        self.notify.notified().await;
     }
 }
 

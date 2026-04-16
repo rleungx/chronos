@@ -165,6 +165,7 @@ mod tests {
     #[test]
     fn generator_recovery_floor_prefers_upper_bound_max() {
         let record = GeneratorRecord {
+            schema_version: 1,
             generator_id: 7,
             owner_worker_endpoint: "worker".into(),
             owner_instance_id: "instance".into(),
@@ -180,6 +181,7 @@ mod tests {
     #[test]
     fn recovered_timeline_floor_prefers_max_of_graceful_and_recovery() {
         let record = TimelineRecord {
+            schema_version: 1,
             route: TimelineRoute {
                 timeline_key: "t".into(),
                 generator_id: 7,
