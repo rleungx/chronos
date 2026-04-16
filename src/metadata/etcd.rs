@@ -20,7 +20,9 @@ use crate::{metrics, TimelineRoute, TsoConfig, TsoError};
 use super::{
     identity::{claim_instance_identity, InstanceIdentityLeaseRecord},
     keys,
-    types::{timeline_route_update_from_routes, RouteUpdateSignal},
+    types::{
+        timeline_route_update_from_routes, RouteUpdateSignal, CURRENT_METADATA_SCHEMA_VERSION,
+    },
     GeneratorBatchOp, GeneratorLeaseAuthority, GeneratorRecord, IdentityLeaseAuthority,
     InstanceIdentityLease, RouteUpdateSource, TimelineAuthority, TimelineBatchOp, TimelineRecord,
     TimelineRecordListPage,
@@ -90,7 +92,13 @@ struct JsonTxnContext {
 
 #[derive(Deserialize)]
 struct RouteOnlyTimelineRecord {
+    #[serde(default = "default_schema_version")]
+    _schema_version: u32,
     route: TimelineRoute,
+}
+
+fn default_schema_version() -> u32 {
+    CURRENT_METADATA_SCHEMA_VERSION
 }
 
 fn parse_prev_route(value: &[u8]) -> Option<TimelineRoute> {
@@ -765,24 +773,39 @@ impl TimelineAuthority for EtcdMetadataStore {
         let _timer = metrics::TSO_METADATA_LATENCY
             .with_label_values(&["get"])
             .start_timer();
-        self.get_json_record(
-            self.timeline_key(timeline_key),
-            "get",
-            "Record deserialization",
-        )
-        .await
+        let result: Option<(TimelineRecord, u64)> = self
+            .get_json_record(
+                self.timeline_key(timeline_key),
+                "get",
+                "Record deserialization",
+            )
+            .await?;
+        result
+            .map(|(record, revision)| {
+                record.validate_schema_version()?;
+                Ok((record, revision))
+            })
+            .transpose()
     }
 
     async fn list_timelines(&self) -> Result<Vec<TimelineRecord>, TsoError> {
         let _timer = metrics::TSO_METADATA_LATENCY
             .with_label_values(&["list"])
             .start_timer();
-        self.get_json_records_with_prefix(
-            self.route_prefix(),
-            "list",
-            "Timeline record list deserialization",
-        )
-        .await
+        let records: Vec<TimelineRecord> = self
+            .get_json_records_with_prefix(
+                self.route_prefix(),
+                "list",
+                "Timeline record list deserialization",
+            )
+            .await?;
+        records
+            .into_iter()
+            .map(|record| {
+                record.validate_schema_version()?;
+                Ok(record)
+            })
+            .collect()
     }
 
     async fn list_timelines_page(
@@ -841,6 +864,7 @@ impl TimelineAuthority for EtcdMetadataStore {
                     error
                 ))
             })?;
+            record.validate_schema_version()?;
             records.push(record);
         }
         records
@@ -864,9 +888,11 @@ impl TimelineAuthority for EtcdMetadataStore {
         let _timer = metrics::TSO_METADATA_LATENCY
             .with_label_values(&["create"])
             .start_timer();
+        record.validate_schema_version()?;
+        let stamped = record.stamped_for_persistence();
         self.create_json_record(
             self.timeline_key(timeline_key),
-            record,
+            &stamped,
             JsonTxnContext {
                 op_label: "create",
                 serialize_context: "Record serialization",
@@ -886,10 +912,12 @@ impl TimelineAuthority for EtcdMetadataStore {
         let _timer = metrics::TSO_METADATA_LATENCY
             .with_label_values(&["cas"])
             .start_timer();
+        record.validate_schema_version()?;
+        let stamped = record.stamped_for_persistence();
         self.cas_json_record(
             self.timeline_key(timeline_key),
             expected_revision,
-            record,
+            &stamped,
             JsonTxnContext {
                 op_label: "cas",
                 serialize_context: "Record serialization",
@@ -907,6 +935,9 @@ impl TimelineAuthority for EtcdMetadataStore {
         let _timer = metrics::TSO_METADATA_LATENCY
             .with_label_values(&["cas_batch"])
             .start_timer();
+        for operation in operations {
+            operation.record.validate_schema_version()?;
+        }
         self.cas_json_records_batch(
             operations
                 .iter()
@@ -914,7 +945,7 @@ impl TimelineAuthority for EtcdMetadataStore {
                     (
                         self.timeline_key(operation.timeline_key.as_str()),
                         operation.previous_revision,
-                        operation.record.clone(),
+                        operation.record.stamped_for_persistence(),
                     )
                 })
                 .collect(),
@@ -938,12 +969,19 @@ impl GeneratorLeaseAuthority for EtcdMetadataStore {
         let _timer = metrics::TSO_METADATA_LATENCY
             .with_label_values(&["get_generator"])
             .start_timer();
-        self.get_json_record(
-            self.generator_key(generator_id),
-            "get_generator",
-            "Generator record deserialization",
-        )
-        .await
+        let result: Option<(GeneratorRecord, u64)> = self
+            .get_json_record(
+                self.generator_key(generator_id),
+                "get_generator",
+                "Generator record deserialization",
+            )
+            .await?;
+        result
+            .map(|(record, revision)| {
+                record.validate_schema_version()?;
+                Ok((record, revision))
+            })
+            .transpose()
     }
 
     async fn create_generator(
@@ -954,9 +992,11 @@ impl GeneratorLeaseAuthority for EtcdMetadataStore {
         let _timer = metrics::TSO_METADATA_LATENCY
             .with_label_values(&["create_generator"])
             .start_timer();
+        record.validate_schema_version()?;
+        let stamped = record.stamped_for_persistence();
         self.create_json_record(
             self.generator_key(generator_id),
-            record,
+            &stamped,
             JsonTxnContext {
                 op_label: "create_generator",
                 serialize_context: "Generator record serialization",
@@ -976,10 +1016,12 @@ impl GeneratorLeaseAuthority for EtcdMetadataStore {
         let _timer = metrics::TSO_METADATA_LATENCY
             .with_label_values(&["cas_generator"])
             .start_timer();
+        record.validate_schema_version()?;
+        let stamped = record.stamped_for_persistence();
         self.cas_json_record(
             self.generator_key(generator_id),
             expected_revision,
-            record,
+            &stamped,
             JsonTxnContext {
                 op_label: "cas_generator",
                 serialize_context: "Generator record serialization",
@@ -997,6 +1039,9 @@ impl GeneratorLeaseAuthority for EtcdMetadataStore {
         let _timer = metrics::TSO_METADATA_LATENCY
             .with_label_values(&["cas_generator_batch"])
             .start_timer();
+        for operation in operations {
+            operation.record.validate_schema_version()?;
+        }
         self.cas_json_records_batch(
             operations
                 .iter()
@@ -1004,7 +1049,7 @@ impl GeneratorLeaseAuthority for EtcdMetadataStore {
                     (
                         self.generator_key(operation.generator_id),
                         operation.previous_revision,
-                        operation.record.clone(),
+                        operation.record.stamped_for_persistence(),
                     )
                 })
                 .collect(),
@@ -1083,6 +1128,7 @@ mod tests {
 
     fn sample_record(route: TimelineRoute) -> TimelineRecord {
         TimelineRecord {
+            schema_version: 1,
             route,
             state: TimelineLifecycleState::Active,
             recovery_floor_tso: None,
