@@ -52,6 +52,15 @@ fn test_endpoint(name: &str) -> String {
     format!("{name}:50051")
 }
 
+fn owner_filtered_status_request(owner_worker_endpoint: String) -> ListTimelineStatusesRequest {
+    ListTimelineStatusesRequest {
+        states: vec![TimelineState::Active as i32],
+        owner_worker_endpoint: Some(owner_worker_endpoint),
+        page_size: 10,
+        page_token: String::new(),
+    }
+}
+
 fn all_timeline_lifecycle_states() -> [TimelineLifecycleState; 5] {
     [
         TimelineLifecycleState::Creating,
@@ -114,7 +123,7 @@ async fn assert_owner_filtered_inventory_supports_planned_drain<M>(
 
     let route_service_a = TsoRouteService::new(service_a.control_plane());
     let control_service_b = TsoControlService::new(service_b.control_plane());
-    let status_service_from_old_owner = TsoTimelineStatusService::new(service_a.control_plane());
+    let status_service_via_worker_a = TsoTimelineStatusService::new(service_a.control_plane());
 
     for timeline_key in ["ops.inventory.timeline-a", "ops.inventory.timeline-b"] {
         route_service_a
@@ -126,13 +135,10 @@ async fn assert_owner_filtered_inventory_supports_planned_drain<M>(
             .expect("ensure_timeline should succeed");
     }
 
-    let inventory_before = status_service_from_old_owner
-        .list_timeline_statuses(Request::new(ListTimelineStatusesRequest {
-            states: vec![TimelineState::Active as i32],
-            owner_worker_endpoint: Some(test_endpoint("endpoint-a")),
-            page_size: 10,
-            page_token: String::new(),
-        }))
+    let inventory_before = status_service_via_worker_a
+        .list_timeline_statuses(Request::new(owner_filtered_status_request(test_endpoint(
+            "endpoint-a",
+        ))))
         .await
         .expect("list before transfer should succeed")
         .into_inner();
@@ -169,13 +175,10 @@ async fn assert_owner_filtered_inventory_supports_planned_drain<M>(
         .into_inner();
     assert_eq!(transfer.state, TimelineState::Active as i32);
 
-    let source_inventory_after = status_service_from_old_owner
-        .list_timeline_statuses(Request::new(ListTimelineStatusesRequest {
-            states: vec![TimelineState::Active as i32],
-            owner_worker_endpoint: Some(test_endpoint("endpoint-a")),
-            page_size: 10,
-            page_token: String::new(),
-        }))
+    let source_inventory_after = status_service_via_worker_a
+        .list_timeline_statuses(Request::new(owner_filtered_status_request(test_endpoint(
+            "endpoint-a",
+        ))))
         .await
         .expect("list on old owner after transfer should succeed")
         .into_inner();
@@ -196,13 +199,10 @@ async fn assert_owner_filtered_inventory_supports_planned_drain<M>(
         vec!["ops.inventory.timeline-b".to_string()]
     );
 
-    let target_inventory_after = status_service_from_old_owner
-        .list_timeline_statuses(Request::new(ListTimelineStatusesRequest {
-            states: vec![TimelineState::Active as i32],
-            owner_worker_endpoint: Some(test_endpoint("endpoint-b")),
-            page_size: 10,
-            page_token: String::new(),
-        }))
+    let target_inventory_after = status_service_via_worker_a
+        .list_timeline_statuses(Request::new(owner_filtered_status_request(test_endpoint(
+            "endpoint-b",
+        ))))
         .await
         .expect("list on old owner for new owner filter should succeed")
         .into_inner();
@@ -223,7 +223,7 @@ async fn assert_owner_filtered_inventory_supports_planned_drain<M>(
     assert_eq!(list_row.state, TimelineState::Active as i32);
     assert!(target_inventory_after.next_page_token.is_empty());
 
-    let point_read = status_service_from_old_owner
+    let point_read = status_service_via_worker_a
         .get_timeline_status(Request::new(GetTimelineStatusRequest {
             timeline_key: "ops.inventory.timeline-a".to_string(),
         }))

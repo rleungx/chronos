@@ -11,6 +11,37 @@ use crate::{
 
 use super::TsoService;
 
+struct CachedTimelineChecks {
+    owner_matches: bool,
+    route_matches_request: bool,
+    timeline_ready: bool,
+    state: TimelineLifecycleState,
+}
+
+impl CachedTimelineChecks {
+    fn new(
+        service: &TsoService,
+        request: &AllocateTimestampsRequest,
+        route: &TimelineRoute,
+        state: TimelineLifecycleState,
+    ) -> Self {
+        Self {
+            owner_matches: service.is_local_endpoint(&route.owner_worker_endpoint),
+            route_matches_request: TsoService::request_matches_timeline_route(request, route),
+            timeline_ready: TsoService::timeline_is_ready(state),
+            state,
+        }
+    }
+
+    fn matches_local_route(&self) -> bool {
+        self.owner_matches && self.route_matches_request
+    }
+
+    fn can_serve(&self, generator_still_matches: bool) -> bool {
+        self.matches_local_route() && self.timeline_ready && generator_still_matches
+    }
+}
+
 impl TsoService {
     pub(super) async fn try_allocate_from_cached_timeline(
         &self,
@@ -27,17 +58,15 @@ impl TsoService {
             let timeline_state = timeline_state_handle.lock().await;
             (timeline_state.route.clone(), timeline_state.state)
         };
-        let route_matches_request = Self::request_matches_timeline_route(request, &cached_route);
-        let owner_matches = self.is_local_endpoint(&cached_route.owner_worker_endpoint);
-        let timeline_ready = Self::timeline_is_ready(cached_state);
+        let checks = CachedTimelineChecks::new(self, request, &cached_route, cached_state);
 
-        if owner_matches && route_matches_request {
+        if checks.matches_local_route() {
             self.validate_batch_for_route(request.count, &cached_route)?;
         }
 
-        if owner_matches && route_matches_request {
+        if checks.matches_local_route() {
             let authority_matches = self
-                .cached_timeline_matches_authority(
+                .cached_timeline_still_matches_metadata(
                     &request.timeline_key,
                     &cached_route,
                     cached_state,
@@ -50,7 +79,7 @@ impl TsoService {
             }
         }
 
-        if owner_matches && route_matches_request && timeline_ready {
+        if checks.matches_local_route() && checks.timeline_ready {
             let generator_id = cached_route.generator_id;
             match self
                 .ensure_generator_lease_for_allocation_with_cancellation(
@@ -79,21 +108,21 @@ impl TsoService {
             }
         }
 
-        if owner_matches && route_matches_request && !timeline_ready {
+        if checks.matches_local_route() && !checks.timeline_ready {
             self.clear_timeline_cache(&request.timeline_key);
             return Err(TsoError::TimelineNotReady {
                 timeline_key: request.timeline_key.clone(),
-                state: cached_state,
+                state: checks.state,
             });
         }
-        if !owner_matches {
+        if !checks.owner_matches {
             self.clear_timeline_cache(&request.timeline_key);
         }
 
         Ok(None)
     }
 
-    async fn cached_timeline_matches_authority(
+    async fn cached_timeline_still_matches_metadata(
         &self,
         timeline_key: &str,
         cached_route: &TimelineRoute,
@@ -176,38 +205,34 @@ impl TsoService {
         cancellation: Option<RequestCancellation>,
     ) -> Result<Option<AllocateTimestampsResponse>, TsoError> {
         Self::check_request_cancellation(cancellation.as_ref())?;
-        let timeline_state = timeline_state_handle.lock().await;
-        let route_matches_request =
-            Self::request_matches_timeline_route(request, &timeline_state.route);
-        let owner_matches = self.is_local_endpoint(&timeline_state.route.owner_worker_endpoint);
-        let timeline_ready = Self::timeline_is_ready(timeline_state.state);
-        let current_state = timeline_state.state;
-        let generator_still_matches = timeline_state.route.generator_id == generator_id;
-        drop(timeline_state);
+        let (current_route, checks, generator_still_matches) = {
+            let timeline_state = timeline_state_handle.lock().await;
+            let route = timeline_state.route.clone();
+            let checks = CachedTimelineChecks::new(self, request, &route, timeline_state.state);
+            let generator_still_matches = route.generator_id == generator_id;
+            (route, checks, generator_still_matches)
+        };
 
-        if owner_matches && route_matches_request && !timeline_ready {
+        if checks.matches_local_route() && !checks.timeline_ready {
             self.clear_timeline_cache(&request.timeline_key);
             return Err(TsoError::TimelineNotReady {
                 timeline_key: request.timeline_key.clone(),
-                state: current_state,
+                state: checks.state,
             });
         }
-        if !owner_matches {
+        if !checks.owner_matches {
             self.clear_timeline_cache(&request.timeline_key);
             return Ok(None);
         }
-        if !(owner_matches && route_matches_request && timeline_ready && generator_still_matches) {
+        if !checks.can_serve(generator_still_matches) {
             return Ok(None);
         }
 
         let authority_matches = self
-            .cached_timeline_matches_authority(
+            .cached_timeline_still_matches_metadata(
                 &request.timeline_key,
-                &{
-                    let timeline_state = timeline_state_handle.lock().await;
-                    timeline_state.route.clone()
-                },
-                current_state,
+                &current_route,
+                checks.state,
                 cancellation.clone(),
             )
             .await?;

@@ -78,6 +78,43 @@ fn explicit_dev_insecure_local_config(bind_addr: SocketAddr) -> TsoConfig {
     }
 }
 
+fn test_health_status_handle() -> HealthStatusHandle {
+    HealthStatusHandle::serving(&chronos::HealthInfo {
+        generator_count: 0,
+        timeline_count: 0,
+        worker_id: "worker-a".into(),
+        instance_id: "instance-a".into(),
+        advertise_endpoint: "endpoint-a:50051".into(),
+    })
+}
+
+fn test_shutdown_identity() -> super::runtime::ShutdownIdentity<'static> {
+    super::runtime::ShutdownIdentity {
+        worker_id: "worker-a",
+        instance_id: "instance-a",
+        advertise_endpoint: "endpoint-a:50051",
+    }
+}
+
+fn shutdown_watch_pair() -> (watch::Sender<bool>, watch::Receiver<bool>) {
+    watch::channel(false)
+}
+
+fn test_shutdown_context(
+    ready: Arc<AtomicBool>,
+    health_status: HealthStatusHandle,
+    shutdown_tx: watch::Sender<bool>,
+) -> super::runtime::ShutdownContext {
+    super::runtime::ShutdownContext {
+        ready,
+        health_status,
+        shutdown_tx,
+        worker_id: "worker-a".into(),
+        instance_id: "instance-a".into(),
+        advertise_endpoint: "endpoint-a".into(),
+    }
+}
+
 struct MetricsTlsFixture {
     _dir: PathBuf,
     ca_cert_path: String,
@@ -1130,14 +1167,8 @@ fn request_shutdown_flips_readiness_and_notifies_watchers() {
     let _guard = STARTUP_READY_LOCK.lock().unwrap();
     let ready = Arc::new(AtomicBool::new(true));
     set_startup_ready(&ready, true);
-    let health_status = HealthStatusHandle::serving(&chronos::HealthInfo {
-        generator_count: 0,
-        timeline_count: 0,
-        worker_id: "worker-a".into(),
-        instance_id: "instance-a".into(),
-        advertise_endpoint: "endpoint-a:50051".into(),
-    });
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let health_status = test_health_status_handle();
+    let (shutdown_tx, shutdown_rx) = shutdown_watch_pair();
 
     let before = metrics::TSO_WORKER_READINESS_TRANSITIONS_TOTAL
         .with_label_values(&["ready", "degraded", "shutting_down"])
@@ -1147,11 +1178,7 @@ fn request_shutdown_flips_readiness_and_notifies_watchers() {
         &ready,
         &health_status,
         &shutdown_tx,
-        super::runtime::ShutdownIdentity {
-            worker_id: "worker-a",
-            instance_id: "instance-a",
-            advertise_endpoint: "endpoint-a:50051",
-        },
+        test_shutdown_identity(),
         ShutdownTrigger::ProcessSignal("signal_ctrl_c"),
     );
 
@@ -1180,14 +1207,8 @@ async fn critical_server_failure_requests_shutdown_and_returns_error() {
     let _guard = STARTUP_READY_LOCK.lock().unwrap();
     let ready = Arc::new(AtomicBool::new(true));
     set_startup_ready(&ready, true);
-    let health_status = HealthStatusHandle::serving(&chronos::HealthInfo {
-        generator_count: 0,
-        timeline_count: 0,
-        worker_id: "worker-a".into(),
-        instance_id: "instance-a".into(),
-        advertise_endpoint: "endpoint-a:50051".into(),
-    });
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let health_status = test_health_status_handle();
+    let (shutdown_tx, shutdown_rx) = shutdown_watch_pair();
     let before = metrics::TSO_SHUTDOWN_TOTAL
         .with_label_values(&["critical_server_failed_grpc"])
         .get();
@@ -1242,14 +1263,8 @@ async fn unexpected_critical_server_exit_without_shutdown_is_fatal() {
     let _guard = STARTUP_READY_LOCK.lock().unwrap();
     let ready = Arc::new(AtomicBool::new(true));
     set_startup_ready(&ready, true);
-    let health_status = HealthStatusHandle::serving(&chronos::HealthInfo {
-        generator_count: 0,
-        timeline_count: 0,
-        worker_id: "worker-a".into(),
-        instance_id: "instance-a".into(),
-        advertise_endpoint: "endpoint-a:50051".into(),
-    });
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let health_status = test_health_status_handle();
+    let (shutdown_tx, shutdown_rx) = shutdown_watch_pair();
 
     let result = tokio::time::timeout(
         Duration::from_secs(1),
@@ -1286,14 +1301,8 @@ fn request_shutdown_preserves_identity_lease_loss_precedence() {
     let _guard = STARTUP_READY_LOCK.lock().unwrap();
     let ready = Arc::new(AtomicBool::new(true));
     set_startup_ready(&ready, true);
-    let health_status = HealthStatusHandle::serving(&chronos::HealthInfo {
-        generator_count: 0,
-        timeline_count: 0,
-        worker_id: "worker-a".into(),
-        instance_id: "instance-a".into(),
-        advertise_endpoint: "endpoint-a:50051".into(),
-    });
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let health_status = test_health_status_handle();
+    let (shutdown_tx, shutdown_rx) = shutdown_watch_pair();
     let before_lost = metrics::TSO_WORKER_READINESS_TRANSITIONS_TOTAL
         .with_label_values(&["ready", "degraded", "identity_lease_lost"])
         .get();
@@ -1305,22 +1314,14 @@ fn request_shutdown_preserves_identity_lease_loss_precedence() {
         &ready,
         &health_status,
         &shutdown_tx,
-        super::runtime::ShutdownIdentity {
-            worker_id: "worker-a",
-            instance_id: "instance-a",
-            advertise_endpoint: "endpoint-a:50051",
-        },
+        test_shutdown_identity(),
         ShutdownTrigger::IdentityLeaseLost,
     );
     request_shutdown(
         &ready,
         &health_status,
         &shutdown_tx,
-        super::runtime::ShutdownIdentity {
-            worker_id: "worker-a",
-            instance_id: "instance-a",
-            advertise_endpoint: "endpoint-a:50051",
-        },
+        test_shutdown_identity(),
         ShutdownTrigger::ProcessSignal("signal_ctrl_c"),
     );
 
@@ -1551,14 +1552,7 @@ async fn identity_lease_loss_flips_readiness_and_triggers_shutdown() {
     let monitor = spawn_identity_lease_loss_monitor(
         lost_rx,
         service.clone(),
-        super::runtime::ShutdownContext {
-            ready: ready.clone(),
-            health_status: health_status.clone(),
-            shutdown_tx,
-            worker_id: "worker-a".into(),
-            instance_id: "instance-a".into(),
-            advertise_endpoint: "endpoint-a".into(),
-        },
+        test_shutdown_context(ready.clone(), health_status.clone(), shutdown_tx),
     );
 
     lost_tx.send(true).unwrap();
@@ -1624,14 +1618,7 @@ async fn identity_lease_loss_monitor_triggers_shutdown_when_receiver_is_already_
     let monitor = spawn_identity_lease_loss_monitor(
         lost_rx,
         service.clone(),
-        super::runtime::ShutdownContext {
-            ready: ready.clone(),
-            health_status: health_status.clone(),
-            shutdown_tx,
-            worker_id: "worker-a".into(),
-            instance_id: "instance-a".into(),
-            advertise_endpoint: "endpoint-a".into(),
-        },
+        test_shutdown_context(ready.clone(), health_status.clone(), shutdown_tx),
     );
 
     monitor.await.unwrap();
