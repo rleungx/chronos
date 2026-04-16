@@ -40,6 +40,21 @@ async fn service_with_config(
     (clock, service)
 }
 
+fn memory_two_worker_services(
+    base: TsoConfig,
+    clock: Arc<ManualClock>,
+    metadata: Arc<MemoryMetadataStore>,
+) -> (Arc<TsoService>, Arc<TsoService>) {
+    let service_a = TsoService::new(
+        with_worker(base.clone(), "worker-a"),
+        clock.clone(),
+        metadata.clone(),
+    )
+    .unwrap();
+    let service_b = TsoService::new(with_worker(base, "worker-b"), clock, metadata).unwrap();
+    (service_a, service_b)
+}
+
 fn worker_endpoint(worker_id: &str) -> String {
     format!("{worker_id}:50051")
 }
@@ -813,15 +828,7 @@ async fn stale_cached_route_from_another_service_returns_route_mismatch_and_refr
     };
     let clock = Arc::new(ManualClock::new(20_000));
     let metadata = Arc::new(MemoryMetadataStore::new());
-
-    let service_a = TsoService::new(
-        with_worker(base.clone(), "worker-a"),
-        clock.clone(),
-        metadata.clone(),
-    )
-    .unwrap();
-    let service_b =
-        TsoService::new(with_worker(base, "worker-b"), clock.clone(), metadata).unwrap();
+    let (service_a, service_b) = memory_two_worker_services(base, clock.clone(), metadata);
 
     let route_a = service_a
         .ensure_timeline("shared-metadata.timeline")
@@ -904,18 +911,8 @@ async fn stale_cached_route_from_another_service_returns_route_mismatch_and_refr
 async fn concurrent_ensure_returns_single_metadata_record_for_same_timeline() {
     let clock = Arc::new(ManualClock::new(21_000));
     let metadata = Arc::new(MemoryMetadataStore::new());
-    let service_a = TsoService::new(
-        with_worker(TsoConfig::default(), "worker-a"),
-        clock.clone(),
-        metadata.clone(),
-    )
-    .unwrap();
-    let service_b = TsoService::new(
-        with_worker(TsoConfig::default(), "worker-b"),
-        clock,
-        metadata.clone(),
-    )
-    .unwrap();
+    let (service_a, service_b) =
+        memory_two_worker_services(TsoConfig::default(), clock, metadata.clone());
 
     let h1 = tokio::spawn({
         let s = service_a.clone();
@@ -982,18 +979,7 @@ async fn reused_endpoint_does_not_bypass_instance_fencing() {
 async fn different_worker_cannot_allocate_timeline_without_transfer() {
     let clock = Arc::new(ManualClock::new(23_000));
     let metadata = Arc::new(MemoryMetadataStore::new());
-    let service_a = TsoService::new(
-        with_worker(TsoConfig::default(), "worker-a"),
-        clock.clone(),
-        metadata.clone(),
-    )
-    .unwrap();
-    let service_b = TsoService::new(
-        with_worker(TsoConfig::default(), "worker-b"),
-        clock,
-        metadata,
-    )
-    .unwrap();
+    let (service_a, service_b) = memory_two_worker_services(TsoConfig::default(), clock, metadata);
 
     let route = service_a
         .ensure_timeline("owner-fence.timeline")
@@ -1592,13 +1578,7 @@ async fn failover_recovery_floor_survives_remote_restart_before_first_allocation
     let shared_generators = base.shared_generators;
     let clock = Arc::new(ManualClock::new(26_000));
     let metadata = Arc::new(MemoryMetadataStore::new());
-
-    let service_a = TsoService::new(
-        with_worker(base.clone(), "worker-a"),
-        clock.clone(),
-        metadata.clone(),
-    )
-    .unwrap();
+    let (service_a, _) = memory_two_worker_services(base.clone(), clock.clone(), metadata.clone());
 
     let route_a = service_a
         .ensure_timeline("failover.restart.floor.timeline")
