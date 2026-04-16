@@ -10,7 +10,7 @@ use crate::proto::v1::{
 use crate::timeline_proxy::TimelineScopedAllocator;
 use crate::{
     AllocateTimestampsRequest as InternalAllocateTimestampsRequest, ResourceTier, TimestampRange,
-    TsoControlPlane, TsoDataPlane,
+    TsoControlPlane, TsoDataPlane, TsoError,
 };
 
 use super::{status_mapping, translation};
@@ -25,12 +25,14 @@ impl TsoRouteService {
     }
 }
 
-fn decode_resource_tier(resource_tier: i32) -> ResourceTier {
+fn decode_resource_tier(resource_tier: i32) -> Result<ResourceTier, TsoError> {
     match ProtoResourceTier::try_from(resource_tier) {
-        Ok(ProtoResourceTier::Shared) => ResourceTier::Shared,
-        Ok(ProtoResourceTier::Warm) => ResourceTier::Warm,
-        Ok(ProtoResourceTier::Dedicated) => ResourceTier::Dedicated,
-        _ => ResourceTier::Shared,
+        Ok(ProtoResourceTier::Shared) => Ok(ResourceTier::Shared),
+        Ok(ProtoResourceTier::Warm) => Ok(ResourceTier::Warm),
+        Ok(ProtoResourceTier::Dedicated) => Ok(ResourceTier::Dedicated),
+        Ok(ProtoResourceTier::Unspecified) | Err(_) => {
+            Err(TsoError::InvalidResourceTier { value: resource_tier })
+        }
     }
 }
 
@@ -58,7 +60,8 @@ impl TimelineRouteService for TsoRouteService {
         request: Request<EnsureTimelineRequest>,
     ) -> Result<Response<EnsureTimelineResponse>, Status> {
         let req = request.into_inner();
-        let tier = decode_resource_tier(req.desired_resource_tier);
+        let tier = decode_resource_tier(req.desired_resource_tier)
+            .map_err(translation::map_tso_error)?;
 
         match self
             .control_plane
@@ -139,14 +142,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn decode_resource_tier_defaults_unknown_values_to_shared() {
-        assert_eq!(decode_resource_tier(-1), ResourceTier::Shared);
+    fn decode_resource_tier_rejects_invalid_values() {
+        assert!(decode_resource_tier(-1).is_err());
+        assert!(decode_resource_tier(ProtoResourceTier::Unspecified as i32).is_err());
         assert_eq!(
-            decode_resource_tier(ProtoResourceTier::Warm as i32),
+            decode_resource_tier(ProtoResourceTier::Warm as i32).unwrap(),
             ResourceTier::Warm
         );
         assert_eq!(
-            decode_resource_tier(ProtoResourceTier::Dedicated as i32),
+            decode_resource_tier(ProtoResourceTier::Dedicated as i32).unwrap(),
             ResourceTier::Dedicated
         );
     }

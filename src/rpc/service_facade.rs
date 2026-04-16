@@ -162,6 +162,7 @@ mod tests {
         )
         .unwrap();
         let timeline = TimelineRecord {
+            schema_version: 1,
             route: TimelineRoute {
                 timeline_key: "timeline.status".into(),
                 generator_id: 7,
@@ -178,6 +179,7 @@ mod tests {
             updated_at_ms: 10,
         };
         let generator = GeneratorRecord {
+            schema_version: 1,
             generator_id: 7,
             owner_worker_endpoint: "worker-a:50051".into(),
             owner_instance_id: "instance-a".into(),
@@ -235,6 +237,7 @@ mod tests {
         )
         .unwrap();
         let timeline = TimelineRecord {
+            schema_version: 1,
             route: TimelineRoute {
                 timeline_key: "timeline.mismatch".into(),
                 generator_id: 7,
@@ -251,6 +254,7 @@ mod tests {
             updated_at_ms: 10,
         };
         let generator = GeneratorRecord {
+            schema_version: 1,
             generator_id: 7,
             owner_worker_endpoint: "worker-b:50051".into(),
             owner_instance_id: "instance-b".into(),
@@ -316,6 +320,7 @@ mod tests {
         .unwrap();
 
         let timeline_a = TimelineRecord {
+            schema_version: 1,
             route: TimelineRoute {
                 timeline_key: "timeline-a".into(),
                 generator_id: 1,
@@ -332,6 +337,7 @@ mod tests {
             updated_at_ms: 11,
         };
         let timeline_b = TimelineRecord {
+            schema_version: 1,
             route: TimelineRoute {
                 timeline_key: "timeline-b".into(),
                 generator_id: 2,
@@ -348,6 +354,7 @@ mod tests {
             updated_at_ms: 22,
         };
         let timeline_c = TimelineRecord {
+            schema_version: 1,
             route: TimelineRoute {
                 timeline_key: "timeline-c".into(),
                 generator_id: 3,
@@ -365,6 +372,7 @@ mod tests {
         };
         let generators = [
             GeneratorRecord {
+                schema_version: 1,
                 generator_id: 1,
                 owner_worker_endpoint: "worker-a:50051".into(),
                 owner_instance_id: "instance-a".into(),
@@ -375,6 +383,7 @@ mod tests {
                 updated_at_ms: 14,
             },
             GeneratorRecord {
+                schema_version: 1,
                 generator_id: 2,
                 owner_worker_endpoint: "worker-a:50051".into(),
                 owner_instance_id: "instance-b".into(),
@@ -385,6 +394,7 @@ mod tests {
                 updated_at_ms: 24,
             },
             GeneratorRecord {
+                schema_version: 1,
                 generator_id: 3,
                 owner_worker_endpoint: "worker-b:50051".into(),
                 owner_instance_id: "instance-c".into(),
@@ -536,6 +546,7 @@ mod tests {
         )
         .unwrap();
         let timeline_a = TimelineRecord {
+            schema_version: 1,
             route: TimelineRoute {
                 timeline_key: "timeline-a".into(),
                 generator_id: 7,
@@ -552,6 +563,7 @@ mod tests {
             updated_at_ms: 11,
         };
         let timeline_b = TimelineRecord {
+            schema_version: 1,
             route: TimelineRoute {
                 timeline_key: "timeline-b".into(),
                 generator_id: 8,
@@ -578,6 +590,7 @@ mod tests {
             .unwrap();
         for generator in [
             GeneratorRecord {
+                schema_version: 1,
                 generator_id: 7,
                 owner_worker_endpoint: "worker-a:50051".into(),
                 owner_instance_id: "instance-a".into(),
@@ -588,6 +601,7 @@ mod tests {
                 updated_at_ms: 15,
             },
             GeneratorRecord {
+                schema_version: 1,
                 generator_id: 8,
                 owner_worker_endpoint: "worker-a:50051".into(),
                 owner_instance_id: "instance-b".into(),
