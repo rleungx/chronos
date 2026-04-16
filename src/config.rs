@@ -15,6 +15,9 @@ pub const DEFAULT_MAX_TIMELINE_PROXY_LANES: usize = 4_096;
 pub const DEFAULT_MAX_TIMELINE_RUNTIME_ENTRIES: usize = 4_096;
 pub const DEFAULT_MAX_CONCURRENT_TIMELINE_LOADS: usize = 64;
 pub const DEFAULT_MAX_BATCH_PER_REQUEST: u32 = 4_096;
+// Production profile currently keeps the same capacity ceilings as the baseline defaults.
+// Separate constants keep that policy explicit and allow tightening later without reshaping
+// the profile application logic.
 pub const PRODUCTION_MAX_BATCH_PER_REQUEST: u32 = 4_096;
 pub const PRODUCTION_MAX_TIMELINE_PROXY_LANES: usize = 4_096;
 pub const PRODUCTION_MAX_TIMELINE_RUNTIME_ENTRIES: usize = 4_096;
@@ -131,6 +134,7 @@ pub struct TsoConfig {
     pub max_future_borrow_ms: u64,
     pub default_resource_tier: ResourceTier,
     pub lease_ttl_ms: u64,
+    // A value of 0 means "inherit lease_ttl_ms" during service construction.
     pub generator_lease_ttl_ms: u64,
     pub generator_maintenance_interval_ms: u64,
     pub generator_ownership_modulo: u32,

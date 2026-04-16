@@ -26,7 +26,7 @@ pub(crate) struct EtcdStartupConfig {
 
 #[derive(Debug, Clone)]
 struct MetadataEnvConfig {
-    kind: String,
+    metadata_kind: String,
     etcd_endpoints: Vec<String>,
     etcd_prefix: String,
 }
@@ -165,14 +165,14 @@ fn apply_identity_env(config: &mut TsoConfig) {
 
 fn load_metadata_env() -> MetadataEnvConfig {
     MetadataEnvConfig {
-        kind: effective_metadata_kind(),
+        metadata_kind: effective_metadata_kind(),
         etcd_endpoints: read_csv_env("CHRONOS_ETCD_ENDPOINTS"),
         etcd_prefix: read_env_or_default("CHRONOS_ETCD_PREFIX", DEFAULT_ETCD_PREFIX),
     }
 }
 
 fn apply_metadata_env(config: &mut TsoConfig, metadata: &MetadataEnvConfig) {
-    config.metadata_kind = metadata.kind.clone();
+    config.metadata_kind = metadata.metadata_kind.clone();
     config.etcd_endpoints = metadata.etcd_endpoints.clone();
 }
 

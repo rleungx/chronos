@@ -78,7 +78,7 @@ impl StartupWorkerReadinessSink {
         }
     }
 
-    fn maybe_record_transition(
+    fn record_transition_if_changed(
         &self,
         previous_state: WorkerReadinessState,
         previous_reason: WorkerReadinessReason,
@@ -104,7 +104,7 @@ impl WorkerReadinessSink for StartupWorkerReadinessSink {
         let previous_reason = self.health_status.readiness_reason();
         self.health_status.mark_ownership_drift();
         if let Some((new_state, new_reason)) =
-            self.maybe_record_transition(previous_state, previous_reason)
+            self.record_transition_if_changed(previous_state, previous_reason)
         {
             set_startup_ready(&self.ready, false);
             warn!(
@@ -131,7 +131,7 @@ impl WorkerReadinessSink for StartupWorkerReadinessSink {
         let previous_reason = self.health_status.readiness_reason();
         self.health_status.clear_ownership_drift();
         if let Some((new_state, new_reason)) =
-            self.maybe_record_transition(previous_state, previous_reason)
+            self.record_transition_if_changed(previous_state, previous_reason)
         {
             if self.startup_complete.load(Ordering::Acquire)
                 && new_state == WorkerReadinessState::Ready

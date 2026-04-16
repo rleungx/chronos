@@ -109,7 +109,7 @@ fn proto_timeline_failover_readiness(
     }
 }
 
-fn proto_timeline_state(state: TimelineLifecycleState) -> i32 {
+pub(super) fn proto_timeline_state(state: TimelineLifecycleState) -> i32 {
     match state {
         TimelineLifecycleState::Creating => crate::proto::v1::TimelineState::Creating as i32,
         TimelineLifecycleState::Active => crate::proto::v1::TimelineState::Active as i32,

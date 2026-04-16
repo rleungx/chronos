@@ -1,11 +1,9 @@
 use tonic::Status;
 
-use crate::proto::v1::{
-    TimelineState as ProtoTimelineState, TransferTimelineRequest, TransferTimelineResponse,
-};
+use crate::proto::v1::{TransferTimelineRequest, TransferTimelineResponse};
 use crate::{TimelineLifecycleState, TimelineRoute, TransferReason, TsoControlPlane, TsoError};
 
-use super::translation;
+use super::{status_mapping, translation};
 
 pub(super) async fn transfer_timeline_response(
     control_plane: &TsoControlPlane,
@@ -55,11 +53,11 @@ fn normalize_transfer_request(
 
 fn resolve_target_owner_endpoint(
     advertise_endpoint: &str,
-    target_worker_id: Option<String>,
+    raw_target_owner_endpoint: Option<String>,
 ) -> Result<String, TsoError> {
-    match target_worker_id {
-        Some(target_worker_id) => {
-            let target_owner_endpoint = target_worker_id.trim();
+    match raw_target_owner_endpoint {
+        Some(raw_target_owner_endpoint) => {
+            let target_owner_endpoint = raw_target_owner_endpoint.trim();
             if target_owner_endpoint.is_empty() {
                 return Err(TsoError::InvalidTargetOwnerEndpoint);
             }
@@ -90,17 +88,7 @@ fn build_transfer_timeline_response(
         new_generator_id: route.generator_id,
         new_epoch: route.epoch,
         route_version: route.route_version,
-        state: proto_timeline_state(state),
-    }
-}
-
-fn proto_timeline_state(state: TimelineLifecycleState) -> i32 {
-    match state {
-        TimelineLifecycleState::Creating => ProtoTimelineState::Creating as i32,
-        TimelineLifecycleState::Active => ProtoTimelineState::Active as i32,
-        TimelineLifecycleState::Draining => ProtoTimelineState::Draining as i32,
-        TimelineLifecycleState::Locked => ProtoTimelineState::Locked as i32,
-        TimelineLifecycleState::Recovering => ProtoTimelineState::Recovering as i32,
+        state: status_mapping::proto_timeline_state(state),
     }
 }
 
@@ -108,6 +96,7 @@ fn proto_timeline_state(state: TimelineLifecycleState) -> i32 {
 mod tests {
     use super::*;
     use crate::ResourceTier;
+    use crate::proto::v1::TimelineState as ProtoTimelineState;
 
     #[test]
     fn normalize_transfer_request_defaults_target_owner_and_manual_reason() {
