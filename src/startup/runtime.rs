@@ -224,9 +224,7 @@ pub(crate) fn request_shutdown(
     ready: &Arc<AtomicBool>,
     health_status: &HealthStatusHandle,
     shutdown_tx: &watch::Sender<bool>,
-    worker_id: &str,
-    instance_id: &str,
-    advertise_endpoint: &str,
+    identity: ShutdownIdentity<'_>,
     trigger: ShutdownTrigger,
 ) {
     let previous_state = health_status.readiness_state();
@@ -252,9 +250,9 @@ pub(crate) fn request_shutdown(
         readiness_state = readiness_state_label(new_state),
         previous_readiness_reason = readiness_reason_label(previous_reason),
         readiness_reason = readiness_reason_label(new_reason),
-        worker_id,
-        instance_id,
-        advertise_endpoint
+        worker_id = identity.worker_id,
+        instance_id = identity.instance_id,
+        advertise_endpoint = identity.advertise_endpoint
     );
     set_startup_ready(ready, false);
     record_shutdown(trigger.label());
@@ -275,9 +273,7 @@ fn critical_server_failure_error(
 async fn await_server_shutdown_with_grace<F>(
     server: F,
     listener: CriticalStartupListener,
-    worker_id: &str,
-    instance_id: &str,
-    advertise_endpoint: &str,
+    identity: ShutdownIdentity<'_>,
 ) where
     F: std::future::Future<Output = AppResult<()>>,
 {
@@ -290,9 +286,9 @@ async fn await_server_shutdown_with_grace<F>(
                 result = "failure",
                 transport = listener.label(),
                 reason = %error,
-                worker_id,
-                instance_id,
-                advertise_endpoint
+                worker_id = identity.worker_id,
+                instance_id = identity.instance_id,
+                advertise_endpoint = identity.advertise_endpoint
             );
         }
         Err(_) => {
@@ -302,9 +298,9 @@ async fn await_server_shutdown_with_grace<F>(
                 result = "degraded",
                 transport = listener.label(),
                 shutdown_grace_ms = CRITICAL_SERVER_SHUTDOWN_GRACE.as_millis(),
-                worker_id,
-                instance_id,
-                advertise_endpoint
+                worker_id = identity.worker_id,
+                instance_id = identity.instance_id,
+                advertise_endpoint = identity.advertise_endpoint
             );
         }
     }
@@ -321,8 +317,21 @@ where
 {
     tokio::pin!(grpc_server);
     tokio::pin!(metrics_server);
+    let CriticalServerContext {
+        ready,
+        health_status,
+        shutdown_tx,
+        shutdown_rx,
+        worker_id,
+        instance_id,
+        advertise_endpoint,
+    } = context;
+    let shutdown_identity = ShutdownIdentity {
+        worker_id,
+        instance_id,
+        advertise_endpoint,
+    };
     let shutdown_requested = |shutdown_rx: &watch::Receiver<bool>| *shutdown_rx.borrow();
-    let shutdown_rx = context.shutdown_rx;
 
     tokio::select! {
         grpc_result = &mut grpc_server => {
@@ -337,39 +346,31 @@ where
                         "server exited without shutdown request",
                     );
                     request_shutdown(
-                        context.ready,
-                        context.health_status,
-                        context.shutdown_tx,
-                        context.worker_id,
-                        context.instance_id,
-                        context.advertise_endpoint,
+                        ready,
+                        health_status,
+                        shutdown_tx,
+                        shutdown_identity,
                         ShutdownTrigger::CriticalServerFailed(CriticalStartupListener::Grpc.label()),
                     );
                     await_server_shutdown_with_grace(
                         metrics_server,
                         CriticalStartupListener::Admin,
-                        context.worker_id,
-                        context.instance_id,
-                        context.advertise_endpoint,
+                        shutdown_identity,
                     ).await;
                     Err(error)
                 }
                 Err(error) => {
                     request_shutdown(
-                        context.ready,
-                        context.health_status,
-                        context.shutdown_tx,
-                        context.worker_id,
-                        context.instance_id,
-                        context.advertise_endpoint,
+                        ready,
+                        health_status,
+                        shutdown_tx,
+                        shutdown_identity,
                         ShutdownTrigger::CriticalServerFailed(CriticalStartupListener::Grpc.label()),
                     );
                     await_server_shutdown_with_grace(
                         metrics_server,
                         CriticalStartupListener::Admin,
-                        context.worker_id,
-                        context.instance_id,
-                        context.advertise_endpoint,
+                        shutdown_identity,
                     ).await;
                     Err(error)
                 }
@@ -387,39 +388,31 @@ where
                         "server exited without shutdown request",
                     );
                     request_shutdown(
-                        context.ready,
-                        context.health_status,
-                        context.shutdown_tx,
-                        context.worker_id,
-                        context.instance_id,
-                        context.advertise_endpoint,
+                        ready,
+                        health_status,
+                        shutdown_tx,
+                        shutdown_identity,
                         ShutdownTrigger::CriticalServerFailed(CriticalStartupListener::Admin.label()),
                     );
                     await_server_shutdown_with_grace(
                         grpc_server,
                         CriticalStartupListener::Grpc,
-                        context.worker_id,
-                        context.instance_id,
-                        context.advertise_endpoint,
+                        shutdown_identity,
                     ).await;
                     Err(error)
                 }
                 Err(error) => {
                     request_shutdown(
-                        context.ready,
-                        context.health_status,
-                        context.shutdown_tx,
-                        context.worker_id,
-                        context.instance_id,
-                        context.advertise_endpoint,
+                        ready,
+                        health_status,
+                        shutdown_tx,
+                        shutdown_identity,
                         ShutdownTrigger::CriticalServerFailed(CriticalStartupListener::Admin.label()),
                     );
                     await_server_shutdown_with_grace(
                         grpc_server,
                         CriticalStartupListener::Grpc,
-                        context.worker_id,
-                        context.instance_id,
-                        context.advertise_endpoint,
+                        shutdown_identity,
                     ).await;
                     Err(error)
                 }
@@ -438,28 +431,54 @@ pub(crate) struct CriticalServerContext<'a> {
     pub(crate) advertise_endpoint: &'a str,
 }
 
+#[derive(Clone)]
+pub(crate) struct ShutdownContext {
+    pub(crate) ready: Arc<AtomicBool>,
+    pub(crate) health_status: HealthStatusHandle,
+    pub(crate) shutdown_tx: watch::Sender<bool>,
+    pub(crate) worker_id: String,
+    pub(crate) instance_id: String,
+    pub(crate) advertise_endpoint: String,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ShutdownIdentity<'a> {
+    pub(crate) worker_id: &'a str,
+    pub(crate) instance_id: &'a str,
+    pub(crate) advertise_endpoint: &'a str,
+}
+
+impl ShutdownContext {
+    fn identity(&self) -> ShutdownIdentity<'_> {
+        ShutdownIdentity {
+            worker_id: &self.worker_id,
+            instance_id: &self.instance_id,
+            advertise_endpoint: &self.advertise_endpoint,
+        }
+    }
+
+    fn request_shutdown(&self, trigger: ShutdownTrigger) {
+        request_shutdown(
+            &self.ready,
+            &self.health_status,
+            &self.shutdown_tx,
+            self.identity(),
+            trigger,
+        );
+    }
+}
+
 pub(crate) fn spawn_identity_lease_loss_monitor(
     mut lost_rx: watch::Receiver<bool>,
-    ready: Arc<AtomicBool>,
-    health_status: HealthStatusHandle,
-    shutdown_tx: watch::Sender<bool>,
-    worker_id: String,
-    instance_id: String,
-    advertise_endpoint: String,
+    service: Arc<TsoService>,
+    shutdown: ShutdownContext,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        while lost_rx.changed().await.is_ok() {
-            if *lost_rx.borrow() {
+        loop {
+            if *lost_rx.borrow_and_update() {
                 record_identity_lease_event("lost");
-                request_shutdown(
-                    &ready,
-                    &health_status,
-                    &shutdown_tx,
-                    &worker_id,
-                    &instance_id,
-                    &advertise_endpoint,
-                    ShutdownTrigger::IdentityLeaseLost,
-                );
+                service.request_local_shutdown_gate();
+                shutdown.request_shutdown(ShutdownTrigger::IdentityLeaseLost);
                 error!(
                     component = "identity_lease",
                     event = "keepalive_lost",
@@ -467,11 +486,14 @@ pub(crate) fn spawn_identity_lease_loss_monitor(
                     action_kind = "identity_lease",
                     action_outcome = "failed",
                     readiness_reason = "identity_lease_lost",
-                    worker_id,
-                    instance_id,
-                    advertise_endpoint,
+                    worker_id = shutdown.worker_id,
+                    instance_id = shutdown.instance_id,
+                    advertise_endpoint = shutdown.advertise_endpoint,
                     action = "shutdown"
                 );
+                break;
+            }
+            if lost_rx.changed().await.is_err() {
                 break;
             }
         }
@@ -495,26 +517,11 @@ async fn wait_for_process_signal() -> Result<&'static str, std::io::Error> {
     Ok("signal_ctrl_c")
 }
 
-fn spawn_process_signal_monitor(
-    ready: Arc<AtomicBool>,
-    health_status: HealthStatusHandle,
-    shutdown_tx: watch::Sender<bool>,
-    worker_id: String,
-    instance_id: String,
-    advertise_endpoint: String,
-) -> tokio::task::JoinHandle<()> {
+fn spawn_process_signal_monitor(shutdown: ShutdownContext) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         match wait_for_process_signal().await {
             Ok(reason) => {
-                request_shutdown(
-                    &ready,
-                    &health_status,
-                    &shutdown_tx,
-                    &worker_id,
-                    &instance_id,
-                    &advertise_endpoint,
-                    ShutdownTrigger::ProcessSignal(reason),
-                );
+                shutdown.request_shutdown(ShutdownTrigger::ProcessSignal(reason));
                 warn!(
                     component = "shutdown",
                     event = "signal_received",
@@ -522,9 +529,9 @@ fn spawn_process_signal_monitor(
                     action_kind = "signal",
                     action_outcome = "received",
                     shutdown_trigger = reason,
-                    worker_id,
-                    instance_id,
-                    advertise_endpoint,
+                    worker_id = shutdown.worker_id,
+                    instance_id = shutdown.instance_id,
+                    advertise_endpoint = shutdown.advertise_endpoint,
                     action = "signal"
                 );
             }
@@ -680,6 +687,21 @@ pub(crate) async fn run() -> AppResult<()> {
         config.advertise_endpoint.clone(),
     )));
     let mut identity_lease = identity_lease;
+    let shutdown_context = ShutdownContext {
+        ready: ready.clone(),
+        health_status: health_status.clone(),
+        shutdown_tx: shutdown_tx.clone(),
+        worker_id: config.worker_id.clone(),
+        instance_id: config.effective_instance_id().to_string(),
+        advertise_endpoint: config.advertise_endpoint.clone(),
+    };
+    if let Some(identity_lease) = identity_lease.as_ref() {
+        spawn_identity_lease_loss_monitor(
+            identity_lease.lost_receiver(),
+            service.clone(),
+            shutdown_context.clone(),
+        );
+    }
     let mut serving_gate = StartupServingGate::default();
     let (metrics_listener, metrics_tls_acceptor) = bind_metrics_listener(config).await?;
     let metrics_addr = metrics_listener.local_addr()?;
@@ -774,25 +796,7 @@ pub(crate) async fn run() -> AppResult<()> {
         );
     }
 
-    if let Some(identity_lease) = identity_lease.as_ref() {
-        spawn_identity_lease_loss_monitor(
-            identity_lease.lost_receiver(),
-            ready.clone(),
-            health_status.clone(),
-            shutdown_tx.clone(),
-            config.worker_id.clone(),
-            config.effective_instance_id().to_string(),
-            config.advertise_endpoint.clone(),
-        );
-    }
-    let signal_monitor = spawn_process_signal_monitor(
-        ready.clone(),
-        health_status.clone(),
-        shutdown_tx.clone(),
-        config.worker_id.clone(),
-        config.effective_instance_id().to_string(),
-        config.advertise_endpoint.clone(),
-    );
+    let signal_monitor = spawn_process_signal_monitor(shutdown_context.clone());
 
     let servers_result = supervise_critical_servers(
         CriticalServerContext {
@@ -809,10 +813,10 @@ pub(crate) async fn run() -> AppResult<()> {
     )
     .await;
     signal_monitor.abort();
+    service.shutdown().await;
     if let Some(identity_lease) = identity_lease.as_mut() {
         identity_lease.shutdown().await;
     }
-    service.shutdown().await;
     servers_result?;
     info!(
         component = "shutdown",

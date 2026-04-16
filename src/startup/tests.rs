@@ -16,7 +16,7 @@ use chronos::rpc::{
     HealthStatusHandle, TsoControlService, TsoRouteService, TsoTimelineStatusService,
     TsoTimestampService,
 };
-use chronos::{SystemClock, TsoError};
+use chronos::{ManualClock, SystemClock, TsoError};
 use futures::FutureExt;
 use std::env;
 use std::net::SocketAddr;
@@ -1147,9 +1147,11 @@ fn request_shutdown_flips_readiness_and_notifies_watchers() {
         &ready,
         &health_status,
         &shutdown_tx,
-        "worker-a",
-        "instance-a",
-        "endpoint-a:50051",
+        super::runtime::ShutdownIdentity {
+            worker_id: "worker-a",
+            instance_id: "instance-a",
+            advertise_endpoint: "endpoint-a:50051",
+        },
         ShutdownTrigger::ProcessSignal("signal_ctrl_c"),
     );
 
@@ -1303,18 +1305,22 @@ fn request_shutdown_preserves_identity_lease_loss_precedence() {
         &ready,
         &health_status,
         &shutdown_tx,
-        "worker-a",
-        "instance-a",
-        "endpoint-a:50051",
+        super::runtime::ShutdownIdentity {
+            worker_id: "worker-a",
+            instance_id: "instance-a",
+            advertise_endpoint: "endpoint-a:50051",
+        },
         ShutdownTrigger::IdentityLeaseLost,
     );
     request_shutdown(
         &ready,
         &health_status,
         &shutdown_tx,
-        "worker-a",
-        "instance-a",
-        "endpoint-a:50051",
+        super::runtime::ShutdownIdentity {
+            worker_id: "worker-a",
+            instance_id: "instance-a",
+            advertise_endpoint: "endpoint-a:50051",
+        },
         ShutdownTrigger::ProcessSignal("signal_ctrl_c"),
     );
 
@@ -1528,6 +1534,12 @@ async fn identity_lease_loss_flips_readiness_and_triggers_shutdown() {
     });
     let (lost_tx, lost_rx) = watch::channel(false);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let service = TsoService::new(
+        explicit_required_config(),
+        Arc::new(ManualClock::new(1_000)),
+        Arc::new(MemoryMetadataStore::new()),
+    )
+    .unwrap();
 
     let before_lost = metrics::TSO_IDENTITY_LEASE_EVENTS_TOTAL
         .with_label_values(&["lost"])
@@ -1538,12 +1550,15 @@ async fn identity_lease_loss_flips_readiness_and_triggers_shutdown() {
 
     let monitor = spawn_identity_lease_loss_monitor(
         lost_rx,
-        ready.clone(),
-        health_status.clone(),
-        shutdown_tx,
-        "worker-a".into(),
-        "instance-a".into(),
-        "endpoint-a".into(),
+        service.clone(),
+        super::runtime::ShutdownContext {
+            ready: ready.clone(),
+            health_status: health_status.clone(),
+            shutdown_tx,
+            worker_id: "worker-a".into(),
+            instance_id: "instance-a".into(),
+            advertise_endpoint: "endpoint-a".into(),
+        },
     );
 
     lost_tx.send(true).unwrap();
@@ -1551,6 +1566,13 @@ async fn identity_lease_loss_flips_readiness_and_triggers_shutdown() {
 
     assert!(!ready.load(Ordering::Relaxed));
     assert!(*shutdown_rx.borrow());
+    assert_eq!(
+        service
+            .ensure_timeline("identity-loss-local-gate")
+            .await
+            .unwrap_err(),
+        TsoError::ServiceShuttingDown
+    );
     assert_eq!(
         health_status.readiness_state(),
         WorkerReadinessState::Degraded
@@ -1577,6 +1599,51 @@ async fn identity_lease_loss_flips_readiness_and_triggers_shutdown() {
 
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
+async fn identity_lease_loss_monitor_triggers_shutdown_when_receiver_is_already_lost() {
+    let _guard = STARTUP_READY_LOCK.lock().unwrap();
+    let ready = Arc::new(AtomicBool::new(true));
+    set_startup_ready(&ready, true);
+    let health_status = HealthStatusHandle::serving(&chronos::HealthInfo {
+        generator_count: 0,
+        timeline_count: 0,
+        worker_id: "worker-a".into(),
+        instance_id: "instance-a".into(),
+        advertise_endpoint: "endpoint-a:50051".into(),
+    });
+    let (lost_tx, lost_rx) = watch::channel(false);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let service = TsoService::new(
+        explicit_required_config(),
+        Arc::new(ManualClock::new(1_000)),
+        Arc::new(MemoryMetadataStore::new()),
+    )
+    .unwrap();
+
+    lost_tx.send(true).unwrap();
+
+    let monitor = spawn_identity_lease_loss_monitor(
+        lost_rx,
+        service.clone(),
+        super::runtime::ShutdownContext {
+            ready: ready.clone(),
+            health_status: health_status.clone(),
+            shutdown_tx,
+            worker_id: "worker-a".into(),
+            instance_id: "instance-a".into(),
+            advertise_endpoint: "endpoint-a".into(),
+        },
+    );
+
+    monitor.await.unwrap();
+
+    assert!(!ready.load(Ordering::Relaxed));
+    assert!(*shutdown_rx.borrow());
+    assert_eq!(health_status.readiness_reason(), WorkerReadinessReason::IdentityLeaseLost);
+    assert!(!health_status.identity_lease_healthy());
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
 #[ignore = "requires a reachable etcd; set CHRONOS_TEST_ETCD_ENDPOINTS or run one on 127.0.0.1:2379"]
 async fn etcd_identity_lease_loss_flips_readiness_and_triggers_shutdown() {
     let _guard = ENV_LOCK.lock().unwrap();
@@ -1598,7 +1665,7 @@ async fn etcd_identity_lease_loss_flips_readiness_and_triggers_shutdown() {
     };
 
     let startup = etcd_startup_config(config.clone(), unique_prefix.clone());
-    let (_service, identity_lease) =
+    let (service, identity_lease) =
         tokio::time::timeout(Duration::from_secs(5), build_tso_service(&startup, clock))
             .await
             .expect("etcd startup timed out")
@@ -1626,12 +1693,15 @@ async fn etcd_identity_lease_loss_flips_readiness_and_triggers_shutdown() {
 
     let monitor = spawn_identity_lease_loss_monitor(
         identity_lease.lost_receiver(),
-        ready.clone(),
-        health_status.clone(),
-        shutdown_tx,
-        config.worker_id.clone(),
-        config.effective_instance_id().to_string(),
-        config.advertise_endpoint.clone(),
+        service.clone(),
+        super::runtime::ShutdownContext {
+            ready: ready.clone(),
+            health_status: health_status.clone(),
+            shutdown_tx,
+            worker_id: config.worker_id.clone(),
+            instance_id: config.effective_instance_id().to_string(),
+            advertise_endpoint: config.advertise_endpoint.clone(),
+        },
     );
 
     let mut client = etcd_client::Client::connect(parsed_endpoints, None)

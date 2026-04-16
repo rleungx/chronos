@@ -255,6 +255,10 @@ fn apply_timing_env(config: &mut TsoConfig) -> AppResult<()> {
         "CHRONOS_MAX_CLOCK_REWIND_MS",
         &mut config.max_clock_rewind_ms,
     )?;
+    apply_parsed_env(
+        "CHRONOS_RECOVERY_CATCHUP_BUDGET_MS",
+        &mut config.recovery_catchup_budget_ms,
+    )?;
     apply_parsed_env("CHRONOS_LEASE_TTL_MS", &mut config.lease_ttl_ms)?;
     apply_parsed_env(
         "CHRONOS_GENERATOR_LEASE_TTL_MS",

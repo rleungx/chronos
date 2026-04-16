@@ -16,12 +16,16 @@ pub(crate) async fn build_tso_service(
     startup: &LoadedStartupConfig,
     clock: Arc<SystemClock>,
 ) -> AppResult<(Arc<TsoService>, Option<InstanceIdentityLease>)> {
-    let config: &TsoConfig = &startup.config;
+    let mut service_config = startup.config.clone();
+    if service_config.instance_id.trim().is_empty() {
+        service_config.instance_id = startup.config.effective_instance_id().to_owned();
+    }
+    let config: &TsoConfig = &service_config;
     match &startup.metadata {
         StartupMetadata::Memory => {
             let metadata = Arc::new(MemoryMetadataStore::new());
             run_metadata_startup_probe(metadata.as_ref()).await?;
-            Ok((TsoService::new(config.clone(), clock, metadata)?, None))
+            Ok((TsoService::new(service_config, clock, metadata)?, None))
         }
         StartupMetadata::Etcd(etcd) => {
             let metadata = Arc::new(
@@ -40,13 +44,13 @@ pub(crate) async fn build_tso_service(
                     Duration::from_millis(config.lease_ttl_ms),
                 )
                 .await?;
-            finalize_etcd_startup(config, clock, metadata, identity_lease).await
+            finalize_etcd_startup(service_config, clock, metadata, identity_lease).await
         }
     }
 }
 
 async fn finalize_etcd_startup(
-    config: &TsoConfig,
+    config: TsoConfig,
     clock: Arc<SystemClock>,
     metadata: Arc<EtcdMetadataStore>,
     mut identity_lease: InstanceIdentityLease,
@@ -56,7 +60,7 @@ async fn finalize_etcd_startup(
         return Err(error);
     }
 
-    match TsoService::new(config.clone(), clock, metadata) {
+    match TsoService::new(config, clock, metadata) {
         Ok(service) => Ok((service, Some(identity_lease))),
         Err(error) => {
             identity_lease.shutdown().await;
