@@ -41,6 +41,24 @@ impl TsoService {
         }
     }
 
+    fn effective_future_borrow_ms_for_timeline_state(
+        &self,
+        timeline_state: &crate::runtime::TimelineState,
+        now_ms: u64,
+    ) -> u64 {
+        let base = self.effective_future_borrow_ms_for_route(&timeline_state.route);
+        let Some(recovery_floor_tso) = timeline_state.recovery_floor_tso else {
+            return base;
+        };
+        let recovery_physical_ms = crate::decode_tso(recovery_floor_tso).physical_ms;
+        if recovery_physical_ms <= now_ms {
+            return base;
+        }
+
+        let catchup_gap_ms = recovery_physical_ms - now_ms;
+        base.max(catchup_gap_ms.min(self.config.recovery_catchup_budget_ms))
+    }
+
     pub async fn ensure_timeline(&self, timeline_key: &str) -> Result<TimelineRoute, TsoError> {
         self.ensure_timeline_with_tier(timeline_key, self.config.default_resource_tier)
             .await
@@ -52,6 +70,7 @@ impl TsoService {
         resource_tier: ResourceTier,
     ) -> Result<TimelineRoute, TsoError> {
         loop {
+            self.reject_new_work_if_shutting_down()?;
             let cached_timeline = self.timeline_runtime.timeline_handle(timeline_key);
             if let Some(timeline_handle) = cached_timeline {
                 let timeline = timeline_handle.lock().await;
@@ -62,7 +81,10 @@ impl TsoService {
                 }
             }
 
-            match self.load_timeline_with_singleflight(timeline_key).await? {
+            match self
+                .load_timeline_with_singleflight_and_cancellation(timeline_key, None)
+                .await?
+            {
                 Some((record, revision)) => {
                     if self.is_local_endpoint(&record.route.owner_worker_endpoint) {
                         match self
@@ -100,6 +122,7 @@ impl TsoService {
                     };
 
                     let record = TimelineRecord {
+                        schema_version: 1,
                         route: route.clone(),
                         state: TimelineLifecycleState::Active,
                         recovery_floor_tso: None,
@@ -151,6 +174,7 @@ impl TsoService {
         }
 
         loop {
+            self.reject_new_work_if_shutting_down()?;
             Self::check_request_cancellation(cancellation.as_ref())?;
             if let Some(response) = self
                 .try_allocate_from_cached_timeline(&request, cancellation.clone())
@@ -160,7 +184,10 @@ impl TsoService {
             }
 
             let (timeline_record, revision) = self
-                .load_timeline_with_singleflight(&request.timeline_key)
+                .load_timeline_with_singleflight_and_cancellation(
+                    &request.timeline_key,
+                    cancellation.clone(),
+                )
                 .await?
                 .ok_or_else(|| TsoError::TimelineNotFound {
                     timeline_key: request.timeline_key.clone(),
@@ -218,7 +245,10 @@ impl TsoService {
                 )
                 .await?;
             let (timeline_record, revision) = self
-                .load_timeline_with_singleflight(&request.timeline_key)
+                .load_timeline_with_singleflight_and_cancellation(
+                    &request.timeline_key,
+                    cancellation.clone(),
+                )
                 .await?
                 .ok_or_else(|| TsoError::TimelineNotFound {
                     timeline_key: request.timeline_key.clone(),
@@ -288,6 +318,7 @@ mod tests {
         ControlPlaneStore, GeneratorBatchOp, GeneratorLeaseAuthority, GeneratorRecord,
         MemoryMetadataStore, RouteUpdateSource, TimelineAuthority, TimelineBatchOp, TimelineRecord,
     };
+    use crate::plane::RequestCancellation;
     use crate::{
         AllocateTimestampsRequest, Clock, ManualClock, ResourceTier, TimelineLifecycleState,
         TsoConfig, TsoError, TsoSecurityMode, TsoService,
@@ -756,6 +787,7 @@ mod tests {
             .create_timeline(
                 &route.timeline_key,
                 &TimelineRecord {
+                    schema_version: 1,
                     route: route.clone(),
                     state: TimelineLifecycleState::Active,
                     recovery_floor_tso: None,
@@ -834,6 +866,7 @@ mod tests {
                 .create_timeline(
                     &route.timeline_key,
                     &TimelineRecord {
+                        schema_version: 1,
                         route: route.clone(),
                         state: TimelineLifecycleState::Active,
                         recovery_floor_tso: None,
@@ -889,6 +922,96 @@ mod tests {
         assert_eq!(first.await.unwrap().unwrap(), route_a);
         assert_eq!(second.await.unwrap().unwrap(), route_b);
         assert_eq!(metadata.max_parallel_loads(), 1);
+    }
+
+    #[tokio::test]
+    async fn timeline_load_limiter_respects_request_cancellation() {
+        let clock = Arc::new(ManualClock::new(22_700));
+        let inner = Arc::new(MemoryMetadataStore::new());
+        for (timeline_key, generator_id) in [
+            ("allocation.timeline-load.cancel.a", 7),
+            ("allocation.timeline-load.cancel.b", 8),
+        ] {
+            inner
+                .create_timeline(
+                    timeline_key,
+                    &TimelineRecord {
+                        schema_version: 1,
+                        route: crate::TimelineRoute {
+                            timeline_key: timeline_key.into(),
+                            generator_id,
+                            owner_worker_endpoint: "127.0.0.1:59999".into(),
+                            epoch: 1,
+                            route_version: 1,
+                            resource_tier: crate::ResourceTier::Shared,
+                        },
+                        state: TimelineLifecycleState::Active,
+                        recovery_floor_tso: None,
+                        issued_upper_bound: None,
+                        last_graceful_issued: None,
+                        lease_expire_at_ms: None,
+                        updated_at_ms: clock.now_ms(),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        let (load_started_tx, load_started_rx) = oneshot::channel();
+        let (release_load_tx, release_load_rx) = oneshot::channel();
+        let metadata = Arc::new(BlockingTimelineLoadStore::new(
+            inner,
+            load_started_tx,
+            release_load_rx,
+        ));
+        let service = TsoService::new(
+            required_test_config(TsoConfig {
+                max_concurrent_timeline_loads: 1,
+                ..TsoConfig::default()
+            }),
+            clock,
+            metadata.clone(),
+        )
+        .unwrap();
+
+        metadata.arm_blocking_load();
+
+        let first_service = service.clone();
+        let first = tokio::spawn(async move {
+            first_service
+                .load_timeline_with_singleflight_and_cancellation(
+                    "allocation.timeline-load.cancel.a",
+                    None,
+                )
+                .await
+        });
+
+        load_started_rx
+            .await
+            .expect("the first cold-cache load should enter metadata");
+        assert_eq!(metadata.active_loads(), 1);
+
+        let cancellation = RequestCancellation::new();
+        let cancelled_service = service.clone();
+        let cancelled_request = cancellation.clone();
+        let second = tokio::spawn(async move {
+            cancelled_service
+                .load_timeline_with_singleflight_and_cancellation(
+                    "allocation.timeline-load.cancel.b",
+                    Some(cancelled_request),
+                )
+                .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        cancellation.cancel();
+
+        let error = second.await.unwrap().unwrap_err();
+        assert_eq!(error, TsoError::RequestCancelled);
+        assert_eq!(metadata.max_parallel_loads(), 1);
+
+        release_load_tx.send(()).unwrap();
+        first.await.unwrap().unwrap();
     }
 
     #[tokio::test]
@@ -1008,6 +1131,80 @@ mod tests {
                 state: TimelineLifecycleState::Draining,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn post_lease_guard_revalidates_authoritative_route_before_serving() {
+        let clock = Arc::new(ManualClock::new(31_500));
+        let inner = Arc::new(MemoryMetadataStore::new());
+        let metadata = Arc::new(SilentRouteUpdateStore::new(inner.clone()));
+        let service = TsoService::new(
+            required_test_config(TsoConfig::default()),
+            clock.clone(),
+            metadata,
+        )
+        .unwrap();
+
+        let route = service
+            .ensure_timeline("allocation.post-lease-cutover.timeline")
+            .await
+            .unwrap();
+        service
+            .allocate_timestamps(AllocateTimestampsRequest {
+                timeline_key: route.timeline_key.clone(),
+                count: 1,
+                expected_epoch: route.epoch,
+                expected_route_version: route.route_version,
+                client_request_id: "seed-post-lease-cutover".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let timeline_state_handle = service
+            .timeline_runtime
+            .timeline_handle(&route.timeline_key)
+            .expect("timeline should be cached after seed allocation");
+        let issued_upper_bound = service
+            .ensure_generator_lease_for_allocation_with_cancellation(
+                &route.timeline_key,
+                route.generator_id,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let (mut record, revision) = inner
+            .load_timeline(&route.timeline_key)
+            .await
+            .unwrap()
+            .unwrap();
+        record.route.route_version += 1;
+        record.updated_at_ms = clock.now_ms();
+        inner
+            .compare_exchange_timeline(&route.timeline_key, revision, &record)
+            .await
+            .unwrap();
+
+        let response = service
+            .try_serve_timeline_state_handle_with_guard(
+                &AllocateTimestampsRequest {
+                    timeline_key: route.timeline_key.clone(),
+                    count: 1,
+                    expected_epoch: route.epoch,
+                    expected_route_version: route.route_version,
+                    client_request_id: "post-lease-cutover".to_string(),
+                },
+                timeline_state_handle,
+                route.generator_id,
+                clock.now_ms(),
+                issued_upper_bound,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(response.is_none(), "post-lease guard should fail closed after cutover");
+        assert!(service.timeline_runtime.timeline_handle(&route.timeline_key).is_none());
     }
 
     #[tokio::test]
@@ -1233,6 +1430,7 @@ mod tests {
             resource_tier: crate::ResourceTier::Shared,
         };
         let record_b = TimelineRecord {
+            schema_version: 1,
             route: route_b.clone(),
             state: TimelineLifecycleState::Active,
             recovery_floor_tso: None,

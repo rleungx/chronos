@@ -5,7 +5,8 @@ use tokio::sync::Mutex;
 use crate::plane::RequestCancellation;
 use crate::runtime::TimelineState;
 use crate::{
-    metrics, AllocateTimestampsRequest, AllocateTimestampsResponse, TimelineRoute, TsoError,
+    metrics, AllocateTimestampsRequest, AllocateTimestampsResponse, TimelineLifecycleState,
+    TimelineRoute, TsoError,
 };
 
 use super::TsoService;
@@ -40,6 +41,7 @@ impl TsoService {
                     &request.timeline_key,
                     &cached_route,
                     cached_state,
+                    cancellation.clone(),
                 )
                 .await?;
             if !authority_matches {
@@ -95,13 +97,27 @@ impl TsoService {
         &self,
         timeline_key: &str,
         cached_route: &TimelineRoute,
-        cached_state: crate::TimelineLifecycleState,
+        cached_state: TimelineLifecycleState,
+        cancellation: Option<RequestCancellation>,
     ) -> Result<bool, TsoError> {
-        let Some((record, _)) = self.load_timeline_with_singleflight(timeline_key).await? else {
+        let Some((record, _)) = self
+            .load_timeline_with_singleflight_and_cancellation(timeline_key, cancellation)
+            .await?
+        else {
             return Ok(false);
         };
 
-        Ok(record.route == *cached_route && record.state == cached_state)
+        let Some((generator_record, _)) = self
+            .metadata
+            .load_generator(cached_route.generator_id)
+            .await?
+        else {
+            return Ok(false);
+        };
+
+        Ok(record.route == *cached_route
+            && record.state == cached_state
+            && self.is_local_generator_owner(&generator_record))
     }
 
     pub(super) async fn serve_allocation_from_timeline_state_handle(
@@ -119,7 +135,7 @@ impl TsoService {
             request.count,
             timeline_state.last_issued_tso,
             now_ms,
-            self.effective_future_borrow_ms_for_route(&timeline_state.route),
+            self.effective_future_borrow_ms_for_timeline_state(&timeline_state, now_ms),
             self.config.max_clock_rewind_ms,
             issued_upper_bound,
         ) {
@@ -181,6 +197,22 @@ impl TsoService {
             return Ok(None);
         }
         if !(owner_matches && route_matches_request && timeline_ready && generator_still_matches) {
+            return Ok(None);
+        }
+
+        let authority_matches = self
+            .cached_timeline_matches_authority(
+                &request.timeline_key,
+                &{
+                    let timeline_state = timeline_state_handle.lock().await;
+                    timeline_state.route.clone()
+                },
+                current_state,
+                cancellation.clone(),
+            )
+            .await?;
+        if !authority_matches {
+            self.clear_timeline_cache(&request.timeline_key);
             return Ok(None);
         }
 
