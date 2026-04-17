@@ -1,5 +1,4 @@
 use std::cmp::{max, min};
-use std::hint::spin_loop;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
 
@@ -29,6 +28,9 @@ impl Generator {
             .checked_mul(cap)
             .and_then(|value| value.checked_add(cursor.sequence as u64))
             .ok_or(TsoError::TsoOverflow)?;
+        // Monotonically advance the generator cursor before any subsequent allocation path can
+        // publish a smaller index. fetch_max keeps concurrent init/allocate races fail-closed by
+        // preserving the highest observed floor-derived position.
         self.next_index.fetch_max(index, AtomicOrdering::AcqRel);
         Ok(())
     }
@@ -56,6 +58,7 @@ impl Generator {
     ) -> Result<Vec<TimestampRange>, TsoError> {
         let cap = SEQUENCE_CAPACITY as u64;
         let count_u64 = u64::from(count);
+        let mut contention_retries = 0u32;
         let floor_index = match floor {
             Some(value) => {
                 let floor_cursor = next_cursor_after(value, self.id)?;
@@ -150,8 +153,19 @@ impl Generator {
                     metrics::TSO_SEQUENCE_UTILIZATION.set((new_index % cap) as i64);
                     return Ok(ranges);
                 }
-                Err(_) => spin_loop(),
+                Err(_) => {
+                    contention_retries = contention_retries.saturating_add(1);
+                    Self::contention_pause(contention_retries);
+                }
             }
+        }
+    }
+
+    fn contention_pause(retries: u32) {
+        if retries.is_multiple_of(8) {
+            std::thread::yield_now();
+        } else {
+            std::hint::spin_loop();
         }
     }
 }
@@ -368,6 +382,34 @@ mod tests {
                 issued_upper_bound: upper_bound,
             }
         );
+    }
+
+    #[test]
+    fn allocate_after_remains_unique_under_parallel_contention() {
+        let generator = Arc::new(Generator::new(9));
+        let mut handles = Vec::new();
+
+        for _ in 0..8 {
+            let generator = generator.clone();
+            handles.push(std::thread::spawn(move || {
+                let mut issued = Vec::new();
+                for _ in 0..64 {
+                    let range = generator.allocate_after(1, None, 10, 0, 0, None).unwrap();
+                    issued.push(range[0].start_tso);
+                }
+                issued
+            }));
+        }
+
+        let mut all = handles
+            .into_iter()
+            .flat_map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>();
+        let issued = all.len();
+        all.sort_unstable();
+        all.dedup();
+
+        assert_eq!(all.len(), issued);
     }
 
     #[test]

@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use crate::plane::RequestCancellation;
 use tokio::sync::Mutex;
+use self::serve::CachedServeGuardOptions;
 
 use crate::metadata::TimelineRecord;
 use crate::timeline_state::build_timeline_state;
@@ -244,42 +245,6 @@ impl TsoService {
                     cancellation.clone(),
                 )
                 .await?;
-            let (timeline_record, revision) = self
-                .load_timeline_with_singleflight_and_cancellation(
-                    &request.timeline_key,
-                    cancellation.clone(),
-                )
-                .await?
-                .ok_or_else(|| TsoError::TimelineNotFound {
-                    timeline_key: request.timeline_key.clone(),
-                })?;
-            if timeline_record.route.route_version != request.expected_route_version {
-                self.clear_timeline_cache(&request.timeline_key);
-                return Err(TsoError::RouteVersionMismatch {
-                    expected: request.expected_route_version,
-                    actual: timeline_record.route.route_version,
-                });
-            }
-            if timeline_record.route.epoch != request.expected_epoch {
-                self.clear_timeline_cache(&request.timeline_key);
-                return Err(TsoError::EpochMismatch {
-                    expected: request.expected_epoch,
-                    actual: timeline_record.route.epoch,
-                });
-            }
-            if !self.is_local_endpoint(&timeline_record.route.owner_worker_endpoint) {
-                self.clear_timeline_cache(&request.timeline_key);
-                return Err(TsoError::NotTimelineOwner {
-                    owner_worker_endpoint: timeline_record.route.owner_worker_endpoint,
-                });
-            }
-            if !Self::timeline_is_ready(timeline_record.state) {
-                self.clear_timeline_cache(&request.timeline_key);
-                return Err(TsoError::TimelineNotReady {
-                    timeline_key: request.timeline_key.clone(),
-                    state: timeline_record.state,
-                });
-            }
             let timeline_state_handle = self
                 .timeline_state_handle_from_record(
                     &request.timeline_key,
@@ -295,7 +260,10 @@ impl TsoService {
                     generator_id,
                     self.clock.now_ms(),
                     issued_upper_bound,
-                    cancellation.clone(),
+                    CachedServeGuardOptions {
+                        cancellation: cancellation.clone(),
+                        revalidate_authority: true,
+                    },
                 )
                 .await?
             {
@@ -323,6 +291,7 @@ mod tests {
         AllocateTimestampsRequest, Clock, ManualClock, ResourceTier, TimelineLifecycleState,
         TsoConfig, TsoError, TsoSecurityMode, TsoService,
     };
+    use super::serve::CachedServeGuardOptions;
 
     #[derive(Clone)]
     struct BlockingGeneratorLoadStore {
@@ -1185,9 +1154,9 @@ mod tests {
             .await
             .unwrap();
 
-        let response = service
-            .try_serve_timeline_state_handle_with_guard(
-                &AllocateTimestampsRequest {
+                let response = service
+                    .try_serve_timeline_state_handle_with_guard(
+                        &AllocateTimestampsRequest {
                     timeline_key: route.timeline_key.clone(),
                     count: 1,
                     expected_epoch: route.epoch,
@@ -1198,7 +1167,10 @@ mod tests {
                 route.generator_id,
                 clock.now_ms(),
                 issued_upper_bound,
-                None,
+                CachedServeGuardOptions {
+                    cancellation: None,
+                    revalidate_authority: true,
+                },
             )
             .await
             .unwrap();
@@ -1270,6 +1242,80 @@ mod tests {
                 timeline_key: route.timeline_key,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn allocation_fails_closed_after_cutover_without_second_full_reload() {
+        let clock = Arc::new(ManualClock::new(40_500));
+        let inner = Arc::new(MemoryMetadataStore::new());
+        let metadata = Arc::new(SilentRouteUpdateStore::new(inner.clone()));
+        let service = TsoService::new(
+            required_test_config(TsoConfig::default()),
+            clock.clone(),
+            metadata,
+        )
+        .unwrap();
+
+        let route = service
+            .ensure_timeline("allocation.slow-path-cutover.timeline")
+            .await
+            .unwrap();
+        service.clear_timeline_cache(&route.timeline_key);
+
+        let issued_upper_bound = service
+            .ensure_generator_lease_for_allocation_with_cancellation(
+                &route.timeline_key,
+                route.generator_id,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let (mut record, revision) = inner
+            .load_timeline(&route.timeline_key)
+            .await
+            .unwrap()
+            .unwrap();
+        record.route.route_version += 1;
+        record.updated_at_ms = clock.now_ms();
+        inner
+            .compare_exchange_timeline(&route.timeline_key, revision, &record)
+            .await
+            .unwrap();
+
+        let stale_record = TimelineRecord {
+            route: route.clone(),
+            updated_at_ms: clock.now_ms(),
+            ..record.clone()
+        };
+        let timeline_state_handle = service
+            .timeline_state_handle_from_record(&route.timeline_key, &stale_record, revision)
+            .await
+            .unwrap();
+
+        let response = service
+            .try_serve_timeline_state_handle_with_guard(
+                &AllocateTimestampsRequest {
+                    timeline_key: route.timeline_key.clone(),
+                    count: 1,
+                    expected_epoch: route.epoch,
+                    expected_route_version: route.route_version,
+                    client_request_id: "slow-path-cutover".to_string(),
+                },
+                timeline_state_handle,
+                route.generator_id,
+                clock.now_ms(),
+                issued_upper_bound,
+                CachedServeGuardOptions {
+                    cancellation: None,
+                    revalidate_authority: true,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(response.is_none());
+        assert!(service.timeline_runtime.timeline_handle(&route.timeline_key).is_none());
     }
 
     #[tokio::test]
@@ -1396,6 +1442,64 @@ mod tests {
         release_load_tx.send(()).unwrap();
         let response = allocate_task.await.unwrap().unwrap();
         assert_eq!(response.timeline_key, route.timeline_key);
+    }
+
+    #[tokio::test]
+    async fn cached_allocation_with_valid_local_lease_skips_metadata_reload() {
+        let clock = Arc::new(ManualClock::new(23_500));
+        let inner = Arc::new(MemoryMetadataStore::new());
+        let (load_started_tx, load_started_rx) = oneshot::channel();
+        let (_release_load_tx, release_load_rx) = oneshot::channel();
+        let metadata = Arc::new(BlockingTimelineLoadStore::new(
+            inner,
+            load_started_tx,
+            release_load_rx,
+        ));
+        let service = TsoService::new(
+            required_test_config(TsoConfig::default()),
+            clock,
+            metadata.clone(),
+        )
+        .unwrap();
+
+        let route = service
+            .ensure_timeline("allocation.cached-hot-path.timeline")
+            .await
+            .unwrap();
+        service
+            .allocate_timestamps(AllocateTimestampsRequest {
+                timeline_key: route.timeline_key.clone(),
+                count: 1,
+                expected_epoch: route.epoch,
+                expected_route_version: route.route_version,
+                client_request_id: "seed-cached-hot-path".to_string(),
+            })
+            .await
+            .unwrap();
+
+        metadata.arm_blocking_load();
+
+        let response = timeout(
+            Duration::from_millis(50),
+            service.allocate_timestamps(AllocateTimestampsRequest {
+                timeline_key: route.timeline_key.clone(),
+                count: 1,
+                expected_epoch: route.epoch,
+                expected_route_version: route.route_version,
+                client_request_id: "cached-hot-path".to_string(),
+            }),
+        )
+        .await
+        .expect("cached allocation should complete without metadata blocking")
+        .unwrap();
+
+        assert_eq!(response.timeline_key, route.timeline_key);
+        assert!(
+            timeout(Duration::from_millis(25), load_started_rx)
+                .await
+                .is_err(),
+            "cached hot path should not trigger timeline metadata reload"
+        );
     }
 
     #[tokio::test]
@@ -1687,7 +1791,10 @@ mod tests {
                 route.generator_id,
                 clock.now_ms(),
                 None,
-                None,
+                CachedServeGuardOptions {
+                    cancellation: None,
+                    revalidate_authority: true,
+                },
             )
             .await
             .unwrap();
@@ -1696,5 +1803,6 @@ mod tests {
             response.is_none(),
             "post-handle guard should force a retry when generator changes before serve"
         );
+        assert!(service.timeline_runtime.timeline_handle(&route.timeline_key).is_none());
     }
 }

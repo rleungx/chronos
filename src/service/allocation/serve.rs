@@ -18,6 +18,11 @@ struct CachedTimelineChecks {
     state: TimelineLifecycleState,
 }
 
+pub(super) struct CachedServeGuardOptions {
+    pub(super) cancellation: Option<RequestCancellation>,
+    pub(super) revalidate_authority: bool,
+}
+
 impl CachedTimelineChecks {
     fn new(
         service: &TsoService,
@@ -59,12 +64,17 @@ impl TsoService {
             (timeline_state.route.clone(), timeline_state.state)
         };
         let checks = CachedTimelineChecks::new(self, request, &cached_route, cached_state);
+        let cached_lease_upper_bound = (checks.matches_local_route() && checks.timeline_ready)
+            .then(|| {
+                self.valid_generator_lease_upper_bound(cached_route.generator_id, self.clock.now_ms())
+            })
+            .flatten();
 
         if checks.matches_local_route() {
             self.validate_batch_for_route(request.count, &cached_route)?;
         }
 
-        if checks.matches_local_route() {
+        if checks.matches_local_route() && cached_lease_upper_bound.is_none() {
             let authority_matches = self
                 .cached_timeline_still_matches_metadata(
                     &request.timeline_key,
@@ -81,6 +91,21 @@ impl TsoService {
 
         if checks.matches_local_route() && checks.timeline_ready {
             let generator_id = cached_route.generator_id;
+            if let Some(issued_upper_bound) = cached_lease_upper_bound {
+                    return self
+                        .try_serve_timeline_state_handle_with_guard(
+                            request,
+                            timeline_state_handle,
+                            generator_id,
+                            self.clock.now_ms(),
+                            Some(issued_upper_bound),
+                            CachedServeGuardOptions {
+                                cancellation,
+                                revalidate_authority: false,
+                            },
+                        )
+                        .await;
+            }
             match self
                 .ensure_generator_lease_for_allocation_with_cancellation(
                     &request.timeline_key,
@@ -97,7 +122,10 @@ impl TsoService {
                             generator_id,
                             self.clock.now_ms(),
                             issued_upper_bound,
-                            cancellation,
+                            CachedServeGuardOptions {
+                                cancellation,
+                                revalidate_authority: true,
+                            },
                         )
                         .await;
                 }
@@ -181,11 +209,9 @@ impl TsoService {
             }
             Err(TsoError::IssuedUpperBoundExceeded { .. }) => {
                 drop(timeline_state);
-                let refresh_now_ms = self.clock.now_ms();
-                self.refresh_generator_lease_inner_with_cancellation(
+                self.refresh_generator_lease_if_unchanged_with_cancellation(
                     generator_id,
-                    refresh_now_ms,
-                    true,
+                    issued_upper_bound,
                     cancellation,
                 )
                 .await?;
@@ -202,9 +228,9 @@ impl TsoService {
         generator_id: u32,
         now_ms: u64,
         issued_upper_bound: Option<u64>,
-        cancellation: Option<RequestCancellation>,
+        options: CachedServeGuardOptions,
     ) -> Result<Option<AllocateTimestampsResponse>, TsoError> {
-        Self::check_request_cancellation(cancellation.as_ref())?;
+        Self::check_request_cancellation(options.cancellation.as_ref())?;
         let (current_route, checks, generator_still_matches) = {
             let timeline_state = timeline_state_handle.lock().await;
             let route = timeline_state.route.clone();
@@ -224,21 +250,27 @@ impl TsoService {
             self.clear_timeline_cache(&request.timeline_key);
             return Ok(None);
         }
-        if !checks.can_serve(generator_still_matches) {
+        if !generator_still_matches {
+            self.clear_timeline_cache(&request.timeline_key);
+            return Ok(None);
+        }
+        if !checks.can_serve(true) {
             return Ok(None);
         }
 
-        let authority_matches = self
-            .cached_timeline_still_matches_metadata(
-                &request.timeline_key,
-                &current_route,
-                checks.state,
-                cancellation.clone(),
-            )
-            .await?;
-        if !authority_matches {
-            self.clear_timeline_cache(&request.timeline_key);
-            return Ok(None);
+        if options.revalidate_authority {
+            let authority_matches = self
+                .cached_timeline_still_matches_metadata(
+                    &request.timeline_key,
+                    &current_route,
+                    checks.state,
+                    options.cancellation.clone(),
+                )
+                .await?;
+            if !authority_matches {
+                self.clear_timeline_cache(&request.timeline_key);
+                return Ok(None);
+            }
         }
 
         self.serve_allocation_from_timeline_state_handle(
@@ -247,7 +279,7 @@ impl TsoService {
             generator_id,
             now_ms,
             issued_upper_bound,
-            cancellation,
+            options.cancellation,
         )
         .await
     }

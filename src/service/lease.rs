@@ -8,6 +8,7 @@ use tokio::time::Instant;
 use crate::metadata::{GeneratorBatchOp, GeneratorRecord};
 use crate::plane::RequestCancellation;
 use crate::planning::generator_recovery_floor_tso;
+use crate::recovery::record_recovery_event;
 use crate::TsoError;
 
 pub(in crate::service) use coordination::GeneratorLeaseCoordinator;
@@ -381,10 +382,35 @@ impl TsoService {
         }
     }
 
+    pub(super) async fn refresh_generator_lease_if_unchanged_with_cancellation(
+        &self,
+        generator_id: u32,
+        observed_upper_bound: Option<u64>,
+        cancellation: Option<RequestCancellation>,
+    ) -> Result<(), TsoError> {
+        let _flight = self
+            .acquire_generator_lease_singleflight(generator_id)
+            .await;
+        let now_ms = self.clock.now_ms();
+        if let Some(lease_state) = self.generator_runtime.lease_state(generator_id) {
+            if lease_state.lease_expire_at_ms > now_ms
+                && lease_state.issued_upper_bound != observed_upper_bound
+            {
+                return Ok(());
+            }
+        } else {
+            return self
+                .ensure_generator_lease_after_singleflight(generator_id, cancellation)
+                .await;
+        }
+
+        self.refresh_generator_lease_inner_with_cancellation(generator_id, now_ms, true, cancellation)
+            .await
+    }
+
     pub(super) async fn refresh_generator_leases_batch(
         &self,
         generator_ids: Vec<u32>,
-        now_ms: u64,
     ) {
         if generator_ids.is_empty() {
             return;
@@ -393,6 +419,7 @@ impl TsoService {
         let mut operations = Vec::new();
         let mut next_states = Vec::new();
         for generator_id in generator_ids {
+            let now_ms = self.clock.now_ms();
             let lease_state = self.generator_runtime.lease_state(generator_id);
             let Some(lease_state) = lease_state else {
                 continue;
@@ -471,10 +498,20 @@ impl TsoService {
                 }
             }
             Err(_) => {
+                record_recovery_event("service", "batch_generator_refresh", "batch_cas_failed");
                 for operation in operations {
-                    let _ = self
-                        .refresh_generator_lease(operation.generator_id, now_ms)
-                        .await;
+                    let refresh_now_ms = self.clock.now_ms();
+                    if self
+                        .refresh_generator_lease(operation.generator_id, refresh_now_ms)
+                        .await
+                        .is_err()
+                    {
+                        record_recovery_event(
+                            "service",
+                            "batch_generator_refresh",
+                            "fallback_refresh_failed",
+                        );
+                    }
                 }
             }
         }
@@ -1072,6 +1109,205 @@ mod tests {
             1,
             "test should exercise a single slow load without retries"
         );
+    }
+
+    #[derive(Clone)]
+    struct FallbackAdvancingLeaseStore {
+        clock: Arc<ManualClock>,
+        compare_exchange_calls: Arc<AtomicUsize>,
+    }
+
+    impl FallbackAdvancingLeaseStore {
+        fn new(clock: Arc<ManualClock>) -> Self {
+            Self {
+                clock,
+                compare_exchange_calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl TimelineAuthority for FallbackAdvancingLeaseStore {
+        async fn load_timeline(
+            &self,
+            _timeline_key: &str,
+        ) -> Result<Option<(TimelineRecord, u64)>, TsoError> {
+            Ok(None)
+        }
+
+        async fn list_timelines(&self) -> Result<Vec<TimelineRecord>, TsoError> {
+            Ok(Vec::new())
+        }
+
+        async fn create_timeline(
+            &self,
+            _timeline_key: &str,
+            _record: &TimelineRecord,
+        ) -> Result<u64, TsoError> {
+            Ok(1)
+        }
+
+        async fn compare_exchange_timeline(
+            &self,
+            _timeline_key: &str,
+            _expected_revision: u64,
+            _record: &TimelineRecord,
+        ) -> Result<u64, TsoError> {
+            Ok(1)
+        }
+
+        async fn compare_exchange_timelines(
+            &self,
+            _operations: &[TimelineBatchOp],
+        ) -> Result<Vec<u64>, TsoError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[async_trait]
+    impl GeneratorLeaseAuthority for FallbackAdvancingLeaseStore {
+        async fn load_generator(
+            &self,
+            generator_id: u32,
+        ) -> Result<Option<(GeneratorRecord, u64)>, TsoError> {
+            Ok(Some((
+                GeneratorRecord {
+                    schema_version: 1,
+                    generator_id,
+                    owner_worker_endpoint: "127.0.0.1:50051".into(),
+                    owner_instance_id: "lease-instance".into(),
+                    generator_lease_token: 1,
+                    lease_expire_at_ms: Some(150),
+                    last_issued_tso: None,
+                    issued_upper_bound: None,
+                    updated_at_ms: 100,
+                },
+                1,
+            )))
+        }
+
+        async fn create_generator(
+            &self,
+            _generator_id: u32,
+            _record: &GeneratorRecord,
+        ) -> Result<u64, TsoError> {
+            Ok(1)
+        }
+
+        async fn compare_exchange_generator(
+            &self,
+            _generator_id: u32,
+            _expected_revision: u64,
+            _record: &GeneratorRecord,
+        ) -> Result<u64, TsoError> {
+            self.compare_exchange_calls.fetch_add(1, Ordering::AcqRel);
+            Ok(2)
+        }
+
+        async fn compare_exchange_generators(
+            &self,
+            _operations: &[GeneratorBatchOp],
+        ) -> Result<Vec<u64>, TsoError> {
+            self.clock.advance(30);
+            Err(TsoError::CasFailed)
+        }
+    }
+
+    impl RouteUpdateSource for FallbackAdvancingLeaseStore {
+        fn subscribe_route_updates(
+            &self,
+        ) -> broadcast::Receiver<crate::metadata::RouteUpdateSignal> {
+            let (_tx, rx) = broadcast::channel(1);
+            rx
+        }
+    }
+
+    #[async_trait]
+    impl ControlPlaneStore for FallbackAdvancingLeaseStore {}
+
+    #[tokio::test]
+    async fn refresh_generator_leases_batch_reloads_now_ms_for_fallback_refreshes() {
+        let clock = Arc::new(ManualClock::new(100));
+        let metadata = Arc::new(FallbackAdvancingLeaseStore::new(clock.clone()));
+        let service = TsoService::new(
+            required_test_config(TsoConfig {
+                generator_lease_ttl_ms: 50,
+                lease_ttl_ms: 50,
+                generator_maintenance_interval_ms: 10,
+                ..TsoConfig::default()
+            }),
+            clock,
+            metadata.clone(),
+        )
+        .unwrap();
+
+        service.background.begin_shutdown();
+        service.background.drain_tasks().await;
+        service.generator_runtime.upsert_lease(
+            0,
+            crate::runtime::GeneratorLeaseState {
+                revision: 1,
+                owner_instance_id: "lease-instance".into(),
+                generator_lease_token: 1,
+                lease_expire_at_ms: 150,
+                last_persisted_tso: None,
+                issued_upper_bound: None,
+            },
+        );
+
+        service.refresh_generator_leases_batch(vec![0]).await;
+
+        let lease_state = service.generator_runtime.lease_state(0).unwrap();
+        assert_eq!(lease_state.lease_expire_at_ms, 180);
+        assert_eq!(metadata.compare_exchange_calls.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn force_refresh_if_unchanged_coalesces_upper_bound_refreshes() {
+        let metadata = Arc::new(DelayedLeaseAcquireStore::new());
+        let service = TsoService::new(
+            required_test_config(TsoConfig {
+                generator_lease_ttl_ms: 50,
+                lease_ttl_ms: 50,
+                generator_maintenance_interval_ms: 10,
+                ..TsoConfig::default()
+            }),
+            Arc::new(ManualClock::new(70_000)),
+            metadata.clone(),
+        )
+        .unwrap();
+
+        service.background.begin_shutdown();
+        service.background.drain_tasks().await;
+        service.generator_runtime.upsert_lease(
+            0,
+            crate::runtime::GeneratorLeaseState {
+                revision: 1,
+                owner_instance_id: "lease-instance".into(),
+                generator_lease_token: 1,
+                lease_expire_at_ms: 70_050,
+                last_persisted_tso: None,
+                issued_upper_bound: Some(1),
+            },
+        );
+
+        let service_a = service.clone();
+        let service_b = service.clone();
+        let task_a = tokio::spawn(async move {
+            service_a
+                .refresh_generator_lease_if_unchanged_with_cancellation(0, Some(1), None)
+                .await
+        });
+        let task_b = tokio::spawn(async move {
+            service_b
+                .refresh_generator_lease_if_unchanged_with_cancellation(0, Some(1), None)
+                .await
+        });
+
+        task_a.await.unwrap().unwrap();
+        task_b.await.unwrap().unwrap();
+
+        assert_eq!(metadata.compare_exchange_calls.load(Ordering::Acquire), 1);
     }
 
     #[tokio::test]
