@@ -8,10 +8,13 @@ use tokio::sync::Semaphore;
 use tokio::time::Duration;
 use tracing::{info, warn};
 
-use crate::metadata::{ControlPlaneStore, TimelineRecord};
+use crate::metadata::ControlPlaneStore;
 use crate::plane::{TsoControlPlane, TsoDataPlane};
 use crate::runtime::{GeneratorRuntimeState, TimelineRuntimeState};
-use crate::{Clock, HealthInfo, ResourceTier, TransferReason, TsoConfig, TsoError, MAX_GENERATORS};
+use crate::{
+    Clock, HealthInfo, ResourceTier, TimelineRoute, TransferReason, TsoConfig, TsoError,
+    MAX_GENERATORS,
+};
 
 use super::background::BackgroundCoordinator;
 use super::contention::MetadataContentionCoordinator;
@@ -173,7 +176,7 @@ impl TsoService {
 
         for timeline in &local_timelines {
             if let Err(error) = self
-                .best_effort_persist_local_timeline_floor(&timeline.route.timeline_key)
+                .best_effort_persist_local_timeline_floor(&timeline.timeline_key)
                 .await
             {
                 warn!(
@@ -181,7 +184,7 @@ impl TsoService {
                     event = "timeline_flush_failed",
                     result = "degraded",
                     reason = %error,
-                    timeline_key = %timeline.route.timeline_key
+                    timeline_key = %timeline.timeline_key
                 );
             }
         }
@@ -215,7 +218,7 @@ impl TsoService {
         &self,
     ) -> Result<
         (
-            Vec<TimelineRecord>,
+            Vec<TimelineRoute>,
             HashSet<u32>,
             ShutdownTransferCandidates,
         ),
@@ -231,7 +234,7 @@ impl TsoService {
         loop {
             let page = self
                 .metadata
-                .list_timelines_page(cursor.as_deref(), page_size)
+                .list_timeline_filters_page(cursor.as_deref(), page_size)
                 .await?;
             if page.records.is_empty() {
                 break;
@@ -240,7 +243,7 @@ impl TsoService {
             for timeline in page.records {
                 if self.is_local_endpoint(&timeline.route.owner_worker_endpoint) {
                     local_generator_ids.insert(timeline.route.generator_id);
-                    local_timelines.push(timeline);
+                    local_timelines.push(timeline.route);
                     continue;
                 }
 
@@ -274,7 +277,7 @@ impl TsoService {
 
     async fn best_effort_transfer_local_timelines_before_shutdown(
         &self,
-        timelines: &[TimelineRecord],
+        timelines: &[TimelineRoute],
         candidates: &ShutdownTransferCandidates,
     ) {
         if candidates.shared.is_empty()
@@ -286,12 +289,12 @@ impl TsoService {
         let mut transfer_state = ShutdownTransferState::default();
 
         for timeline in timelines {
-            if !self.is_local_endpoint(&timeline.route.owner_worker_endpoint) {
+            if !self.is_local_endpoint(&timeline.owner_worker_endpoint) {
                 continue;
             }
             let Some((target_endpoint, target_generator_id)) = Self::shutdown_transfer_target(
                 candidates,
-                timeline.route.resource_tier,
+                timeline.resource_tier,
                 &mut transfer_state,
             ) else {
                 continue;
@@ -299,7 +302,7 @@ impl TsoService {
 
             if let Err(error) = self
                 .transfer_timeline_for_rpc(
-                    &timeline.route.timeline_key,
+                    &timeline.timeline_key,
                     target_endpoint.clone(),
                     Some(target_generator_id),
                     TransferReason::Rebalance,
@@ -311,7 +314,7 @@ impl TsoService {
                     event = "timeline_transfer_failed",
                     result = "degraded",
                     reason = %error,
-                    timeline_key = %timeline.route.timeline_key,
+                    timeline_key = %timeline.timeline_key,
                     target_owner_endpoint = %target_endpoint,
                     target_generator_id
                 );

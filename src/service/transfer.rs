@@ -488,6 +488,7 @@ impl TsoService {
                 return Err(e);
             }
         };
+        self.clear_timeline_cache(timeline_key);
         let (route, state) = self
             .synchronize_transfer_completion(
                 timeline_key,
