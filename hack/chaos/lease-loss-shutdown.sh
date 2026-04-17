@@ -19,6 +19,8 @@ INSTANCE_ID="${CHRONOS_CHAOS_INSTANCE_ID:-${SERVICE_ENDPOINT}}"
 BENCH_DURATION_SECS="${CHRONOS_CHAOS_BENCH_DURATION_SECS:-3}"
 SAFETY_GAP_MS="${CHRONOS_CHAOS_SAFETY_GAP_MS:-1}"
 LEASE_TTL_MS="${CHRONOS_CHAOS_LEASE_TTL_MS:-1500}"
+RECOVERY_REQ_PER_SEC_MIN="${CHRONOS_CHAOS_RECOVERY_REQ_PER_SEC_MIN:-10}"
+RECOVERY_LATENCY_P95_US_MAX="${CHRONOS_CHAOS_RECOVERY_LATENCY_P95_US_MAX:-500000}"
 ARTIFACT_ROOT="${CHRONOS_CHAOS_ARTIFACT_DIR:-${CHRONOS_ARTIFACT_DIR:-}}"
 KEEP_ARTIFACTS_ON_SUCCESS="${CHRONOS_CHAOS_KEEP_ARTIFACTS_ON_SUCCESS:-${CHRONOS_KEEP_ARTIFACTS_ON_SUCCESS:-0}}"
 STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -68,6 +70,8 @@ worker_id=${WORKER_ID}
 instance_id=${INSTANCE_ID}
 safety_gap_ms=${SAFETY_GAP_MS}
 lease_ttl_ms=${LEASE_TTL_MS}
+recovery_req_per_sec_min=${RECOVERY_REQ_PER_SEC_MIN}
+recovery_latency_p95_us_max=${RECOVERY_LATENCY_P95_US_MAX}
 artifact_dir=${ARTIFACT_DIR}
 artifact_index=${INDEX_LOG}
 chronos_log=${CHRONOS_LOG}
@@ -176,6 +180,44 @@ wait_for_identity_release() {
   return 1
 }
 
+extract_metric() {
+  local key=$1
+  local file=$2
+  awk -F '=' -v key="${key}" '$1 == key { print $2; exit }' "${file}"
+}
+
+assert_metric_at_least() {
+  local key=$1
+  local file=$2
+  local minimum=$3
+  local value
+  value="$(extract_metric "${key}" "${file}")"
+  if [[ -z "${value}" ]]; then
+    echo "missing metric ${key} in ${file}" >&2
+    return 1
+  fi
+  python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) >= float(sys.argv[2]) else 1)' "${value}" "${minimum}" || {
+    echo "metric ${key} must be >= ${minimum}, got ${value}" >&2
+    return 1
+  }
+}
+
+assert_metric_at_most() {
+  local key=$1
+  local file=$2
+  local maximum=$3
+  local value
+  value="$(extract_metric "${key}" "${file}")"
+  if [[ -z "${value}" ]]; then
+    echo "missing metric ${key} in ${file}" >&2
+    return 1
+  fi
+  python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) <= float(sys.argv[2]) else 1)' "${value}" "${maximum}" || {
+    echo "metric ${key} must be <= ${maximum}, got ${value}" >&2
+    return 1
+  }
+}
+
 start_chronos() {
   : >"${CHRONOS_LOG}"
   env \
@@ -238,7 +280,8 @@ env \
 
 curl -fsS "http://${METRICS_ENDPOINT}/readyz" | grep -qx 'ready'
 curl -fsS "http://${METRICS_ENDPOINT}/metrics" | grep -q '^tso_startup_ready'
-grep -q '^req_per_sec=' "${RECOVERY_BENCH_LOG}"
+assert_metric_at_least "req_per_sec" "${RECOVERY_BENCH_LOG}" "${RECOVERY_REQ_PER_SEC_MIN}"
+assert_metric_at_most "latency_p95_us" "${RECOVERY_BENCH_LOG}" "${RECOVERY_LATENCY_P95_US_MAX}"
 
 RESULT="success"
 write_summary

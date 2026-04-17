@@ -18,10 +18,18 @@ SOAK_BATCH="${CHRONOS_SOAK_BATCH:-1}"
 CONTROL_TIMELINES="${CHRONOS_SOAK_CONTROL_TIMELINES:-2000}"
 CONTROL_PAGE_SIZE="${CHRONOS_SOAK_CONTROL_PAGE_SIZE:-200}"
 CONTROL_CONCURRENCY="${CHRONOS_SOAK_CONTROL_CONCURRENCY:-8}"
-WATCH_CONCURRENCY="${CHRONOS_SOAK_WATCH_CONCURRENCY:-4}"
-WATCH_TIMEOUT_MS="${CHRONOS_SOAK_WATCH_TIMEOUT_MS:-5000}"
+FILTERED_CONCURRENCY="${CHRONOS_SOAK_FILTERED_CONCURRENCY:-4}"
 WAIT_ATTEMPTS="${CHRONOS_SOAK_WAIT_ATTEMPTS:-60}"
 WAIT_INTERVAL_SECS="${CHRONOS_SOAK_WAIT_INTERVAL_SECS:-1}"
+SOAK_REQ_PER_SEC_MIN="${CHRONOS_SOAK_REQ_PER_SEC_MIN:-50}"
+SOAK_LATENCY_P95_US_MAX="${CHRONOS_SOAK_LATENCY_P95_US_MAX:-200000}"
+SOAK_LATENCY_P99_US_MAX="${CHRONOS_SOAK_LATENCY_P99_US_MAX:-500000}"
+CONTROL_REQ_PER_SEC_MIN="${CHRONOS_SOAK_CONTROL_REQ_PER_SEC_MIN:-10}"
+CONTROL_RPC_P95_US_MAX="${CHRONOS_SOAK_CONTROL_RPC_P95_US_MAX:-500000}"
+CONTROL_SCAN_P95_US_MAX="${CHRONOS_SOAK_CONTROL_SCAN_P95_US_MAX:-1000000}"
+FILTERED_REQ_PER_SEC_MIN="${CHRONOS_SOAK_FILTERED_REQ_PER_SEC_MIN:-10}"
+FILTERED_RPC_P95_US_MAX="${CHRONOS_SOAK_FILTERED_RPC_P95_US_MAX:-500000}"
+FILTERED_SCAN_P95_US_MAX="${CHRONOS_SOAK_FILTERED_SCAN_P95_US_MAX:-1000000}"
 UNIQUE_SUFFIX="$(date +%s)-$$"
 ETCD_PREFIX="${CHRONOS_SOAK_ETCD_PREFIX:-/chronos-soak-${UNIQUE_SUFFIX}}"
 WORKER_ID="${CHRONOS_SOAK_WORKER_ID:-worker-soak}"
@@ -37,7 +45,7 @@ if [[ -n "${ARTIFACT_ROOT}" ]]; then
   CHRONOS_LOG="${ARTIFACT_DIR}/chronos.log"
   BENCH_LOG="${ARTIFACT_DIR}/bench.log"
   CONTROL_STATUS_LOG="${ARTIFACT_DIR}/status.log"
-  CONTROL_WATCH_LOG="${ARTIFACT_DIR}/watch.log"
+  CONTROL_FILTERED_LOG="${ARTIFACT_DIR}/status-filtered.log"
   ETCD_LOG="${ARTIFACT_DIR}/etcd.log"
   DOCKER_PS_LOG="${ARTIFACT_DIR}/docker-ps.txt"
   READYZ_LOG="${ARTIFACT_DIR}/readyz.txt"
@@ -49,7 +57,7 @@ else
   CHRONOS_LOG="$(mktemp -t chronos-soak.XXXXXX.log)"
   BENCH_LOG="$(mktemp -t chronos-soak-bench.XXXXXX.log)"
   CONTROL_STATUS_LOG="$(mktemp -t chronos-soak-status.XXXXXX.log)"
-  CONTROL_WATCH_LOG="$(mktemp -t chronos-soak-watch.XXXXXX.log)"
+  CONTROL_FILTERED_LOG="$(mktemp -t chronos-soak-status-filtered.XXXXXX.log)"
   ETCD_LOG=""
   DOCKER_PS_LOG=""
   READYZ_LOG=""
@@ -81,8 +89,16 @@ soak_batch=${SOAK_BATCH}
 control_timelines=${CONTROL_TIMELINES}
 control_page_size=${CONTROL_PAGE_SIZE}
 control_concurrency=${CONTROL_CONCURRENCY}
-watch_concurrency=${WATCH_CONCURRENCY}
-watch_timeout_ms=${WATCH_TIMEOUT_MS}
+filtered_concurrency=${FILTERED_CONCURRENCY}
+soak_req_per_sec_min=${SOAK_REQ_PER_SEC_MIN}
+soak_latency_p95_us_max=${SOAK_LATENCY_P95_US_MAX}
+soak_latency_p99_us_max=${SOAK_LATENCY_P99_US_MAX}
+control_req_per_sec_min=${CONTROL_REQ_PER_SEC_MIN}
+control_rpc_p95_us_max=${CONTROL_RPC_P95_US_MAX}
+control_scan_p95_us_max=${CONTROL_SCAN_P95_US_MAX}
+filtered_req_per_sec_min=${FILTERED_REQ_PER_SEC_MIN}
+filtered_rpc_p95_us_max=${FILTERED_RPC_P95_US_MAX}
+filtered_scan_p95_us_max=${FILTERED_SCAN_P95_US_MAX}
 etcd_prefix=${ETCD_PREFIX}
 worker_id=${WORKER_ID}
 safety_gap_ms=${SAFETY_GAP_MS}
@@ -91,7 +107,7 @@ artifact_index=${INDEX_LOG}
 chronos_log=${CHRONOS_LOG}
 bench_log=${BENCH_LOG}
 status_log=${CONTROL_STATUS_LOG}
-watch_log=${CONTROL_WATCH_LOG}
+filtered_status_log=${CONTROL_FILTERED_LOG}
 EOF
 }
 
@@ -135,10 +151,10 @@ cleanup() {
     echo "[soak] chronos log: ${CHRONOS_LOG}" >&2
     echo "[soak] bench log: ${BENCH_LOG}" >&2
     echo "[soak] status log: ${CONTROL_STATUS_LOG}" >&2
-    echo "[soak] watch log: ${CONTROL_WATCH_LOG}" >&2
+    echo "[soak] filtered status log: ${CONTROL_FILTERED_LOG}" >&2
     [[ -n "${ARTIFACT_DIR}" ]] && echo "[soak] artifacts: ${ARTIFACT_DIR}" >&2
   elif [[ "${KEEP_ARTIFACTS_ON_SUCCESS}" != "1" ]]; then
-    rm -f "${CHRONOS_LOG}" "${BENCH_LOG}" "${CONTROL_STATUS_LOG}" "${CONTROL_WATCH_LOG}"
+    rm -f "${CHRONOS_LOG}" "${BENCH_LOG}" "${CONTROL_STATUS_LOG}" "${CONTROL_FILTERED_LOG}"
   fi
 }
 trap cleanup EXIT
@@ -173,6 +189,38 @@ assert_positive_metric() {
   fi
   python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) > 0 else 1)' "${value}" || {
     echo "metric ${key} must be > 0, got ${value}" >&2
+    return 1
+  }
+}
+
+assert_metric_at_least() {
+  local key=$1
+  local file=$2
+  local minimum=$3
+  local value
+  value="$(extract_metric "${key}" "${file}")"
+  if [[ -z "${value}" ]]; then
+    echo "missing metric ${key} in ${file}" >&2
+    return 1
+  fi
+  python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) >= float(sys.argv[2]) else 1)' "${value}" "${minimum}" || {
+    echo "metric ${key} must be >= ${minimum}, got ${value}" >&2
+    return 1
+  }
+}
+
+assert_metric_at_most() {
+  local key=$1
+  local file=$2
+  local maximum=$3
+  local value
+  value="$(extract_metric "${key}" "${file}")"
+  if [[ -z "${value}" ]]; then
+    echo "missing metric ${key} in ${file}" >&2
+    return 1
+  fi
+  python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) <= float(sys.argv[2]) else 1)' "${value}" "${maximum}" || {
+    echo "metric ${key} must be <= ${maximum}, got ${value}" >&2
     return 1
   }
 }
@@ -223,16 +271,17 @@ env \
   CHRONOS_CONTROL_BENCH_WARMUP_SECS="${SOAK_WARMUP_SECS}" \
   "${RELEASE_BIN_DIR}/chronos-control-bench" | tee "${CONTROL_STATUS_LOG}"
 
-echo "[soak] running control-plane watch benchmark"
+echo "[soak] running filtered control-plane status benchmark"
 env \
   CHRONOS_CONTROL_BENCH_ENDPOINT="http://${SERVICE_ENDPOINT}" \
-  CHRONOS_CONTROL_BENCH_SCENARIO=watch_all_snapshot \
-  CHRONOS_CONTROL_BENCH_CONCURRENCY="${WATCH_CONCURRENCY}" \
+  CHRONOS_CONTROL_BENCH_SCENARIO=status_scan_filtered \
+  CHRONOS_CONTROL_BENCH_CONCURRENCY="${FILTERED_CONCURRENCY}" \
   CHRONOS_CONTROL_BENCH_TIMELINES="${CONTROL_TIMELINES}" \
+  CHRONOS_CONTROL_BENCH_PAGE_SIZE="${CONTROL_PAGE_SIZE}" \
   CHRONOS_CONTROL_BENCH_DURATION_SECS="${SOAK_DURATION_SECS}" \
   CHRONOS_CONTROL_BENCH_WARMUP_SECS="${SOAK_WARMUP_SECS}" \
-  CHRONOS_CONTROL_BENCH_WATCH_SNAPSHOT_TIMEOUT_MS="${WATCH_TIMEOUT_MS}" \
-  "${RELEASE_BIN_DIR}/chronos-control-bench" | tee "${CONTROL_WATCH_LOG}"
+  CHRONOS_CONTROL_BENCH_FILTER_OWNER_ENDPOINT="${SERVICE_ENDPOINT}" \
+  "${RELEASE_BIN_DIR}/chronos-control-bench" | tee "${CONTROL_FILTERED_LOG}"
 
 echo "[soak] validating readiness and metrics surfaces"
 curl -fsS "http://${METRICS_ENDPOINT}/readyz" | grep -qx 'ready'
@@ -240,10 +289,15 @@ curl -fsS "http://${METRICS_ENDPOINT}/metrics" | grep -q '^tso_build_info'
 curl -fsS "http://${METRICS_ENDPOINT}/metrics" | grep -q '^tso_startup_ready'
 curl -fsS "http://${METRICS_ENDPOINT}/metrics" | grep -q '^tso_allocate_total'
 
-assert_positive_metric "req_per_sec" "${BENCH_LOG}"
-assert_positive_metric "req_per_sec" "${CONTROL_STATUS_LOG}"
-grep -qx 'timeouts=0' "${CONTROL_WATCH_LOG}"
-grep -qx 'stream_errors=0' "${CONTROL_WATCH_LOG}"
+assert_metric_at_least "req_per_sec" "${BENCH_LOG}" "${SOAK_REQ_PER_SEC_MIN}"
+assert_metric_at_most "latency_p95_us" "${BENCH_LOG}" "${SOAK_LATENCY_P95_US_MAX}"
+assert_metric_at_most "latency_p99_us" "${BENCH_LOG}" "${SOAK_LATENCY_P99_US_MAX}"
+assert_metric_at_least "req_per_sec" "${CONTROL_STATUS_LOG}" "${CONTROL_REQ_PER_SEC_MIN}"
+assert_metric_at_most "rpc_latency_p95_us" "${CONTROL_STATUS_LOG}" "${CONTROL_RPC_P95_US_MAX}"
+assert_metric_at_most "scan_latency_p95_us" "${CONTROL_STATUS_LOG}" "${CONTROL_SCAN_P95_US_MAX}"
+assert_metric_at_least "req_per_sec" "${CONTROL_FILTERED_LOG}" "${FILTERED_REQ_PER_SEC_MIN}"
+assert_metric_at_most "rpc_latency_p95_us" "${CONTROL_FILTERED_LOG}" "${FILTERED_RPC_P95_US_MAX}"
+assert_metric_at_most "scan_latency_p95_us" "${CONTROL_FILTERED_LOG}" "${FILTERED_SCAN_P95_US_MAX}"
 
 RESULT="success"
 write_summary
