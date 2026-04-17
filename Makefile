@@ -16,8 +16,13 @@ ETCD_ENDPOINTS ?= 127.0.0.1:2379
 	test-rebalance-bench \
 	test-soak \
 	test-chaos \
+	promtool-check \
+	observability-check \
+	release-check \
 	observability-up \
 	observability-down
+
+PROMTOOL_IMAGE ?= prom/prometheus:v2.54.1
 
 etcd-up:
 	docker compose -f $(ETCD_COMPOSE_FILE) up -d
@@ -65,6 +70,35 @@ test-soak:
 
 test-chaos:
 	bash hack/chaos/lease-loss-shutdown.sh
+
+promtool-check:
+	docker run --rm \
+		-v $(CURDIR)/observability/prometheus:/etc/prometheus:ro \
+		$(PROMTOOL_IMAGE) \
+		promtool check rules /etc/prometheus/alerts.yml
+	docker run --rm \
+		-v $(CURDIR)/observability/prometheus:/etc/prometheus:ro \
+		$(PROMTOOL_IMAGE) \
+		promtool test rules /etc/prometheus/alerts.test.yml
+
+observability-check: promtool-check
+
+release-check:
+	CHRONOS_PROFILE=production \
+	CHRONOS_BUILD_COMMIT=$$(git rev-parse HEAD) \
+	CHRONOS_SECURITY_MODE=dev-insecure \
+	CHRONOS_BIND_ADDR=127.0.0.1:50051 \
+	CHRONOS_ADVERTISE_ENDPOINT=127.0.0.1:50051 \
+	CHRONOS_METRICS_BIND_ADDR=127.0.0.1:9898 \
+	cargo run --bin chronos -- --check-config
+	CHRONOS_PROFILE=production \
+	CHRONOS_BUILD_COMMIT=$$(git rev-parse HEAD) \
+	CHRONOS_SECURITY_MODE=dev-insecure \
+	CHRONOS_BIND_ADDR=127.0.0.1:50051 \
+	CHRONOS_ADVERTISE_ENDPOINT=127.0.0.1:50051 \
+	CHRONOS_METRICS_BIND_ADDR=127.0.0.1:9898 \
+	cargo run --bin chronos -- --print-effective-config
+	cargo build --locked --release --bin chronos --bin chronos-bench --bin chronos-control-bench --bin chronos-failover-bench
 
 observability-up:
 	docker compose -f observability/docker-compose.yml up -d

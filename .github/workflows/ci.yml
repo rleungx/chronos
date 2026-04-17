@@ -32,6 +32,8 @@ jobs:
         run: make test-layer-2
       - name: Run Layer 3 memory-path semantic regression
         run: make test-layer-3
+      - name: Validate observability rules
+        run: make observability-check
 
   layer-4-real-etcd:
     runs-on: ubuntu-latest
