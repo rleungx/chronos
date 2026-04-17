@@ -6,6 +6,7 @@ use etcd_client::{
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde::Serialize;
+use std::collections::HashMap;
 use std::sync::Mutex as StdMutex;
 use std::sync::MutexGuard;
 use tokio::sync::{broadcast, watch};
@@ -16,6 +17,7 @@ use tracing::{error, info, warn};
 use crate::recovery::record_recovery_event;
 use crate::tls::read_required_pem_file;
 use crate::{metrics, TimelineRoute, TsoConfig, TsoError};
+use futures::future::try_join_all;
 
 use super::{
     identity::{claim_instance_identity, InstanceIdentityLeaseRecord},
@@ -24,8 +26,9 @@ use super::{
         timeline_route_update_from_routes, RouteUpdateSignal, CURRENT_METADATA_SCHEMA_VERSION,
     },
     GeneratorBatchOp, GeneratorLeaseAuthority, GeneratorRecord, IdentityLeaseAuthority,
-    InstanceIdentityLease, RouteUpdateSource, TimelineAuthority, TimelineBatchOp, TimelineRecord,
-    TimelineRecordListPage,
+    InstanceIdentityLease, RouteUpdateSource, TimelineAuthority, TimelineBatchOp,
+    TimelineFilterRecord, TimelineFilterRecordListPage, TimelineRecord, TimelineRecordListPage,
+    TimelineRouteRecord,
 };
 
 pub struct EtcdMetadataStore {
@@ -97,14 +100,35 @@ struct RouteOnlyTimelineRecord {
     route: TimelineRoute,
 }
 
+#[derive(Deserialize)]
+struct TimelineFilterOnlyRecord {
+    #[serde(default = "default_schema_version")]
+    schema_version: u32,
+    route: TimelineRoute,
+    #[serde(default = "default_timeline_state")]
+    state: crate::TimelineLifecycleState,
+}
+
 fn default_schema_version() -> u32 {
     CURRENT_METADATA_SCHEMA_VERSION
+}
+
+fn default_timeline_state() -> crate::TimelineLifecycleState {
+    crate::TimelineLifecycleState::Active
 }
 
 fn parse_prev_route(value: &[u8]) -> Option<TimelineRoute> {
     serde_json::from_slice::<RouteOnlyTimelineRecord>(value)
         .ok()
         .map(|record| record.route)
+}
+
+fn parse_timeline_filter_record(value: &[u8]) -> Result<TimelineFilterRecord, serde_json::Error> {
+    serde_json::from_slice::<TimelineFilterOnlyRecord>(value).map(|record| TimelineFilterRecord {
+        schema_version: record.schema_version,
+        route: record.route,
+        state: record.state,
+    })
 }
 
 fn route_update_for_watch_event(
@@ -129,7 +153,7 @@ fn prefix_range_end(prefix: &str) -> Vec<u8> {
 
 impl EtcdMetadataStore {
     async fn probe_metadata_runtime(&self) -> Result<(), TsoError> {
-        self.load_timeline("__chronos_startup_probe__").await?;
+        self.load_timeline_route("__chronos_startup_probe__").await?;
         self.load_generator(0).await?;
         Ok(())
     }
@@ -788,6 +812,28 @@ impl TimelineAuthority for EtcdMetadataStore {
             .transpose()
     }
 
+    async fn load_timeline_route(
+        &self,
+        timeline_key: &str,
+    ) -> Result<Option<(TimelineRouteRecord, u64)>, TsoError> {
+        let _timer = metrics::TSO_METADATA_LATENCY
+            .with_label_values(&["get_route"])
+            .start_timer();
+        let result: Option<(TimelineRouteRecord, u64)> = self
+            .get_json_record(
+                self.timeline_key(timeline_key),
+                "get_route",
+                "Route record deserialization",
+            )
+            .await?;
+        result
+            .map(|(record, revision)| {
+                record.validate_schema_version()?;
+                Ok((record, revision))
+            })
+            .transpose()
+    }
+
     async fn list_timelines(&self) -> Result<Vec<TimelineRecord>, TsoError> {
         let _timer = metrics::TSO_METADATA_LATENCY
             .with_label_values(&["list"])
@@ -875,6 +921,78 @@ impl TimelineAuthority for EtcdMetadataStore {
         records.truncate(limit);
 
         Ok(TimelineRecordListPage {
+            records,
+            next_start_after_timeline_key,
+        })
+    }
+
+    async fn list_timeline_filters_page(
+        &self,
+        start_after_timeline_key: Option<&str>,
+        limit: usize,
+    ) -> Result<TimelineFilterRecordListPage, TsoError> {
+        let _timer = metrics::TSO_METADATA_LATENCY
+            .with_label_values(&["list_page_filters"])
+            .start_timer();
+        if limit == 0 {
+            return Ok(TimelineFilterRecordListPage {
+                records: Vec::new(),
+                next_start_after_timeline_key: None,
+            });
+        }
+
+        let mut client = self.client.clone();
+        let route_prefix = self.route_prefix();
+        let start_key = start_after_timeline_key
+            .map(|timeline_key| self.timeline_key(timeline_key))
+            .unwrap_or_else(|| route_prefix.clone());
+        let fetch_limit = limit
+            .saturating_add(1)
+            .saturating_add(usize::from(start_after_timeline_key.is_some()))
+            .min(i64::MAX as usize) as i64;
+        let response = client
+            .get(
+                start_key.clone(),
+                Some(
+                    GetOptions::new()
+                        .with_range(prefix_range_end(&route_prefix))
+                        .with_limit(fetch_limit),
+                ),
+            )
+            .await
+            .map_err(|error| {
+                metrics::TSO_METADATA_ERRORS_TOTAL
+                    .with_label_values(&["list_page_filters"])
+                    .inc();
+                TsoError::Internal(format!("Etcd list_page_filters failed: {}", error))
+            })?;
+
+        let mut records = Vec::with_capacity(response.kvs().len().min(limit + 1));
+        for kv in response.kvs() {
+            if start_after_timeline_key.is_some() && kv.key() == start_key.as_bytes() {
+                continue;
+            }
+
+            let record = parse_timeline_filter_record(kv.value()).map_err(|error| {
+                metrics::TSO_METADATA_ERRORS_TOTAL
+                    .with_label_values(&["list_page_filters"])
+                    .inc();
+                TsoError::Internal(format!(
+                    "Timeline filter record page deserialization failed: {}",
+                    error
+                ))
+            })?;
+            record.validate_schema_version()?;
+            records.push(record);
+        }
+        records
+            .sort_unstable_by(|left, right| left.route.timeline_key.cmp(&right.route.timeline_key));
+
+        let next_start_after_timeline_key =
+            (records.len() > limit).then(|| records[limit - 1].route.timeline_key.clone());
+        records.truncate(limit);
+
+        Ok(TimelineFilterRecordListPage {
             records,
             next_start_after_timeline_key,
         })
@@ -982,6 +1100,24 @@ impl GeneratorLeaseAuthority for EtcdMetadataStore {
                 Ok((record, revision))
             })
             .transpose()
+    }
+
+    async fn load_generators(
+        &self,
+        generator_ids: &[u32],
+    ) -> Result<HashMap<u32, Option<GeneratorRecord>>, TsoError> {
+        let _timer = metrics::TSO_METADATA_LATENCY
+            .with_label_values(&["get_generator_batch"])
+            .start_timer();
+        let results = try_join_all(generator_ids.iter().copied().map(|generator_id| async move {
+            let record = self
+                .load_generator(generator_id)
+                .await?
+                .map(|(record, _)| record);
+            Ok::<(u32, Option<GeneratorRecord>), TsoError>((generator_id, record))
+        }))
+        .await?;
+        Ok(results.into_iter().collect())
     }
 
     async fn create_generator(
@@ -1112,7 +1248,10 @@ mod tests {
     use crate::{ResourceTier, TimelineLifecycleState};
 
     use super::EtcdMetadataStore;
-    use super::{parse_prev_route, route_update_for_watch_event, TimelineRecord, TimelineRoute};
+    use super::{
+        parse_prev_route, parse_timeline_filter_record, route_update_for_watch_event,
+        TimelineRecord, TimelineRoute, TimelineRouteRecord,
+    };
     use tokio::time::Duration;
 
     fn sample_route(generator_id: u32, route_version: u64) -> TimelineRoute {
@@ -1173,6 +1312,37 @@ mod tests {
             Some(next.route.clone())
         );
         assert_eq!(route_update_for_watch_event(None, &next), Some(next.route));
+    }
+
+    #[test]
+    fn parse_timeline_filter_record_accepts_partial_payload() {
+        let payload = serde_json::json!({
+            "schema_version": 1,
+            "route": sample_route(7, 2),
+            "state": "Recovering"
+        });
+
+        let record = parse_timeline_filter_record(payload.to_string().as_bytes()).unwrap();
+        assert_eq!(record.route, sample_route(7, 2));
+        assert_eq!(record.state, crate::TimelineLifecycleState::Recovering);
+    }
+
+    #[test]
+    fn timeline_route_record_deserializes_from_full_timeline_payload() {
+        let payload = serde_json::json!({
+            "schema_version": 1,
+            "route": sample_route(7, 3),
+            "state": "Recovering",
+            "recovery_floor_tso": 42,
+            "issued_upper_bound": 88,
+            "last_graceful_issued": 77,
+            "lease_expire_at_ms": 66,
+            "updated_at_ms": 10
+        });
+
+        let record: TimelineRouteRecord = serde_json::from_slice(payload.to_string().as_bytes()).unwrap();
+        assert_eq!(record.route, sample_route(7, 3));
+        assert!(record.validate_schema_version().is_ok());
     }
 
     #[tokio::test]
