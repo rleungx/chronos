@@ -21,3 +21,15 @@ Everything else is internal client logic.
 ## Clients
 
 - Client index: `clients/README.md`
+
+## Production operations
+
+- Production guide: `docs/production.md`
+- Release checklist: `docs/release.md`
+- Rollback procedure: `docs/rollback.md`
+- Observability: `observability/README.md`
+- Runbooks:
+  - `docs/runbooks/not-ready.md`
+  - `docs/runbooks/identity-lease-lost.md`
+  - `docs/runbooks/metadata-errors-etcd.md`
+  - `docs/runbooks/transfer-failures.md`

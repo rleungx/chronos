@@ -23,9 +23,20 @@ metrics surface.
    make observability-up
    ```
 
-3. Open <http://localhost:9090>.
+3. Open Grafana at <http://localhost:3000>.
 
-4. Stop Prometheus when done:
+   - Default login: `admin` / `admin`
+   - Preprovisioned dashboard: `Chronos / Chronos Overview`
+
+5. Validate the alert rules:
+
+   ```bash
+   make observability-check
+   ```
+
+4. Open Prometheus at <http://localhost:9090>.
+
+5. Stop Prometheus and Grafana when done:
 
    ```bash
    make observability-down
@@ -45,6 +56,24 @@ metrics surface.
 
 These alerts are intended as starter rules, not final production SLO policy. Tune thresholds and
 alert routing for your environment.
+
+Runbooks for the highest-value alerts now live under:
+
+- `docs/runbooks/not-ready.md`
+- `docs/runbooks/identity-lease-lost.md`
+- `docs/runbooks/metadata-errors-etcd.md`
+- `docs/runbooks/transfer-failures.md`
+
+## Included dashboards
+
+- `observability/grafana/dashboards/chronos-overview.json`
+
+The overview dashboard is intended to answer four operator questions quickly:
+
+1. Is the instance ready and shutting down?
+2. Are allocation throughput and latency healthy?
+3. Are metadata and control-plane dependencies degrading?
+4. Are transfer/failover/recovery paths firing unexpectedly?
 
 ## Local validation harnesses
 
@@ -80,3 +109,5 @@ The `soak-real-etcd` and `chaos-lease-loss` workflows upload `artifacts/soak/` a
 `artifacts/chaos/` respectively. Start with `summary.txt`, then inspect `chronos.log` and
 `etcd.log` before diving into bench output. `artifact-index.txt` is the fastest way to confirm what
 the job actually captured.
+
+See `docs/production.md` for the recommended validation order and benchmark budget variables.
