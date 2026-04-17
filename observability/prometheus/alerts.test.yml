@@ -1,0 +1,75 @@
+rule_files:
+  - alerts.yml
+
+evaluation_interval: 1m
+
+tests:
+  - interval: 1m
+    input_series:
+      - series: 'up{job="chronos"}'
+        values: '0 0 0 0 0'
+      - series: 'tso_startup_ready{job="chronos"}'
+        values: '0 0 0 0 0 0 0'
+      - series: 'tso_identity_lease_events_total{job="chronos",event="lost"}'
+        values: '0 0 0 1 1 1 1 1'
+      - series: 'tso_lease_expired_total{job="chronos"}'
+        values: '0 0 0 0 0 0 1 1 1 1 1 1'
+      - series: 'tso_transfer_outcomes_total{job="chronos",action="failover",reason="failover",outcome="failed"}'
+        values: '0 0 0 0 0 0 1 1 1 1 1 1'
+      - series: 'tso_watch_keepalive_dropped_total{job="chronos"}'
+        values: '0 0 0 0 0 0 1 1 1 1 1 1'
+      - series: 'tso_shutdown_total{job="chronos",reason="identity_lease_lost"}'
+        values: '0 0 0 0 0 0 1 1 1 1 1 1'
+      - series: 'tso_startup_bootstrap_fail_total{job="chronos",stage="metadata"}'
+        values: '0 0 0 0 0 0 0 0 0 1 1 1 1 1 1 1'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: ChronosDown
+        exp_alerts:
+          - exp_labels:
+              alertname: ChronosDown
+              severity: critical
+              job: chronos
+      - eval_time: 6m
+        alertname: ChronosNotReady
+        exp_alerts:
+          - exp_labels:
+              alertname: ChronosNotReady
+              severity: critical
+              job: chronos
+      - eval_time: 7m
+        alertname: ChronosIdentityLeaseLost
+        exp_alerts:
+          - exp_labels:
+              alertname: ChronosIdentityLeaseLost
+              severity: critical
+      - eval_time: 11m
+        alertname: ChronosLeaseExpired
+        exp_alerts:
+          - exp_labels:
+              alertname: ChronosLeaseExpired
+              severity: warning
+      - eval_time: 11m
+        alertname: ChronosTransferFailures
+        exp_alerts:
+          - exp_labels:
+              alertname: ChronosTransferFailures
+              severity: warning
+      - eval_time: 11m
+        alertname: ChronosWatchKeepaliveDropped
+        exp_alerts:
+          - exp_labels:
+              alertname: ChronosWatchKeepaliveDropped
+              severity: warning
+      - eval_time: 11m
+        alertname: ChronosShutdownEvents
+        exp_alerts:
+          - exp_labels:
+              alertname: ChronosShutdownEvents
+              severity: warning
+      - eval_time: 15m
+        alertname: ChronosStartupBootstrapFailures
+        exp_alerts:
+          - exp_labels:
+              alertname: ChronosStartupBootstrapFailures
+              severity: warning

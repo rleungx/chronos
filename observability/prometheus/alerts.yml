@@ -59,6 +59,15 @@ groups:
           summary: Chronos watch consumers are timing out
           description: Route/watch sends timed out in the last 10 minutes.
 
+      - alert: ChronosWatchKeepaliveDropped
+        expr: increase(tso_watch_keepalive_dropped_total{job="chronos"}[10m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: Chronos dropped watch keepalive events
+          description: Watch keepalive events were dropped due to backpressure in the last 10 minutes.
+
       - alert: ChronosProxySaturation
         expr: increase(tso_timeline_proxy_saturated_total{job="chronos"}[10m]) > 0
         for: 0m
@@ -67,6 +76,60 @@ groups:
         annotations:
           summary: Chronos timeline proxy saturated
           description: Timeline proxy saturation events were recorded in the last 10 minutes.
+
+      - alert: ChronosProxyTimeouts
+        expr: increase(tso_timeline_proxy_timeout_total{job="chronos"}[10m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: Chronos timeline proxy timed out
+          description: Timeline proxy timeout events were recorded in the last 10 minutes.
+
+      - alert: ChronosRuntimeCacheDegraded
+        expr: sum(increase(tso_timeline_runtime_cache_events_total{job="chronos",event="degraded_uncached"}[10m])) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: Chronos timeline runtime cache degraded to uncached serving
+          description: Runtime cache saturation forced uncached timeline serving in the last 10 minutes.
+
+      - alert: ChronosLeaseExpired
+        expr: increase(tso_lease_expired_total{job="chronos"}[10m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: Chronos observed lease expiration events
+          description: Lease expiration events were recorded in the last 10 minutes.
+
+      - alert: ChronosTransferFailures
+        expr: sum(increase(tso_transfer_outcomes_total{job="chronos",outcome=~"failed|blocked"}[10m])) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: Chronos transfer or failover actions failed
+          description: Transfer or failover actions were blocked or failed in the last 10 minutes.
+
+      - alert: ChronosRecoveryEvents
+        expr: sum(increase(tso_recovery_events_total{job="chronos"}[10m])) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: Chronos entered recovery paths
+          description: Recover-and-continue paths were exercised in the last 10 minutes.
+
+      - alert: ChronosShutdownEvents
+        expr: sum(increase(tso_shutdown_total{job="chronos"}[10m])) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: Chronos performed controlled shutdown actions
+          description: Controlled shutdown reasons were recorded in the last 10 minutes.
 
       - alert: ChronosStartupPreflightFailures
         expr: sum(increase(tso_startup_preflight_fail_total{job="chronos"}[15m])) > 0
