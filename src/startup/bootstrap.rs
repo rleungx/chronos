@@ -79,7 +79,7 @@ where
         result = "success",
         reason = "probe_begin"
     );
-    metadata.load_timeline("__chronos_startup_probe__").await?;
+    metadata.load_timeline_route("__chronos_startup_probe__").await?;
     metadata.load_generator(0).await?;
     let _ = metadata.subscribe_route_updates();
     info!(

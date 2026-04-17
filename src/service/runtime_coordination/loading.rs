@@ -3,7 +3,7 @@ use std::sync::Arc;
 use dashmap::DashMap;
 use tokio::sync::watch;
 
-use crate::metadata::TimelineRecord;
+use crate::metadata::{TimelineRecord, TimelineRouteRecord};
 use crate::TsoError;
 
 use super::super::TsoService;
@@ -76,9 +76,29 @@ impl TsoService {
         timeline_key: &str,
         cancellation: Option<crate::plane::RequestCancellation>,
     ) -> Result<Option<(TimelineRecord, u64)>, TsoError> {
+        // Singleflight only serializes one cold metadata load per timeline key. It does not retry
+        // failed loads internally; callers observe the underlying error and decide whether to retry.
         let _flight = self.acquire_timeline_load_singleflight(timeline_key).await;
         let _permit = self.acquire_timeline_load_permit(cancellation).await?;
         self.metadata.load_timeline(timeline_key).await
+    }
+
+    pub(in crate::service) async fn load_timeline_route_with_singleflight(
+        &self,
+        timeline_key: &str,
+    ) -> Result<Option<(TimelineRouteRecord, u64)>, TsoError> {
+        self.load_timeline_route_with_singleflight_and_cancellation(timeline_key, None)
+            .await
+    }
+
+    pub(in crate::service) async fn load_timeline_route_with_singleflight_and_cancellation(
+        &self,
+        timeline_key: &str,
+        cancellation: Option<crate::plane::RequestCancellation>,
+    ) -> Result<Option<(TimelineRouteRecord, u64)>, TsoError> {
+        let _flight = self.acquire_timeline_load_singleflight(timeline_key).await;
+        let _permit = self.acquire_timeline_load_permit(cancellation).await?;
+        self.metadata.load_timeline_route(timeline_key).await
     }
 }
 

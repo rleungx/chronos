@@ -7,7 +7,7 @@ pub(in crate::service) use loading::TimelineLoadCoordinator;
 use std::collections::HashMap;
 
 use crate::lifecycle::{TimelineLifecycleContract, TimelineServingReadiness};
-use crate::metadata::{GeneratorRecord, TimelineRecord};
+use crate::metadata::{GeneratorRecord, TimelineFilterRecord, TimelineRecord};
 use crate::service::endpoints_match;
 use crate::status::{
     build_timeline_status_snapshot, TimelineStatusListPage, TimelineStatusSnapshot,
@@ -17,15 +17,42 @@ use crate::{TimelineLifecycleState, TimelineRoute, TsoError};
 use super::TsoService;
 
 impl TsoService {
+    fn timeline_state_matches_status_filters(
+        state: TimelineLifecycleState,
+        route: &TimelineRoute,
+        states: &[TimelineLifecycleState],
+        owner_worker_endpoint: Option<&str>,
+    ) -> bool {
+        (states.is_empty() || states.contains(&state))
+            && owner_worker_endpoint
+                .map(|endpoint| endpoints_match(&route.owner_worker_endpoint, endpoint))
+                .unwrap_or(true)
+    }
+
     fn timeline_matches_status_filters(
         timeline: &TimelineRecord,
         states: &[TimelineLifecycleState],
         owner_worker_endpoint: Option<&str>,
     ) -> bool {
-        (states.is_empty() || states.contains(&timeline.state))
-            && owner_worker_endpoint
-                .map(|endpoint| endpoints_match(&timeline.route.owner_worker_endpoint, endpoint))
-                .unwrap_or(true)
+        Self::timeline_state_matches_status_filters(
+            timeline.state,
+            &timeline.route,
+            states,
+            owner_worker_endpoint,
+        )
+    }
+
+    fn timeline_filter_record_matches_status_filters(
+        timeline: &TimelineFilterRecord,
+        states: &[TimelineLifecycleState],
+        owner_worker_endpoint: Option<&str>,
+    ) -> bool {
+        Self::timeline_state_matches_status_filters(
+            timeline.state,
+            &timeline.route,
+            states,
+            owner_worker_endpoint,
+        )
     }
 
     pub(super) fn timeline_is_ready(state: TimelineLifecycleState) -> bool {
@@ -67,7 +94,7 @@ impl TsoService {
 
     pub async fn get_timeline_route(&self, timeline_key: &str) -> Result<TimelineRoute, TsoError> {
         let (record, _) = self
-            .load_timeline_with_singleflight(timeline_key)
+            .load_timeline_route_with_singleflight(timeline_key)
             .await?
             .ok_or_else(|| TsoError::TimelineNotFound {
                 timeline_key: timeline_key.to_owned(),
@@ -143,22 +170,27 @@ impl TsoService {
             }
             scan_cursor = page.next_start_after_timeline_key.clone();
 
+            let missing_generator_ids: Vec<_> = page
+                .records
+                .iter()
+                .filter(|timeline| {
+                    Self::timeline_matches_status_filters(timeline, states, owner_worker_endpoint)
+                })
+                .map(|timeline| timeline.route.generator_id)
+                .filter(|generator_id| !generator_cache.contains_key(generator_id))
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            if !missing_generator_ids.is_empty() {
+                generator_cache.extend(self.metadata.load_generators(&missing_generator_ids).await?);
+            }
+
             for timeline in page.records {
                 if !Self::timeline_matches_status_filters(&timeline, states, owner_worker_endpoint)
                 {
                     continue;
                 }
                 let generator_id = timeline.route.generator_id;
-                if let std::collections::hash_map::Entry::Vacant(entry) =
-                    generator_cache.entry(generator_id)
-                {
-                    let loaded = self
-                        .metadata
-                        .load_generator(generator_id)
-                        .await?
-                        .map(|(record, _)| record);
-                    entry.insert(loaded);
-                }
                 let generator = match generator_cache.get(&generator_id) {
                     Some(generator) => (*generator).as_ref(),
                     _ => None,
@@ -197,13 +229,17 @@ impl TsoService {
             loop {
                 let page = self
                     .metadata
-                    .list_timelines_page(lookahead_cursor.as_deref(), scan_limit)
+                    .list_timeline_filters_page(lookahead_cursor.as_deref(), scan_limit)
                     .await?;
                 if page.records.is_empty() {
                     break;
                 }
                 if page.records.iter().any(|timeline| {
-                    Self::timeline_matches_status_filters(timeline, states, owner_worker_endpoint)
+                    Self::timeline_filter_record_matches_status_filters(
+                        timeline,
+                        states,
+                        owner_worker_endpoint,
+                    )
                 }) {
                     has_more_matching = true;
                     break;
@@ -241,7 +277,7 @@ impl TsoService {
 
     pub async fn renew_timeline_lease(&self, timeline_key: &str) -> Result<(), TsoError> {
         let (record, _) = self
-            .load_timeline_with_singleflight(timeline_key)
+            .load_timeline_route_with_singleflight(timeline_key)
             .await?
             .ok_or_else(|| TsoError::TimelineNotFound {
                 timeline_key: timeline_key.to_owned(),
@@ -303,6 +339,19 @@ mod tests {
                 )
             );
         }
+    }
+
+    #[tokio::test]
+    async fn get_timeline_route_reads_route_without_full_record_use() {
+        let clock = Arc::new(ManualClock::new(19_500));
+        let metadata = Arc::new(MemoryMetadataStore::new());
+        let service = TsoService::new(required_test_config(TsoConfig::default()), clock, metadata)
+            .unwrap();
+
+        let route = service.ensure_timeline("runtime.route-only.read").await.unwrap();
+        let loaded = service.get_timeline_route(&route.timeline_key).await.unwrap();
+
+        assert_eq!(loaded, route);
     }
 
     #[tokio::test]

@@ -1,9 +1,11 @@
 use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::MutexGuard;
 use std::sync::{Mutex as StdMutex, Weak};
 use std::time::Duration;
 
+use futures::FutureExt;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
@@ -47,7 +49,11 @@ impl BackgroundCoordinator {
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        self.register_task(tokio::spawn(task));
+        self.register_task(tokio::spawn(async move {
+            if AssertUnwindSafe(task).catch_unwind().await.is_err() {
+                record_recovery_event("service", "background_task", "panic");
+            }
+        }));
     }
 
     pub(super) fn begin_shutdown(&self) -> bool {
@@ -112,10 +118,16 @@ impl TsoService {
                     };
                     let now_ms = service.clock.now_ms();
                     if let Some(generator_id) = service.next_generator_with_ownership_drift(now_ms) {
-                        let _ = service.ensure_generator_lease(generator_id).await;
+                        if service.ensure_generator_lease(generator_id).await.is_err() {
+                            record_recovery_event(
+                                "service",
+                                "background_generator_maintenance",
+                                "drift_reacquire_failed",
+                            );
+                        }
                     }
                     let keys = service.generator_runtime.lease_keys();
-                    service.refresh_generator_leases_batch(keys, now_ms).await;
+                    service.refresh_generator_leases_batch(keys).await;
                 }
             }
         }
@@ -127,6 +139,8 @@ mod tests {
     use std::panic::{self, AssertUnwindSafe};
     use std::sync::Arc;
     use tokio::sync::Notify;
+
+    use crate::metrics;
 
     use super::{AtomicBool, AtomicOrdering, BackgroundCoordinator, Duration};
 
@@ -187,5 +201,25 @@ mod tests {
         let _guard = coordinator.tasks_lock();
         drop(_guard);
         coordinator.abort_all();
+    }
+
+    #[tokio::test]
+    async fn spawn_tracked_records_recovery_event_when_task_panics() {
+        let coordinator = BackgroundCoordinator::new();
+        let before = metrics::TSO_RECOVERY_EVENTS_TOTAL
+            .with_label_values(&["service", "background_task", "panic"])
+            .get();
+
+        coordinator.spawn_tracked(async move {
+            panic!("background task panic should be recorded");
+        });
+        coordinator.drain_tasks().await;
+
+        assert!(
+            metrics::TSO_RECOVERY_EVENTS_TOTAL
+                .with_label_values(&["service", "background_task", "panic"])
+                .get()
+                > before
+        );
     }
 }
