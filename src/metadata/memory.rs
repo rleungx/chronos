@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     hash::Hash,
     sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard},
 };
@@ -16,7 +16,8 @@ use crate::{metrics, recovery::record_recovery_event, TimelineRoute, TsoError};
 use super::{
     types::{collect_timeline_route_update, RouteUpdateSignal},
     ControlPlaneStore, GeneratorBatchOp, GeneratorLeaseAuthority, GeneratorRecord,
-    RouteUpdateSource, TimelineAuthority, TimelineBatchOp, TimelineRecord, TimelineRecordListPage,
+    RouteUpdateSource, TimelineAuthority, TimelineBatchOp, TimelineFilterRecord,
+    TimelineFilterRecordListPage, TimelineRecord, TimelineRecordListPage, TimelineRouteRecord,
 };
 
 pub struct MemoryMetadataStore {
@@ -250,6 +251,29 @@ impl TimelineAuthority for MemoryMetadataStore {
             .transpose()
     }
 
+    async fn load_timeline_route(
+        &self,
+        timeline_key: &str,
+    ) -> Result<Option<(TimelineRouteRecord, u64)>, TsoError> {
+        let _timer = metrics::TSO_METADATA_LATENCY
+            .with_label_values(&["get_route"])
+            .start_timer();
+        self.records
+            .get(timeline_key)
+            .map(|entry| {
+                let (record, revision) = entry.value().clone();
+                record.validate_schema_version()?;
+                Ok((
+                    TimelineRouteRecord {
+                        schema_version: record.schema_version,
+                        route: record.route,
+                    },
+                    revision,
+                ))
+            })
+            .transpose()
+    }
+
     async fn list_timelines(&self) -> Result<Vec<TimelineRecord>, TsoError> {
         let _timer = metrics::TSO_METADATA_LATENCY
             .with_label_values(&["list"])
@@ -298,6 +322,49 @@ impl TimelineAuthority for MemoryMetadataStore {
         page_records.truncate(limit);
 
         Ok(TimelineRecordListPage {
+            records: page_records,
+            next_start_after_timeline_key,
+        })
+    }
+
+    async fn list_timeline_filters_page(
+        &self,
+        start_after_timeline_key: Option<&str>,
+        limit: usize,
+    ) -> Result<TimelineFilterRecordListPage, TsoError> {
+        let _timer = metrics::TSO_METADATA_LATENCY
+            .with_label_values(&["list_page_filters"])
+            .start_timer();
+        if limit == 0 {
+            return Ok(TimelineFilterRecordListPage {
+                records: Vec::new(),
+                next_start_after_timeline_key: None,
+            });
+        }
+
+        let timeline_keys = self.sorted_timeline_keys();
+        let start_index = start_after_timeline_key
+            .map(|start_after| {
+                timeline_keys.partition_point(|timeline_key| timeline_key.as_str() <= start_after)
+            })
+            .unwrap_or(0);
+        let mut page_records = Vec::with_capacity(limit + 1);
+        for timeline_key in timeline_keys.iter().skip(start_index).take(limit + 1) {
+            if let Some(record) = self.records.get(timeline_key.as_str()) {
+                let record = record.value().0.clone();
+                record.validate_schema_version()?;
+                page_records.push(TimelineFilterRecord {
+                    schema_version: record.schema_version,
+                    route: record.route,
+                    state: record.state,
+                });
+            }
+        }
+        let next_start_after_timeline_key = (page_records.len() > limit)
+            .then(|| page_records[limit - 1].route.timeline_key.clone());
+        page_records.truncate(limit);
+
+        Ok(TimelineFilterRecordListPage {
             records: page_records,
             next_start_after_timeline_key,
         })
@@ -457,6 +524,29 @@ impl GeneratorLeaseAuthority for MemoryMetadataStore {
                 Ok((record, revision))
             })
             .transpose()
+    }
+
+    async fn load_generators(
+        &self,
+        generator_ids: &[u32],
+    ) -> Result<HashMap<u32, Option<GeneratorRecord>>, TsoError> {
+        let _timer = metrics::TSO_METADATA_LATENCY
+            .with_label_values(&["get_generator_batch"])
+            .start_timer();
+        let mut loaded = HashMap::with_capacity(generator_ids.len());
+        for &generator_id in generator_ids {
+            let record = self
+                .generators
+                .get(&generator_id)
+                .map(|entry| {
+                    let (record, _) = entry.value().clone();
+                    record.validate_schema_version()?;
+                    Ok(record)
+                })
+                .transpose()?;
+            loaded.insert(generator_id, record);
+        }
+        Ok(loaded)
     }
 
     async fn create_generator(
