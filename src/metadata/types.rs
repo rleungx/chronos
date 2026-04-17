@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use tokio::sync::broadcast;
 
 use crate::{TimelineLifecycleState, TimelineRoute, TsoError};
@@ -30,6 +31,22 @@ pub struct TimelineRecord {
     pub lease_expire_at_ms: Option<u64>,
     #[serde(default)]
     pub updated_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TimelineFilterRecord {
+    #[serde(default = "default_metadata_schema_version")]
+    pub schema_version: u32,
+    pub route: TimelineRoute,
+    #[serde(default = "default_timeline_state")]
+    pub state: TimelineLifecycleState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TimelineRouteRecord {
+    #[serde(default = "default_metadata_schema_version")]
+    pub schema_version: u32,
+    pub route: TimelineRoute,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -72,6 +89,32 @@ impl TimelineRecord {
     }
 }
 
+impl TimelineFilterRecord {
+    pub fn validate_schema_version(&self) -> Result<(), TsoError> {
+        if self.schema_version == CURRENT_METADATA_SCHEMA_VERSION {
+            Ok(())
+        } else {
+            Err(TsoError::Internal(format!(
+                "unsupported timeline metadata schema_version {}",
+                self.schema_version
+            )))
+        }
+    }
+}
+
+impl TimelineRouteRecord {
+    pub fn validate_schema_version(&self) -> Result<(), TsoError> {
+        if self.schema_version == CURRENT_METADATA_SCHEMA_VERSION {
+            Ok(())
+        } else {
+            Err(TsoError::Internal(format!(
+                "unsupported timeline metadata schema_version {}",
+                self.schema_version
+            )))
+        }
+    }
+}
+
 impl GeneratorRecord {
     pub fn validate_schema_version(&self) -> Result<(), TsoError> {
         if self.schema_version == CURRENT_METADATA_SCHEMA_VERSION {
@@ -101,6 +144,12 @@ pub struct TimelineBatchOp {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TimelineRecordListPage {
     pub records: Vec<TimelineRecord>,
+    pub next_start_after_timeline_key: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TimelineFilterRecordListPage {
+    pub records: Vec<TimelineFilterRecord>,
     pub next_start_after_timeline_key: Option<String>,
 }
 
@@ -155,6 +204,22 @@ pub trait TimelineAuthority: Send + Sync {
         &self,
         timeline_key: &str,
     ) -> Result<Option<(TimelineRecord, u64)>, TsoError>;
+    async fn load_timeline_route(
+        &self,
+        timeline_key: &str,
+    ) -> Result<Option<(TimelineRouteRecord, u64)>, TsoError> {
+        self.load_timeline(timeline_key).await.map(|loaded| {
+            loaded.map(|(record, revision)| {
+                (
+                    TimelineRouteRecord {
+                        schema_version: record.schema_version,
+                        route: record.route,
+                    },
+                    revision,
+                )
+            })
+        })
+    }
     async fn list_timelines(&self) -> Result<Vec<TimelineRecord>, TsoError>;
     async fn list_timelines_page(
         &self,
@@ -188,6 +253,25 @@ pub trait TimelineAuthority: Send + Sync {
         Ok(TimelineRecordListPage {
             records: page_records,
             next_start_after_timeline_key,
+        })
+    }
+    async fn list_timeline_filters_page(
+        &self,
+        start_after_timeline_key: Option<&str>,
+        limit: usize,
+    ) -> Result<TimelineFilterRecordListPage, TsoError> {
+        let page = self.list_timelines_page(start_after_timeline_key, limit).await?;
+        Ok(TimelineFilterRecordListPage {
+            records: page
+                .records
+                .into_iter()
+                .map(|record| TimelineFilterRecord {
+                    schema_version: record.schema_version,
+                    route: record.route,
+                    state: record.state,
+                })
+                .collect(),
+            next_start_after_timeline_key: page.next_start_after_timeline_key,
         })
     }
     async fn create_timeline(
@@ -226,6 +310,21 @@ pub trait GeneratorLeaseAuthority: Send + Sync {
         &self,
         generator_id: u32,
     ) -> Result<Option<(GeneratorRecord, u64)>, TsoError>;
+    async fn load_generators(
+        &self,
+        generator_ids: &[u32],
+    ) -> Result<HashMap<u32, Option<GeneratorRecord>>, TsoError> {
+        let mut loaded = HashMap::with_capacity(generator_ids.len());
+        for &generator_id in generator_ids {
+            loaded.insert(
+                generator_id,
+                self.load_generator(generator_id)
+                    .await?
+                    .map(|(record, _)| record),
+            );
+        }
+        Ok(loaded)
+    }
     async fn create_generator(
         &self,
         generator_id: u32,
@@ -354,5 +453,22 @@ mod tests {
             record.validate_schema_version(),
             Err(TsoError::Internal(_))
         ));
+    }
+
+    #[test]
+    fn timeline_filter_record_rejects_unknown_schema_version() {
+        let mut record = TimelineFilterRecord {
+            schema_version: CURRENT_METADATA_SCHEMA_VERSION + 1,
+            route: sample_route(7, 1),
+            state: TimelineLifecycleState::Active,
+        };
+
+        assert!(matches!(
+            record.validate_schema_version(),
+            Err(TsoError::Internal(_))
+        ));
+
+        record.schema_version = CURRENT_METADATA_SCHEMA_VERSION;
+        assert!(record.validate_schema_version().is_ok());
     }
 }

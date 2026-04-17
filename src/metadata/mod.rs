@@ -12,8 +12,9 @@ pub use identity::InstanceIdentityLease;
 pub use memory::MemoryMetadataStore;
 pub use types::{
     ControlPlaneStore, GeneratorBatchOp, GeneratorLeaseAuthority, GeneratorRecord,
-    RouteUpdateSignal, RouteUpdateSource, TimelineAuthority, TimelineBatchOp, TimelineRecord,
-    TimelineRecordListPage,
+    RouteUpdateSignal, RouteUpdateSource, TimelineAuthority, TimelineBatchOp,
+    TimelineFilterRecord, TimelineFilterRecordListPage, TimelineRecord, TimelineRecordListPage,
+    TimelineRouteRecord,
 };
 
 #[async_trait]
