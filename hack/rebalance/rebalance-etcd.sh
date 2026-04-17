@@ -27,6 +27,10 @@ TIMELINE_NAMESPACE="${CHRONOS_REBALANCE_NAMESPACE:-rebalancebench-${UNIQUE_SUFFI
 WORKER_ID_A="${CHRONOS_REBALANCE_WORKER_ID_A:-worker-rebalance-a}"
 WORKER_ID_B="${CHRONOS_REBALANCE_WORKER_ID_B:-worker-rebalance-b}"
 SAFETY_GAP_MS="${CHRONOS_REBALANCE_SAFETY_GAP_MS:-1}"
+ALLOCATE_SUCCESS_PER_SEC_MIN="${CHRONOS_REBALANCE_ALLOCATE_SUCCESS_PER_SEC_MIN:-5}"
+ALLOCATE_LATENCY_P95_US_MAX="${CHRONOS_REBALANCE_ALLOCATE_LATENCY_P95_US_MAX:-500000}"
+ROUTE_REFRESH_P95_US_MAX="${CHRONOS_REBALANCE_ROUTE_REFRESH_P95_US_MAX:-500000}"
+TRANSFER_LATENCY_P95_US_MAX="${CHRONOS_REBALANCE_TRANSFER_LATENCY_P95_US_MAX:-5000000}"
 ARTIFACT_ROOT="${CHRONOS_REBALANCE_ARTIFACT_DIR:-${CHRONOS_ARTIFACT_DIR:-}}"
 KEEP_ARTIFACTS_ON_SUCCESS="${CHRONOS_REBALANCE_KEEP_ARTIFACTS_ON_SUCCESS:-${CHRONOS_KEEP_ARTIFACTS_ON_SUCCESS:-0}}"
 STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -91,6 +95,10 @@ timeline_namespace=${TIMELINE_NAMESPACE}
 worker_id_a=${WORKER_ID_A}
 worker_id_b=${WORKER_ID_B}
 safety_gap_ms=${SAFETY_GAP_MS}
+allocate_success_per_sec_min=${ALLOCATE_SUCCESS_PER_SEC_MIN}
+allocate_latency_p95_us_max=${ALLOCATE_LATENCY_P95_US_MAX}
+route_refresh_p95_us_max=${ROUTE_REFRESH_P95_US_MAX}
+transfer_latency_p95_us_max=${TRANSFER_LATENCY_P95_US_MAX}
 artifact_dir=${ARTIFACT_DIR}
 artifact_index=${INDEX_LOG}
 chronos_a_log=${CHRONOS_A_LOG}
@@ -212,6 +220,38 @@ assert_zero_metric() {
   }
 }
 
+assert_metric_at_least() {
+  local key=$1
+  local file=$2
+  local minimum=$3
+  local value
+  value="$(extract_metric "${key}" "${file}")"
+  if [[ -z "${value}" ]]; then
+    echo "missing metric ${key} in ${file}" >&2
+    return 1
+  fi
+  python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) >= float(sys.argv[2]) else 1)' "${value}" "${minimum}" || {
+    echo "metric ${key} must be >= ${minimum}, got ${value}" >&2
+    return 1
+  }
+}
+
+assert_metric_at_most() {
+  local key=$1
+  local file=$2
+  local maximum=$3
+  local value
+  value="$(extract_metric "${key}" "${file}")"
+  if [[ -z "${value}" ]]; then
+    echo "missing metric ${key} in ${file}" >&2
+    return 1
+  fi
+  python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) <= float(sys.argv[2]) else 1)' "${value}" "${maximum}" || {
+    echo "metric ${key} must be <= ${maximum}, got ${value}" >&2
+    return 1
+  }
+}
+
 echo "[rebalance] resetting etcd"
 make etcd-reset >/dev/null
 echo "[rebalance] starting etcd"
@@ -275,6 +315,10 @@ assert_positive_metric "allocate_success_total" "${REBALANCE_LOG}"
 assert_positive_metric "transfer_attempts_total" "${REBALANCE_LOG}"
 assert_positive_metric "transfer_success_total" "${REBALANCE_LOG}"
 assert_positive_metric "route_refresh_total" "${REBALANCE_LOG}"
+assert_metric_at_least "allocate_success_per_sec" "${REBALANCE_LOG}" "${ALLOCATE_SUCCESS_PER_SEC_MIN}"
+assert_metric_at_most "allocate_latency_p95_us" "${REBALANCE_LOG}" "${ALLOCATE_LATENCY_P95_US_MAX}"
+assert_metric_at_most "route_refresh_p95_us" "${REBALANCE_LOG}" "${ROUTE_REFRESH_P95_US_MAX}"
+assert_metric_at_most "transfer_latency_p95_us" "${REBALANCE_LOG}" "${TRANSFER_LATENCY_P95_US_MAX}"
 assert_zero_metric "transfer_failed_total" "${REBALANCE_LOG}"
 assert_zero_metric "monotonicity_violations_total" "${REBALANCE_LOG}"
 
