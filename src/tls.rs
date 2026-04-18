@@ -1,6 +1,7 @@
 use std::fs;
 use std::io::Cursor;
 
+use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::RootCertStore;
 
@@ -15,8 +16,7 @@ pub fn parse_pem_certificates(
     pem: &[u8],
     env_key: &str,
 ) -> Result<Vec<CertificateDer<'static>>, TsoError> {
-    let mut reader = Cursor::new(pem);
-    let certs = rustls_pemfile::certs(&mut reader)
+    let certs = CertificateDer::pem_reader_iter(&mut Cursor::new(pem))
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| {
             TsoError::Internal(format!("{env_key} could not parse certificates: {error}"))
@@ -33,10 +33,8 @@ pub fn parse_pem_private_key(
     pem: &[u8],
     env_key: &str,
 ) -> Result<PrivateKeyDer<'static>, TsoError> {
-    let mut reader = Cursor::new(pem);
-    rustls_pemfile::private_key(&mut reader)
-        .map_err(|error| TsoError::Internal(format!("{env_key} could not parse key: {error}")))?
-        .ok_or_else(|| TsoError::Internal(format!("{env_key} did not contain a private key")))
+    PrivateKeyDer::from_pem_slice(pem)
+        .map_err(|error| TsoError::Internal(format!("{env_key} could not parse key: {error}")))
 }
 
 pub fn load_root_cert_store(pem: &[u8], env_key: &str) -> Result<RootCertStore, TsoError> {
