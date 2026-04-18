@@ -219,5 +219,5 @@ assert_metric_at_most "latency_p95_us" "${RECOVERY_BENCH_LOG}" "${RECOVERY_LATEN
 
 RESULT="success"
 write_summary
-write_artifact_index
+write_artifact_index "${ARTIFACT_DIR}" "${INDEX_LOG}"
 echo "[chaos] success"
