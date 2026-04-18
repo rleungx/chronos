@@ -4,6 +4,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+source "${REPO_ROOT}/hack/lib/common.sh"
 
 cd "${REPO_ROOT}"
 
@@ -49,27 +50,11 @@ first_success_after_kill_ms_max=${FIRST_SUCCESS_AFTER_KILL_MS_MAX}
 EOF
 }
 
-write_artifact_index() {
-  [[ -n "${INDEX_LOG}" ]] || return 0
-  mkdir -p "${ARTIFACT_DIR}"
-  python3 - <<'PY' "${ARTIFACT_DIR}" "${INDEX_LOG}"
-from pathlib import Path
-import sys
-
-artifact_dir = Path(sys.argv[1])
-index_path = Path(sys.argv[2])
-lines = []
-for path in sorted(p for p in artifact_dir.iterdir() if p.is_file()):
-    lines.append(f"{path.name}\t{path.stat().st_size}")
-index_path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
-PY
-}
-
 cleanup() {
   local exit_code=$?
   RESULT=$([[ ${exit_code} -eq 0 ]] && echo success || echo failure)
   write_summary
-  write_artifact_index
+  write_artifact_index "${ARTIFACT_DIR}" "${INDEX_LOG}"
   if [[ ${exit_code} -ne 0 ]]; then
     echo
     echo "[failover] log: ${FAILOVER_LOG}" >&2
@@ -79,85 +64,6 @@ cleanup() {
   fi
 }
 trap cleanup EXIT
-
-extract_metric() {
-  local key=$1
-  local file=$2
-  awk -F '=' -v key="${key}" '$1 == key { print $2; exit }' "${file}"
-}
-
-assert_metric_present() {
-  local key=$1
-  local file=$2
-  local value
-  value="$(extract_metric "${key}" "${file}")"
-  if [[ -z "${value}" ]]; then
-    echo "missing metric ${key} in ${file}" >&2
-    return 1
-  fi
-}
-
-assert_positive_metric() {
-  local key=$1
-  local file=$2
-  local value
-  value="$(extract_metric "${key}" "${file}")"
-  if [[ -z "${value}" ]]; then
-    echo "missing metric ${key} in ${file}" >&2
-    return 1
-  fi
-  python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) > 0 else 1)' "${value}" || {
-    echo "metric ${key} must be > 0, got ${value}" >&2
-    return 1
-  }
-}
-
-assert_zero_metric() {
-  local key=$1
-  local file=$2
-  local value
-  value="$(extract_metric "${key}" "${file}")"
-  if [[ -z "${value}" ]]; then
-    echo "missing metric ${key} in ${file}" >&2
-    return 1
-  fi
-  [[ "${value}" == "0" ]] || {
-    echo "metric ${key} must be 0, got ${value}" >&2
-    return 1
-  }
-}
-
-assert_metric_at_least() {
-  local key=$1
-  local file=$2
-  local minimum=$3
-  local value
-  value="$(extract_metric "${key}" "${file}")"
-  if [[ -z "${value}" ]]; then
-    echo "missing metric ${key} in ${file}" >&2
-    return 1
-  fi
-  python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) >= float(sys.argv[2]) else 1)' "${value}" "${minimum}" || {
-    echo "metric ${key} must be >= ${minimum}, got ${value}" >&2
-    return 1
-  }
-}
-
-assert_metric_at_most() {
-  local key=$1
-  local file=$2
-  local maximum=$3
-  local value
-  value="$(extract_metric "${key}" "${file}")"
-  if [[ -z "${value}" ]]; then
-    echo "missing metric ${key} in ${file}" >&2
-    return 1
-  fi
-  python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) <= float(sys.argv[2]) else 1)' "${value}" "${maximum}" || {
-    echo "metric ${key} must be <= ${maximum}, got ${value}" >&2
-    return 1
-  }
-}
 
 echo "[failover] building binaries"
 cargo build --locked --bin chronos --bin chronos-failover-bench >/dev/null
