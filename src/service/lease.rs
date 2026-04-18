@@ -74,6 +74,10 @@ impl TsoService {
                                 self.lookup_generator(generator_id)?
                                     .init_after_floor(generator_floor_tso)?;
                             }
+                            self.generator_runtime.mark_generator_ready_for_lease(
+                                generator_id,
+                                record.generator_lease_token,
+                            );
                             self.generator_runtime.upsert_lease(
                                 generator_id,
                                 crate::runtime::GeneratorLeaseState {
@@ -141,6 +145,10 @@ impl TsoService {
                                     self.lookup_generator(generator_id)?
                                         .init_after_floor(generator_floor_tso)?;
                                 }
+                                self.generator_runtime.mark_generator_ready_for_lease(
+                                    generator_id,
+                                    record.generator_lease_token,
+                                );
                                 self.generator_runtime.upsert_lease(
                                     generator_id,
                                     crate::runtime::GeneratorLeaseState {
@@ -191,6 +199,10 @@ impl TsoService {
                     };
                     match self.metadata.create_generator(generator_id, &record).await {
                         Ok(revision) => {
+                            self.generator_runtime.mark_generator_ready_for_lease(
+                                generator_id,
+                                record.generator_lease_token,
+                            );
                             self.generator_runtime.upsert_lease(
                                 generator_id,
                                 crate::runtime::GeneratorLeaseState {
@@ -359,6 +371,8 @@ impl TsoService {
             .await
         {
             Ok(new_rev) => {
+                self.generator_runtime
+                    .mark_generator_ready_for_lease(generator_id, record.generator_lease_token);
                 self.generator_runtime.upsert_lease(
                     generator_id,
                     crate::runtime::GeneratorLeaseState {
@@ -495,6 +509,8 @@ impl TsoService {
                     next_states.into_iter().zip(revisions.into_iter())
                 {
                     state.revision = revision;
+                    self.generator_runtime
+                        .mark_generator_ready_for_lease(generator_id, state.generator_lease_token);
                     self.generator_runtime.upsert_lease(generator_id, state);
                     self.clear_generator_ownership_drift(generator_id);
                 }
@@ -1245,6 +1261,9 @@ mod tests {
 
         service.background.begin_shutdown();
         service.background.drain_tasks().await;
+        service
+            .generator_runtime
+            .mark_generator_ready_for_lease(0, 1);
         service.generator_runtime.upsert_lease(
             0,
             crate::runtime::GeneratorLeaseState {
@@ -1281,6 +1300,9 @@ mod tests {
 
         service.background.begin_shutdown();
         service.background.drain_tasks().await;
+        service
+            .generator_runtime
+            .mark_generator_ready_for_lease(0, 1);
         service.generator_runtime.upsert_lease(
             0,
             crate::runtime::GeneratorLeaseState {

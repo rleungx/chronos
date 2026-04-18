@@ -6,10 +6,19 @@ use dashmap::DashMap;
 
 use crate::{encode_tso, metrics, next_cursor_after, TimestampRange, TsoError, SEQUENCE_CAPACITY};
 
+const MAX_GENERATOR_CONTENTION_RETRIES: u32 = 32;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AllocateAfterResult {
+    Allocated(Vec<TimestampRange>),
+    Contended,
+}
+
 #[derive(Debug)]
 pub(crate) struct Generator {
     id: u32,
     next_index: AtomicU64,
+    ready_lease_token: AtomicU64,
 }
 
 impl Generator {
@@ -17,6 +26,7 @@ impl Generator {
         Self {
             id,
             next_index: AtomicU64::new(0),
+            ready_lease_token: AtomicU64::new(0),
         }
     }
 
@@ -33,6 +43,20 @@ impl Generator {
         // preserving the highest observed floor-derived position.
         self.next_index.fetch_max(index, AtomicOrdering::AcqRel);
         Ok(())
+    }
+
+    pub(crate) fn mark_ready_for_lease(&self, generator_lease_token: u64) {
+        self.ready_lease_token
+            .store(generator_lease_token, AtomicOrdering::Release);
+    }
+
+    pub(crate) fn clear_ready_lease(&self) {
+        self.ready_lease_token.store(0, AtomicOrdering::Release);
+    }
+
+    pub(crate) fn ready_for_lease(&self, generator_lease_token: u64) -> bool {
+        generator_lease_token != 0
+            && self.ready_lease_token.load(AtomicOrdering::Acquire) == generator_lease_token
     }
 
     pub(crate) fn current_last_issued_tso(&self) -> Result<Option<u64>, TsoError> {
@@ -55,7 +79,7 @@ impl Generator {
         max_future_borrow_ms: u64,
         max_clock_rewind_ms: u64,
         issued_upper_bound: Option<u64>,
-    ) -> Result<Vec<TimestampRange>, TsoError> {
+    ) -> Result<AllocateAfterResult, TsoError> {
         let cap = SEQUENCE_CAPACITY as u64;
         let count_u64 = u64::from(count);
         let mut contention_retries = 0u32;
@@ -151,10 +175,13 @@ impl Generator {
 
                     metrics::TSO_ALLOCATE_COUNT_TOTAL.inc_by(count as u64);
                     metrics::TSO_SEQUENCE_UTILIZATION.set((new_index % cap) as i64);
-                    return Ok(ranges);
+                    return Ok(AllocateAfterResult::Allocated(ranges));
                 }
                 Err(_) => {
                     contention_retries = contention_retries.saturating_add(1);
+                    if contention_retries >= MAX_GENERATOR_CONTENTION_RETRIES {
+                        return Ok(AllocateAfterResult::Contended);
+                    }
                     Self::contention_pause(contention_retries);
                 }
             }
@@ -223,7 +250,11 @@ impl GeneratorRuntimeState {
     ) -> bool {
         self.leases
             .get(&generator_id)
-            .map(|lease| Self::lease_matches_owner_and_time(&lease, owner_instance_id, now_ms))
+            .map(|lease| {
+                Self::lease_matches_owner_and_time(&lease, owner_instance_id, now_ms)
+                    && self.generators[generator_id as usize]
+                        .ready_for_lease(lease.generator_lease_token)
+            })
             .unwrap_or(false)
     }
 
@@ -234,10 +265,23 @@ impl GeneratorRuntimeState {
         now_ms: u64,
     ) -> Option<u64> {
         self.leases.get(&generator_id).and_then(|lease| {
-            Self::lease_matches_owner_and_time(&lease, owner_instance_id, now_ms)
-                .then_some(lease.issued_upper_bound)
-                .flatten()
+            if Self::lease_matches_owner_and_time(&lease, owner_instance_id, now_ms)
+                && self.generators[generator_id as usize]
+                    .ready_for_lease(lease.generator_lease_token)
+            {
+                lease.issued_upper_bound
+            } else {
+                None
+            }
         })
+    }
+
+    pub(crate) fn mark_generator_ready_for_lease(
+        &self,
+        generator_id: u32,
+        generator_lease_token: u64,
+    ) {
+        self.generators[generator_id as usize].mark_ready_for_lease(generator_lease_token);
     }
 
     fn lease_matches_owner_and_time(
@@ -254,10 +298,14 @@ impl GeneratorRuntimeState {
 
     pub(crate) fn remove_lease(&self, generator_id: u32) {
         self.leases.remove(&generator_id);
+        self.generators[generator_id as usize].clear_ready_lease();
     }
 
     pub(crate) fn clear_leases(&self) {
         self.leases.clear();
+        for generator in &self.generators {
+            generator.clear_ready_lease();
+        }
     }
 
     pub(crate) fn claimed_generator_for_timeline(&self, timeline_key: &str) -> Option<u32> {
@@ -310,6 +358,10 @@ mod tests {
         let ranges = generator
             .allocate_after(SEQUENCE_CAPACITY + 1, None, 5, 2, 0, None)
             .expect("allocation should succeed");
+        let ranges = match ranges {
+            AllocateAfterResult::Allocated(ranges) => ranges,
+            AllocateAfterResult::Contended => panic!("allocation should not contend"),
+        };
 
         assert_eq!(ranges.len(), 2);
         assert_eq!(ranges[0].start_tso, encode_tso(5, 7, 0).unwrap());
@@ -329,6 +381,10 @@ mod tests {
         let ranges = generator
             .allocate_after(2, Some(floor), 1, 10, 0, None)
             .expect("allocation should honor floor");
+        let ranges = match ranges {
+            AllocateAfterResult::Allocated(ranges) => ranges,
+            AllocateAfterResult::Contended => panic!("allocation should not contend"),
+        };
 
         assert_eq!(ranges.len(), 1);
         assert_eq!(ranges[0].start_tso, encode_tso(8, 3, 10).unwrap());
@@ -394,7 +450,10 @@ mod tests {
             handles.push(std::thread::spawn(move || {
                 let mut issued = Vec::new();
                 for _ in 0..64 {
-                    let range = generator.allocate_after(1, None, 10, 0, 0, None).unwrap();
+                    let range = match generator.allocate_after(1, None, 10, 0, 0, None).unwrap() {
+                        AllocateAfterResult::Allocated(range) => range,
+                        AllocateAfterResult::Contended => continue,
+                    };
                     issued.push(range[0].start_tso);
                 }
                 issued
@@ -415,6 +474,7 @@ mod tests {
     #[test]
     fn lease_validation_requires_matching_owner_and_unexpired_time() {
         let runtime = GeneratorRuntimeState::new(2);
+        runtime.mark_generator_ready_for_lease(1, 11);
         runtime.upsert_lease(
             1,
             GeneratorLeaseState {
@@ -441,6 +501,35 @@ mod tests {
         assert_eq!(
             runtime.valid_lease_upper_bound_for_owner(1, "worker-a", 500),
             None
+        );
+    }
+
+    #[test]
+    fn lease_validation_requires_generator_ready_for_current_token() {
+        let runtime = GeneratorRuntimeState::new(2);
+        runtime.upsert_lease(
+            1,
+            GeneratorLeaseState {
+                revision: 7,
+                owner_instance_id: "worker-a".to_owned(),
+                generator_lease_token: 11,
+                lease_expire_at_ms: 500,
+                last_persisted_tso: Some(99),
+                issued_upper_bound: Some(123),
+            },
+        );
+
+        assert!(!runtime.lease_valid_for_owner(1, "worker-a", 499));
+        assert_eq!(
+            runtime.valid_lease_upper_bound_for_owner(1, "worker-a", 499),
+            None
+        );
+
+        runtime.mark_generator_ready_for_lease(1, 11);
+        assert!(runtime.lease_valid_for_owner(1, "worker-a", 499));
+        assert_eq!(
+            runtime.valid_lease_upper_bound_for_owner(1, "worker-a", 499),
+            Some(123)
         );
     }
 

@@ -85,6 +85,8 @@ pub enum TsoError {
         timeline_key: String,
         max_entries: usize,
     },
+    #[error("generator allocation contention exceeded retry budget: generator {generator_id}")]
+    AllocationContention { generator_id: u32 },
     #[error("not timeline owner: {owner_worker_endpoint}")]
     NotTimelineOwner { owner_worker_endpoint: String },
     #[error("not generator owner: generator {generator_id} is owned by {owner_worker_endpoint}")]
