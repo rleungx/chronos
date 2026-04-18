@@ -30,6 +30,9 @@ tests:
               alertname: ChronosDown
               severity: critical
               job: chronos
+            exp_annotations:
+              summary: Chronos metrics target is down
+              description: Prometheus cannot scrape the Chronos metrics endpoint for 2 minutes.
       - eval_time: 6m
         alertname: ChronosNotReady
         exp_alerts:
@@ -37,39 +40,64 @@ tests:
               alertname: ChronosNotReady
               severity: critical
               job: chronos
+            exp_annotations:
+              summary: Chronos is not ready
+              description: Chronos has remained not-ready for at least 5 minutes.
       - eval_time: 7m
         alertname: ChronosIdentityLeaseLost
         exp_alerts:
           - exp_labels:
               alertname: ChronosIdentityLeaseLost
+              event: lost
+              job: chronos
               severity: critical
+            exp_annotations:
+              summary: Chronos lost its identity lease
+              description: Identity lease loss was observed in the last 5 minutes.
       - eval_time: 11m
         alertname: ChronosLeaseExpired
         exp_alerts:
           - exp_labels:
               alertname: ChronosLeaseExpired
+              job: chronos
               severity: warning
+            exp_annotations:
+              summary: Chronos observed lease expiration events
+              description: Lease expiration events were recorded in the last 10 minutes.
       - eval_time: 11m
         alertname: ChronosTransferFailures
         exp_alerts:
           - exp_labels:
               alertname: ChronosTransferFailures
               severity: warning
+            exp_annotations:
+              summary: Chronos transfer or failover actions failed
+              description: Transfer or failover actions were blocked or failed in the last 10 minutes.
       - eval_time: 11m
         alertname: ChronosWatchKeepaliveDropped
         exp_alerts:
           - exp_labels:
               alertname: ChronosWatchKeepaliveDropped
+              job: chronos
               severity: warning
+            exp_annotations:
+              summary: Chronos dropped watch keepalive events
+              description: Watch keepalive events were dropped due to backpressure in the last 10 minutes.
       - eval_time: 11m
         alertname: ChronosShutdownEvents
         exp_alerts:
           - exp_labels:
               alertname: ChronosShutdownEvents
               severity: warning
+            exp_annotations:
+              summary: Chronos performed controlled shutdown actions
+              description: Controlled shutdown reasons were recorded in the last 10 minutes.
       - eval_time: 15m
         alertname: ChronosStartupBootstrapFailures
         exp_alerts:
           - exp_labels:
               alertname: ChronosStartupBootstrapFailures
               severity: warning
+            exp_annotations:
+              summary: Chronos startup bootstrap failures detected
+              description: Startup bootstrap failures were recorded in the last 15 minutes.
