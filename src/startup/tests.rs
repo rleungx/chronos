@@ -23,6 +23,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::{MutexGuard, Once};
 use std::time::Duration;
 use tokio::sync::watch;
 
@@ -50,6 +51,20 @@ fn parsed_test_etcd_endpoints() -> Vec<String> {
         .map(|endpoint| endpoint.trim().to_string())
         .filter(|endpoint| !endpoint.is_empty())
         .collect()
+}
+
+fn install_test_crypto_provider() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
+fn startup_ready_guard() -> MutexGuard<'static, ()> {
+    install_test_crypto_provider();
+    STARTUP_READY_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
 }
 
 fn explicit_required_config() -> TsoConfig {
@@ -139,6 +154,7 @@ fn unique_temp_dir(label: &str) -> PathBuf {
 }
 
 fn build_metrics_tls_fixture() -> MetricsTlsFixture {
+    install_test_crypto_provider();
     let dir = unique_temp_dir("metrics-tls");
 
     let mut ca_params = CertificateParams::new(vec!["chronos-metrics-ca".into()]).unwrap();
@@ -197,6 +213,7 @@ fn build_metrics_tls_connector(
     fixture: &MetricsTlsFixture,
     include_client_cert: bool,
 ) -> TlsConnector {
+    install_test_crypto_provider();
     let ca_cert = std::fs::read(&fixture.ca_cert_path).unwrap();
     let roots = load_root_cert_store(&ca_cert, "test metrics client ca").expect("load test CA");
     let builder = ClientConfig::builder().with_root_certificates(roots);
@@ -216,6 +233,7 @@ fn build_metrics_tls_connector(
 }
 
 fn build_test_mtls_acceptor(fixture: &MetricsTlsFixture) -> TlsAcceptor {
+    install_test_crypto_provider();
     let ca_cert = std::fs::read(&fixture.ca_cert_path).unwrap();
     let server_cert = std::fs::read(&fixture.server_cert_path).unwrap();
     let server_key = std::fs::read(&fixture.server_key_path).unwrap();
@@ -676,6 +694,7 @@ async fn serve_metrics_rejects_https_without_client_certificate() {
 
 #[tokio::test]
 async fn etcd_metadata_runtime_uses_configured_mtls_and_timeout() {
+    install_test_crypto_provider();
     let fixture = build_metrics_tls_fixture();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -1164,7 +1183,7 @@ fn identity_lease_loss_records_shutdown_metric() {
 
 #[test]
 fn request_shutdown_flips_readiness_and_notifies_watchers() {
-    let _guard = STARTUP_READY_LOCK.lock().unwrap();
+    let _guard = startup_ready_guard();
     let ready = Arc::new(AtomicBool::new(true));
     set_startup_ready(&ready, true);
     let health_status = test_health_status_handle();
@@ -1204,7 +1223,7 @@ fn request_shutdown_flips_readiness_and_notifies_watchers() {
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn critical_server_failure_requests_shutdown_and_returns_error() {
-    let _guard = STARTUP_READY_LOCK.lock().unwrap();
+    let _guard = startup_ready_guard();
     let ready = Arc::new(AtomicBool::new(true));
     set_startup_ready(&ready, true);
     let health_status = test_health_status_handle();
@@ -1260,7 +1279,7 @@ async fn critical_server_failure_requests_shutdown_and_returns_error() {
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn unexpected_critical_server_exit_without_shutdown_is_fatal() {
-    let _guard = STARTUP_READY_LOCK.lock().unwrap();
+    let _guard = startup_ready_guard();
     let ready = Arc::new(AtomicBool::new(true));
     set_startup_ready(&ready, true);
     let health_status = test_health_status_handle();
@@ -1298,7 +1317,7 @@ async fn unexpected_critical_server_exit_without_shutdown_is_fatal() {
 
 #[test]
 fn request_shutdown_preserves_identity_lease_loss_precedence() {
-    let _guard = STARTUP_READY_LOCK.lock().unwrap();
+    let _guard = startup_ready_guard();
     let ready = Arc::new(AtomicBool::new(true));
     set_startup_ready(&ready, true);
     let health_status = test_health_status_handle();
@@ -1523,7 +1542,7 @@ fn ownership_drift_clear_does_not_restore_ready_after_shutdown_or_identity_loss(
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn identity_lease_loss_flips_readiness_and_triggers_shutdown() {
-    let _guard = STARTUP_READY_LOCK.lock().unwrap();
+    let _guard = startup_ready_guard();
     let ready = Arc::new(AtomicBool::new(true));
     set_startup_ready(&ready, true);
     let health_status = HealthStatusHandle::serving(&chronos::HealthInfo {
@@ -1594,7 +1613,7 @@ async fn identity_lease_loss_flips_readiness_and_triggers_shutdown() {
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn identity_lease_loss_monitor_triggers_shutdown_when_receiver_is_already_lost() {
-    let _guard = STARTUP_READY_LOCK.lock().unwrap();
+    let _guard = startup_ready_guard();
     let ready = Arc::new(AtomicBool::new(true));
     set_startup_ready(&ready, true);
     let health_status = HealthStatusHandle::serving(&chronos::HealthInfo {
