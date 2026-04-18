@@ -1,0 +1,21 @@
+name: Supply Chain
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+  dependency-policy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.94.0
+      - name: Install cargo-deny
+        run: cargo install --locked cargo-deny --version 0.19.4
+      - name: Enforce dependency policy
+        run: cargo deny --all-features check advisories bans licenses sources

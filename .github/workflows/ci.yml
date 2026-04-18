@@ -34,6 +34,8 @@ jobs:
         run: make test-layer-3
       - name: Validate observability rules
         run: make observability-check
+      - name: Validate dependency policy
+        run: make dependency-check
 
   layer-4-real-etcd:
     runs-on: ubuntu-latest

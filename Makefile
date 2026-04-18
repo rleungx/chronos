@@ -18,6 +18,7 @@ ETCD_ENDPOINTS ?= 127.0.0.1:2379
 	test-chaos \
 	promtool-check \
 	observability-check \
+	dependency-check \
 	release-check \
 	observability-up \
 	observability-down
@@ -83,6 +84,10 @@ promtool-check:
 
 observability-check: promtool-check
 
+dependency-check:
+	cargo install --locked cargo-deny --version 0.19.4 >/dev/null 2>&1 || true
+	cargo deny --all-features check advisories bans licenses sources
+
 release-check:
 	CHRONOS_PROFILE=production \
 	CHRONOS_BUILD_COMMIT=$$(git rev-parse HEAD) \
@@ -98,6 +103,7 @@ release-check:
 	CHRONOS_ADVERTISE_ENDPOINT=127.0.0.1:50051 \
 	CHRONOS_METRICS_BIND_ADDR=127.0.0.1:9898 \
 	cargo run --bin chronos -- --print-effective-config
+	$(MAKE) dependency-check
 	cargo build --locked --release --bin chronos --bin chronos-bench --bin chronos-control-bench --bin chronos-failover-bench
 
 observability-up:
