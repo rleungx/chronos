@@ -95,8 +95,8 @@ fn build_transfer_timeline_response(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ResourceTier;
     use crate::proto::v1::TimelineState as ProtoTimelineState;
+    use crate::ResourceTier;
 
     #[test]
     fn normalize_transfer_request_defaults_target_owner_and_manual_reason() {
@@ -146,7 +146,10 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(matches!(error, TsoError::InvalidTransferReason { value: 0 }));
+        assert!(matches!(
+            error,
+            TsoError::InvalidTransferReason { value: 0 }
+        ));
     }
 
     #[test]

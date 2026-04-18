@@ -1625,7 +1625,10 @@ async fn identity_lease_loss_monitor_triggers_shutdown_when_receiver_is_already_
 
     assert!(!ready.load(Ordering::Relaxed));
     assert!(*shutdown_rx.borrow());
-    assert_eq!(health_status.readiness_reason(), WorkerReadinessReason::IdentityLeaseLost);
+    assert_eq!(
+        health_status.readiness_reason(),
+        WorkerReadinessReason::IdentityLeaseLost
+    );
     assert!(!health_status.identity_lease_healthy());
 }
 

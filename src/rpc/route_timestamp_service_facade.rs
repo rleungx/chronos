@@ -30,9 +30,9 @@ fn decode_resource_tier(resource_tier: i32) -> Result<ResourceTier, TsoError> {
         Ok(ProtoResourceTier::Shared) => Ok(ResourceTier::Shared),
         Ok(ProtoResourceTier::Warm) => Ok(ResourceTier::Warm),
         Ok(ProtoResourceTier::Dedicated) => Ok(ResourceTier::Dedicated),
-        Ok(ProtoResourceTier::Unspecified) | Err(_) => {
-            Err(TsoError::InvalidResourceTier { value: resource_tier })
-        }
+        Ok(ProtoResourceTier::Unspecified) | Err(_) => Err(TsoError::InvalidResourceTier {
+            value: resource_tier,
+        }),
     }
 }
 
@@ -60,8 +60,8 @@ impl TimelineRouteService for TsoRouteService {
         request: Request<EnsureTimelineRequest>,
     ) -> Result<Response<EnsureTimelineResponse>, Status> {
         let req = request.into_inner();
-        let tier = decode_resource_tier(req.desired_resource_tier)
-            .map_err(translation::map_tso_error)?;
+        let tier =
+            decode_resource_tier(req.desired_resource_tier).map_err(translation::map_tso_error)?;
 
         match self
             .control_plane
