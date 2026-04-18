@@ -404,14 +404,16 @@ impl TsoService {
                 .await;
         }
 
-        self.refresh_generator_lease_inner_with_cancellation(generator_id, now_ms, true, cancellation)
-            .await
+        self.refresh_generator_lease_inner_with_cancellation(
+            generator_id,
+            now_ms,
+            true,
+            cancellation,
+        )
+        .await
     }
 
-    pub(super) async fn refresh_generator_leases_batch(
-        &self,
-        generator_ids: Vec<u32>,
-    ) {
+    pub(super) async fn refresh_generator_leases_batch(&self, generator_ids: Vec<u32>) {
         if generator_ids.is_empty() {
             return;
         }

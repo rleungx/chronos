@@ -18,8 +18,7 @@ use chronos::{
     metadata::{EtcdMetadataStore, GeneratorLeaseAuthority, MemoryMetadataStore},
     AllocateTimestampsRequest, AllocateTimestampsResponse, ManualClock, ResourceTier,
     TimelineLifecycleState, TimelineRoute, TransferReason, TsoConfig, TsoError, TsoService,
-    MAX_PHYSICAL_MS,
-    SEQUENCE_CAPACITY,
+    MAX_PHYSICAL_MS, SEQUENCE_CAPACITY,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -66,7 +66,10 @@ impl TsoService {
         let checks = CachedTimelineChecks::new(self, request, &cached_route, cached_state);
         let cached_lease_upper_bound = (checks.matches_local_route() && checks.timeline_ready)
             .then(|| {
-                self.valid_generator_lease_upper_bound(cached_route.generator_id, self.clock.now_ms())
+                self.valid_generator_lease_upper_bound(
+                    cached_route.generator_id,
+                    self.clock.now_ms(),
+                )
             })
             .flatten();
 
@@ -92,19 +95,19 @@ impl TsoService {
         if checks.matches_local_route() && checks.timeline_ready {
             let generator_id = cached_route.generator_id;
             if let Some(issued_upper_bound) = cached_lease_upper_bound {
-                    return self
-                        .try_serve_timeline_state_handle_with_guard(
-                            request,
-                            timeline_state_handle,
-                            generator_id,
-                            self.clock.now_ms(),
-                            Some(issued_upper_bound),
-                            CachedServeGuardOptions {
-                                cancellation,
-                                revalidate_authority: false,
-                            },
-                        )
-                        .await;
+                return self
+                    .try_serve_timeline_state_handle_with_guard(
+                        request,
+                        timeline_state_handle,
+                        generator_id,
+                        self.clock.now_ms(),
+                        Some(issued_upper_bound),
+                        CachedServeGuardOptions {
+                            cancellation,
+                            revalidate_authority: false,
+                        },
+                    )
+                    .await;
             }
             match self
                 .ensure_generator_lease_for_allocation_with_cancellation(

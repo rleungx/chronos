@@ -2,9 +2,9 @@ mod serve;
 
 use std::sync::Arc;
 
+use self::serve::CachedServeGuardOptions;
 use crate::plane::RequestCancellation;
 use tokio::sync::Mutex;
-use self::serve::CachedServeGuardOptions;
 
 use crate::metadata::TimelineRecord;
 use crate::timeline_state::build_timeline_state;
@@ -282,6 +282,7 @@ mod tests {
     use tokio::sync::{broadcast, oneshot};
     use tokio::time::{timeout, Duration};
 
+    use super::serve::CachedServeGuardOptions;
     use crate::metadata::{
         ControlPlaneStore, GeneratorBatchOp, GeneratorLeaseAuthority, GeneratorRecord,
         MemoryMetadataStore, RouteUpdateSource, TimelineAuthority, TimelineBatchOp, TimelineRecord,
@@ -291,7 +292,6 @@ mod tests {
         AllocateTimestampsRequest, Clock, ManualClock, ResourceTier, TimelineLifecycleState,
         TsoConfig, TsoError, TsoSecurityMode, TsoService,
     };
-    use super::serve::CachedServeGuardOptions;
 
     #[derive(Clone)]
     struct BlockingGeneratorLoadStore {
@@ -1154,9 +1154,9 @@ mod tests {
             .await
             .unwrap();
 
-                let response = service
-                    .try_serve_timeline_state_handle_with_guard(
-                        &AllocateTimestampsRequest {
+        let response = service
+            .try_serve_timeline_state_handle_with_guard(
+                &AllocateTimestampsRequest {
                     timeline_key: route.timeline_key.clone(),
                     count: 1,
                     expected_epoch: route.epoch,
@@ -1175,8 +1175,14 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(response.is_none(), "post-lease guard should fail closed after cutover");
-        assert!(service.timeline_runtime.timeline_handle(&route.timeline_key).is_none());
+        assert!(
+            response.is_none(),
+            "post-lease guard should fail closed after cutover"
+        );
+        assert!(service
+            .timeline_runtime
+            .timeline_handle(&route.timeline_key)
+            .is_none());
     }
 
     #[tokio::test]
@@ -1315,7 +1321,10 @@ mod tests {
             .unwrap();
 
         assert!(response.is_none());
-        assert!(service.timeline_runtime.timeline_handle(&route.timeline_key).is_none());
+        assert!(service
+            .timeline_runtime
+            .timeline_handle(&route.timeline_key)
+            .is_none());
     }
 
     #[tokio::test]
@@ -1803,6 +1812,9 @@ mod tests {
             response.is_none(),
             "post-handle guard should force a retry when generator changes before serve"
         );
-        assert!(service.timeline_runtime.timeline_handle(&route.timeline_key).is_none());
+        assert!(service
+            .timeline_runtime
+            .timeline_handle(&route.timeline_key)
+            .is_none());
     }
 }
