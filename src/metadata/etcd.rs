@@ -153,7 +153,8 @@ fn prefix_range_end(prefix: &str) -> Vec<u8> {
 
 impl EtcdMetadataStore {
     async fn probe_metadata_runtime(&self) -> Result<(), TsoError> {
-        self.load_timeline_route("__chronos_startup_probe__").await?;
+        self.load_timeline_route("__chronos_startup_probe__")
+            .await?;
         self.load_generator(0).await?;
         Ok(())
     }
@@ -1109,13 +1110,18 @@ impl GeneratorLeaseAuthority for EtcdMetadataStore {
         let _timer = metrics::TSO_METADATA_LATENCY
             .with_label_values(&["get_generator_batch"])
             .start_timer();
-        let results = try_join_all(generator_ids.iter().copied().map(|generator_id| async move {
-            let record = self
-                .load_generator(generator_id)
-                .await?
-                .map(|(record, _)| record);
-            Ok::<(u32, Option<GeneratorRecord>), TsoError>((generator_id, record))
-        }))
+        let results = try_join_all(
+            generator_ids
+                .iter()
+                .copied()
+                .map(|generator_id| async move {
+                    let record = self
+                        .load_generator(generator_id)
+                        .await?
+                        .map(|(record, _)| record);
+                    Ok::<(u32, Option<GeneratorRecord>), TsoError>((generator_id, record))
+                }),
+        )
         .await?;
         Ok(results.into_iter().collect())
     }
@@ -1340,7 +1346,8 @@ mod tests {
             "updated_at_ms": 10
         });
 
-        let record: TimelineRouteRecord = serde_json::from_slice(payload.to_string().as_bytes()).unwrap();
+        let record: TimelineRouteRecord =
+            serde_json::from_slice(payload.to_string().as_bytes()).unwrap();
         assert_eq!(record.route, sample_route(7, 3));
         assert!(record.validate_schema_version().is_ok());
     }
