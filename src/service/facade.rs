@@ -216,14 +216,7 @@ impl TsoService {
 
     async fn collect_shutdown_inventory(
         &self,
-    ) -> Result<
-        (
-            Vec<TimelineRoute>,
-            HashSet<u32>,
-            ShutdownTransferCandidates,
-        ),
-        TsoError,
-    > {
+    ) -> Result<(Vec<TimelineRoute>, HashSet<u32>, ShutdownTransferCandidates), TsoError> {
         let mut local_timelines = Vec::new();
         let mut local_generator_ids = HashSet::new();
         let mut candidates = ShutdownTransferCandidates::default();

@@ -11,8 +11,8 @@ use crate::planning::{
     should_release_claimed_dedicated_generator,
     should_release_previous_dedicated_generator_after_route_change, TransferPlan,
 };
-use crate::timeline_state::build_timeline_state;
 use crate::service::endpoints_match;
+use crate::timeline_state::build_timeline_state;
 use crate::{ResourceTier, TimelineLifecycleState, TimelineRoute, TransferReason, TsoError};
 use telemetry::{
     log_failover_blocked, log_transfer_completed, log_transfer_failed,
@@ -268,7 +268,9 @@ impl TsoService {
         }
 
         if !self.is_local_endpoint(&transfer.owner_endpoint) && transfer.generator_id.is_some() {
-            if self.config.generator_ownership_modulo > 1 && self.owns_generator_id(new_generator_id) {
+            if self.config.generator_ownership_modulo > 1
+                && self.owns_generator_id(new_generator_id)
+            {
                 self.release_claimed_dedicated_if_needed(
                     timeline_key,
                     previous_route,
@@ -288,10 +290,15 @@ impl TsoService {
                 return Err(error);
             }
 
-            if let Some((generator_record, _)) = self.metadata.load_generator(new_generator_id).await?
+            if let Some((generator_record, _)) =
+                self.metadata.load_generator(new_generator_id).await?
             {
                 let lease_is_active = generator_record.lease_expire_at_ms.is_some_and(|exp| {
-                    !crate::lease_expired_with_safety_gap(exp, self.clock.now_ms(), self.config.safety_gap_ms)
+                    !crate::lease_expired_with_safety_gap(
+                        exp,
+                        self.clock.now_ms(),
+                        self.config.safety_gap_ms,
+                    )
                 });
                 if lease_is_active
                     && !endpoints_match(
@@ -560,8 +567,7 @@ mod tests {
 
     use crate::metadata::{GeneratorLeaseAuthority, MemoryMetadataStore};
     use crate::{
-        ManualClock, ResourceTier, TransferReason, TsoConfig, TsoError, TsoSecurityMode,
-        TsoService,
+        ManualClock, ResourceTier, TransferReason, TsoConfig, TsoError, TsoSecurityMode, TsoService,
     };
 
     fn required_test_config(config: TsoConfig) -> TsoConfig {
@@ -649,8 +655,12 @@ mod tests {
     async fn failover_requires_known_previous_generator_lease_expiry() {
         let clock = Arc::new(ManualClock::new(31_000));
         let metadata = Arc::new(MemoryMetadataStore::new());
-        let service = TsoService::new(with_worker(TsoConfig::default(), "worker-a"), clock, metadata)
-            .unwrap();
+        let service = TsoService::new(
+            with_worker(TsoConfig::default(), "worker-a"),
+            clock,
+            metadata,
+        )
+        .unwrap();
 
         let route = service
             .ensure_timeline("transfer-failover-missing-lease")
@@ -711,7 +721,10 @@ mod tests {
         )
         .unwrap();
 
-        let route = service.ensure_timeline("transfer-unsafe-remote").await.unwrap();
+        let route = service
+            .ensure_timeline("transfer-unsafe-remote")
+            .await
+            .unwrap();
         let error = service
             .transfer_timeline_for_rpc(
                 &route.timeline_key,
@@ -749,7 +762,10 @@ mod tests {
         )
         .unwrap();
 
-        let route = service.ensure_timeline("transfer-remote-owner-conflict").await.unwrap();
+        let route = service
+            .ensure_timeline("transfer-remote-owner-conflict")
+            .await
+            .unwrap();
         let conflicting_generator_id = route.generator_id + 1;
         metadata
             .create_generator(

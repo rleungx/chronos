@@ -182,7 +182,11 @@ impl TsoService {
                 .into_iter()
                 .collect();
             if !missing_generator_ids.is_empty() {
-                generator_cache.extend(self.metadata.load_generators(&missing_generator_ids).await?);
+                generator_cache.extend(
+                    self.metadata
+                        .load_generators(&missing_generator_ids)
+                        .await?,
+                );
             }
 
             for timeline in page.records {
@@ -345,11 +349,17 @@ mod tests {
     async fn get_timeline_route_reads_route_without_full_record_use() {
         let clock = Arc::new(ManualClock::new(19_500));
         let metadata = Arc::new(MemoryMetadataStore::new());
-        let service = TsoService::new(required_test_config(TsoConfig::default()), clock, metadata)
-            .unwrap();
+        let service =
+            TsoService::new(required_test_config(TsoConfig::default()), clock, metadata).unwrap();
 
-        let route = service.ensure_timeline("runtime.route-only.read").await.unwrap();
-        let loaded = service.get_timeline_route(&route.timeline_key).await.unwrap();
+        let route = service
+            .ensure_timeline("runtime.route-only.read")
+            .await
+            .unwrap();
+        let loaded = service
+            .get_timeline_route(&route.timeline_key)
+            .await
+            .unwrap();
 
         assert_eq!(loaded, route);
     }
