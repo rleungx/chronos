@@ -1,13 +1,30 @@
 # Chronos
 
-Chronos is a gRPC timestamp service.
+Chronos is a gRPC-based timestamp service for applications that need monotonic, timeline-scoped
+timestamp allocation without exposing routing, ownership, or failover mechanics to application
+code.
 
-The intended application-facing model is:
+From an application developer's perspective, the happy path is intentionally small:
 
 1. Create one client bound to one timeline
 2. Call one allocation API
 
-Everything else is internal client logic.
+Everything else — route discovery, stale-route recovery, owner changes, and retry behavior — is
+handled by the Chronos client/runtime layer.
+
+## What Chronos provides
+
+- A single allocation surface for normal application usage
+- Timeline-scoped routing so one logical workload can keep using the same client contract
+- Internal handling for route ensure, route refresh, and stale-route retry
+- Production-oriented operational assets in this repo: validation gates, alerts, dashboards,
+  runbooks, and release/rollback guidance
+
+## Start here
+
+- If you want to integrate Chronos into an application, start with `clients/README.md`.
+- If you want to operate or evaluate Chronos in a production setting, start with
+  `docs/production.md`.
 
 ## Notes
 
@@ -24,13 +41,7 @@ Everything else is internal client logic.
 
 ## Production operations
 
-- Production guide: `docs/production.md`
-- Release checklist: `docs/release.md`
-- Rollback procedure: `docs/rollback.md`
-- Dependency policy: `deny.toml`
-- Observability: `observability/README.md`
-- Runbooks:
-  - `docs/runbooks/not-ready.md`
-  - `docs/runbooks/identity-lease-lost.md`
-  - `docs/runbooks/metadata-errors-etcd.md`
-  - `docs/runbooks/transfer-failures.md`
+- Start with `docs/production.md` for the operator path.
+- Use `docs/release.md` for release validation and `docs/rollback.md` for rollback handling.
+- Use `observability/README.md` for Prometheus, Grafana, alerts, and runbook links.
+- Dependency policy lives in `deny.toml` and is enforced by CI.

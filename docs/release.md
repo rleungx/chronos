@@ -1,6 +1,7 @@
 # Chronos Release Checklist
 
-This checklist is the minimum in-repo release procedure for Chronos.
+This document is the release gate companion to `docs/production.md`. Use it when you are about to
+promote a build, not as the general operations guide.
 
 ## Required validation before cutting a release
 
@@ -51,4 +52,4 @@ Before publishing or deploying, ensure you have:
 If any benchmark budget or observability validation fails after a release candidate build, do not
 promote the artifact. Revert to the last candidate whose validation bundle is intact.
 
-See `docs/rollback.md` for the concrete rollback procedure.
+For the full rollback procedure, see `docs/rollback.md`.

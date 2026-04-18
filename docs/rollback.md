@@ -1,7 +1,7 @@
 # Chronos Rollback Procedure
 
-Use this procedure when a release candidate or freshly deployed build fails validation or degrades
-runtime behavior.
+Use this document only after a candidate has already failed validation or a deployed build has
+degraded. For normal release preparation, start with `docs/release.md`.
 
 ## Rollback triggers
 

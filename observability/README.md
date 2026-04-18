@@ -1,8 +1,8 @@
 # Chronos Observability
 
 Chronos already exposes `/healthz`, `/readyz`, and Prometheus metrics on the metrics listener.
-This directory adds a minimal local Prometheus setup and starter alert rules for the existing
-metrics surface.
+This directory is the observability entrypoint: local Prometheus/Grafana startup, alert rule
+validation, dashboard assets, and links to the runbooks that explain what to do when an alert fires.
 
 ## Local Prometheus
 
@@ -54,8 +54,8 @@ metrics surface.
 - `ChronosStartupPreflightFailures`
 - `ChronosStartupBootstrapFailures`
 
-These alerts are intended as starter rules, not final production SLO policy. Tune thresholds and
-alert routing for your environment.
+These alerts are the repository's default operational rule set. Tune thresholds and routing for your
+environment, but treat this file as the source of truth for alert behavior shipped with Chronos.
 
 Runbooks for the highest-value alerts now live under:
 
@@ -111,3 +111,4 @@ The `soak-real-etcd` and `chaos-lease-loss` workflows upload `artifacts/soak/` a
 the job actually captured.
 
 See `docs/production.md` for the recommended validation order and benchmark budget variables.
+See `docs/release.md` for the release gate sequence.

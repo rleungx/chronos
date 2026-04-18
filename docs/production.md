@@ -104,10 +104,7 @@ your hardware, but do not remove the gates.
 
 ## Runbooks
 
-- `docs/runbooks/not-ready.md`
-- `docs/runbooks/identity-lease-lost.md`
-- `docs/runbooks/metadata-errors-etcd.md`
-- `docs/runbooks/transfer-failures.md`
+For alert-to-action guidance, use the runbook index in `observability/README.md`.
 
 ## Dependency policy
 
