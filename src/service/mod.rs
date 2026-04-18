@@ -36,6 +36,7 @@ pub struct TsoService {
     pub(super) metadata: Arc<dyn ControlPlaneStore>,
     pub(super) generator_runtime: GeneratorRuntimeState,
     pub(super) timeline_runtime: TimelineRuntimeState,
+    pub(super) generator_admission_gates: Vec<Arc<Semaphore>>,
     timeline_load_coordinator: TimelineLoadCoordinator,
     timeline_load_limiter: Arc<Semaphore>,
     generator_lease_coordinator: GeneratorLeaseCoordinator,
@@ -76,6 +77,37 @@ impl TsoService {
 
     pub(super) fn clear_timeline_cache(&self, timeline_key: &str) {
         self.timeline_runtime.remove_timeline(timeline_key);
+    }
+
+    pub(super) async fn acquire_generator_admission(
+        &self,
+        generator_id: u32,
+        resource_tier: crate::ResourceTier,
+        cancellation: Option<RequestCancellation>,
+    ) -> Result<Option<OwnedSemaphorePermit>, TsoError> {
+        if !matches!(
+            resource_tier,
+            crate::ResourceTier::Shared | crate::ResourceTier::Warm
+        ) {
+            return Ok(None);
+        }
+
+        let permit = self.generator_admission_gates[generator_id as usize]
+            .clone()
+            .acquire_owned();
+        if let Some(cancellation) = cancellation {
+            tokio::select! {
+                permit = permit => permit
+                    .map(Some)
+                    .map_err(|_| TsoError::ServiceShuttingDown),
+                _ = cancellation.cancelled() => Err(TsoError::RequestCancelled),
+            }
+        } else {
+            permit
+                .await
+                .map(Some)
+                .map_err(|_| TsoError::ServiceShuttingDown)
+        }
     }
 
     pub(super) fn check_request_cancellation(

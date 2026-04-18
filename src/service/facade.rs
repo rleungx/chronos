@@ -76,6 +76,9 @@ impl TsoService {
             metadata: metadata as Arc<dyn ControlPlaneStore>,
             generator_runtime: GeneratorRuntimeState::new(MAX_GENERATORS),
             timeline_runtime: TimelineRuntimeState::new(max_timeline_runtime_entries),
+            generator_admission_gates: (0..MAX_GENERATORS)
+                .map(|_| Arc::new(Semaphore::new(1)))
+                .collect(),
             timeline_load_coordinator: TimelineLoadCoordinator::default(),
             timeline_load_limiter: Arc::new(Semaphore::new(max_concurrent_timeline_loads)),
             generator_lease_coordinator: GeneratorLeaseCoordinator::default(),
