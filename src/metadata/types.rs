@@ -260,7 +260,9 @@ pub trait TimelineAuthority: Send + Sync {
         start_after_timeline_key: Option<&str>,
         limit: usize,
     ) -> Result<TimelineFilterRecordListPage, TsoError> {
-        let page = self.list_timelines_page(start_after_timeline_key, limit).await?;
+        let page = self
+            .list_timelines_page(start_after_timeline_key, limit)
+            .await?;
         Ok(TimelineFilterRecordListPage {
             records: page
                 .records
