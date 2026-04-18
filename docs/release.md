@@ -13,6 +13,7 @@ make test-layer-2
 make test-layer-3
 make test-layer-4
 make observability-check
+make dependency-check
 make test-soak
 make test-chaos
 make test-failover-bench
@@ -43,6 +44,7 @@ Before publishing or deploying, ensure you have:
 2. the exact `CHRONOS_BUILD_COMMIT` used at runtime
 3. retained soak/chaos/failover/rebalance artifacts for the validation run
 4. alert rules validated with `make observability-check`
+5. dependency policy validated with `make dependency-check`
 
 ## Rollback expectation
 

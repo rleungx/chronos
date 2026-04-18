@@ -52,6 +52,7 @@ Run these in order:
 
 ```bash
 cargo clippy --locked --all-targets -- -D warnings
+make dependency-check
 make test-layer-0
 make test-layer-2
 make test-layer-3
@@ -107,3 +108,13 @@ your hardware, but do not remove the gates.
 - `docs/runbooks/identity-lease-lost.md`
 - `docs/runbooks/metadata-errors-etcd.md`
 - `docs/runbooks/transfer-failures.md`
+
+## Dependency policy
+
+Chronos now ships a repo-local `deny.toml` and executable dependency gate:
+
+```bash
+make dependency-check
+```
+
+This enforces advisory, license, source, and wildcard dependency policy before release promotion.

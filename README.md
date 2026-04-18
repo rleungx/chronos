@@ -27,6 +27,7 @@ Everything else is internal client logic.
 - Production guide: `docs/production.md`
 - Release checklist: `docs/release.md`
 - Rollback procedure: `docs/rollback.md`
+- Dependency policy: `deny.toml`
 - Observability: `observability/README.md`
 - Runbooks:
   - `docs/runbooks/not-ready.md`
