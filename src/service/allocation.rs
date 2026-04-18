@@ -217,7 +217,7 @@ impl TsoService {
             }
             self.validate_batch_for_route(request.count, &timeline_record.route)?;
 
-            let (timeline_record, _revision) = match self
+            let (timeline_record, activated_revision) = match self
                 .activate_local_timeline_record(&request.timeline_key, timeline_record, revision)
                 .await
             {
@@ -249,7 +249,7 @@ impl TsoService {
                 .timeline_state_handle_from_record(
                     &request.timeline_key,
                     &timeline_record,
-                    revision,
+                    activated_revision,
                 )
                 .await?;
             let generator_id = timeline_record.route.generator_id;
@@ -1009,6 +1009,7 @@ mod tests {
             })
             .await
             .unwrap();
+        service.generator_runtime.remove_lease(route.generator_id);
 
         let (mut record, revision) = inner
             .load_timeline(&route.timeline_key)
@@ -1069,6 +1070,7 @@ mod tests {
             })
             .await
             .unwrap();
+        service.generator_runtime.remove_lease(route.generator_id);
 
         let (mut record, revision) = inner
             .load_timeline(&route.timeline_key)
