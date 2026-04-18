@@ -56,6 +56,9 @@ pub(super) fn map_tso_error(err: TsoError) -> Status {
         TsoError::TimelineRuntimeCacheSaturated { .. } => {
             status_with_error_detail(Code::Unavailable, err)
         }
+        TsoError::AllocationContention { .. } => {
+            status_with_error_detail(Code::ResourceExhausted, err)
+        }
         TsoError::FailoverRequiresExpiredLease { .. } => {
             status_with_error_detail(Code::FailedPrecondition, err)
         }
@@ -149,6 +152,7 @@ fn error_detail_code(err: &TsoError) -> ErrorCode {
         | TsoError::TimelineRuntimeCacheSaturated { .. }
         | TsoError::ServiceShuttingDown
         | TsoError::RequestCancelled => ErrorCode::TemporarilyUnavailable,
+        TsoError::AllocationContention { .. } => ErrorCode::RateLimited,
         TsoError::TimelineNotReady { state, .. } => {
             timeline_not_ready_public_mapping(*state).detail_code
         }
@@ -344,6 +348,11 @@ mod tests {
                     requested_physical_ms: 42,
                     allowed_physical_ms: 41,
                 },
+                Code::ResourceExhausted,
+                ErrorCode::RateLimited,
+            ),
+            (
+                TsoError::AllocationContention { generator_id: 7 },
                 Code::ResourceExhausted,
                 ErrorCode::RateLimited,
             ),

@@ -87,6 +87,32 @@ pub static TSO_ALLOCATE_COUNT_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
         "Total number of timestamps allocated",
     )
 });
+pub static TSO_ALLOCATE_OUTCOMES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec_metric(
+        "tso_allocate_outcomes_total",
+        "Allocation outcomes by path and outcome",
+        &["path", "outcome"],
+    )
+});
+pub static TSO_ALLOCATE_RANGES_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter_metric(
+        "tso_allocate_ranges_total",
+        "Total number of timestamp ranges emitted across allocation responses",
+    )
+});
+pub static TSO_ALLOCATE_CROSS_MS_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter_metric(
+        "tso_allocate_cross_ms_total",
+        "Total number of allocation responses that spanned multiple millisecond ranges",
+    )
+});
+pub static TSO_ALLOCATE_STAGE_LATENCY: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec_metric(
+        "tso_allocate_stage_latency_seconds",
+        "Allocation stage latency by path and stage",
+        &["path", "stage"],
+    )
+});
 pub static TSO_ALLOCATE_LATENCY: LazyLock<Histogram> = LazyLock::new(|| {
     register_histogram_metric(
         "tso_allocate_latency_seconds",

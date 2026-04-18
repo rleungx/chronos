@@ -2,8 +2,9 @@ mod serve;
 
 use std::sync::Arc;
 
-use self::serve::CachedServeGuardOptions;
+use self::serve::{AllocationPath, CachedServeGuardOptions};
 use crate::plane::RequestCancellation;
+use std::time::Instant;
 use tokio::sync::Mutex;
 
 use crate::metadata::TimelineRecord;
@@ -184,6 +185,7 @@ impl TsoService {
                 return Ok(response);
             }
 
+            let metadata_load_started = Instant::now();
             let (timeline_record, revision) = self
                 .load_timeline_with_singleflight_and_cancellation(
                     &request.timeline_key,
@@ -193,6 +195,11 @@ impl TsoService {
                 .ok_or_else(|| TsoError::TimelineNotFound {
                     timeline_key: request.timeline_key.clone(),
                 })?;
+            Self::record_allocation_stage_latency(
+                AllocationPath::Metadata,
+                "metadata_load",
+                metadata_load_started,
+            );
 
             if timeline_record.route.route_version != request.expected_route_version {
                 self.clear_timeline_cache(&request.timeline_key);
@@ -217,6 +224,7 @@ impl TsoService {
             }
             self.validate_batch_for_route(request.count, &timeline_record.route)?;
 
+            let activate_local_started = Instant::now();
             let (timeline_record, activated_revision) = match self
                 .activate_local_timeline_record(&request.timeline_key, timeline_record, revision)
                 .await
@@ -229,6 +237,11 @@ impl TsoService {
                 }
                 Err(error) => return Err(error),
             };
+            Self::record_allocation_stage_latency(
+                AllocationPath::Metadata,
+                "activate_local",
+                activate_local_started,
+            );
 
             if !Self::timeline_is_ready(timeline_record.state) {
                 self.clear_timeline_cache(&request.timeline_key);
@@ -238,6 +251,7 @@ impl TsoService {
                 });
             }
 
+            let lease_ensure_started = Instant::now();
             let issued_upper_bound = self
                 .ensure_generator_lease_for_allocation_with_cancellation(
                     &request.timeline_key,
@@ -245,6 +259,11 @@ impl TsoService {
                     cancellation.clone(),
                 )
                 .await?;
+            Self::record_allocation_stage_latency(
+                AllocationPath::Metadata,
+                "lease_ensure",
+                lease_ensure_started,
+            );
             let timeline_state_handle = self
                 .timeline_state_handle_from_record(
                     &request.timeline_key,
@@ -263,6 +282,7 @@ impl TsoService {
                     CachedServeGuardOptions {
                         cancellation: cancellation.clone(),
                         revalidate_authority: true,
+                        path: AllocationPath::Metadata,
                     },
                 )
                 .await?
@@ -282,7 +302,7 @@ mod tests {
     use tokio::sync::{broadcast, oneshot};
     use tokio::time::{timeout, Duration};
 
-    use super::serve::CachedServeGuardOptions;
+    use super::serve::{AllocationPath, CachedServeGuardOptions};
     use crate::metadata::{
         ControlPlaneStore, GeneratorBatchOp, GeneratorLeaseAuthority, GeneratorRecord,
         MemoryMetadataStore, RouteUpdateSource, TimelineAuthority, TimelineBatchOp, TimelineRecord,
@@ -1172,6 +1192,7 @@ mod tests {
                 CachedServeGuardOptions {
                     cancellation: None,
                     revalidate_authority: true,
+                    path: AllocationPath::Metadata,
                 },
             )
             .await
@@ -1317,6 +1338,7 @@ mod tests {
                 CachedServeGuardOptions {
                     cancellation: None,
                     revalidate_authority: true,
+                    path: AllocationPath::Metadata,
                 },
             )
             .await
@@ -1514,6 +1536,128 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cached_allocation_with_unready_local_lease_reloads_metadata() {
+        let clock = Arc::new(ManualClock::new(23_500));
+        let inner = Arc::new(MemoryMetadataStore::new());
+        let (load_started_tx, load_started_rx) = oneshot::channel();
+        let (release_load_tx, release_load_rx) = oneshot::channel();
+        let metadata = Arc::new(BlockingTimelineLoadStore::new(
+            inner,
+            load_started_tx,
+            release_load_rx,
+        ));
+        let service = TsoService::new(
+            required_test_config(TsoConfig::default()),
+            clock,
+            metadata.clone(),
+        )
+        .unwrap();
+
+        let route = service
+            .ensure_timeline("allocation.cached-unready-lease.timeline")
+            .await
+            .unwrap();
+        service
+            .allocate_timestamps(AllocateTimestampsRequest {
+                timeline_key: route.timeline_key.clone(),
+                count: 1,
+                expected_epoch: route.epoch,
+                expected_route_version: route.route_version,
+                client_request_id: "seed-cached-unready-lease".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let lease = service
+            .generator_runtime
+            .lease_state(route.generator_id)
+            .expect("generator lease should exist");
+        service.generator_runtime.remove_lease(route.generator_id);
+        service
+            .generator_runtime
+            .upsert_lease(route.generator_id, lease);
+        metadata.arm_blocking_load();
+
+        let service_clone = service.clone();
+        let route_clone = route.clone();
+        let allocate_task = tokio::spawn(async move {
+            service_clone
+                .allocate_timestamps(AllocateTimestampsRequest {
+                    timeline_key: route_clone.timeline_key.clone(),
+                    count: 1,
+                    expected_epoch: route_clone.epoch,
+                    expected_route_version: route_clone.route_version,
+                    client_request_id: "cached-unready-lease".to_string(),
+                })
+                .await
+        });
+
+        load_started_rx
+            .await
+            .expect("unready lease should force a metadata reload");
+        release_load_tx.send(()).unwrap();
+        let response = allocate_task.await.unwrap().unwrap();
+        assert_eq!(response.timeline_key, route.timeline_key);
+    }
+
+    #[tokio::test]
+    async fn cached_guard_fails_closed_when_timeline_state_drifts_before_serve() {
+        let clock = Arc::new(ManualClock::new(24_000));
+        let metadata = Arc::new(MemoryMetadataStore::new());
+        let service =
+            TsoService::new(required_test_config(TsoConfig::default()), clock, metadata).unwrap();
+
+        let route = service
+            .ensure_timeline("allocation.cached-state-drift.timeline")
+            .await
+            .unwrap();
+        let timeline_state_handle = service
+            .timeline_runtime
+            .timeline_handle(&route.timeline_key)
+            .expect("timeline should be cached after ensure");
+
+        {
+            let mut timeline_state = timeline_state_handle.lock().await;
+            timeline_state.state = TimelineLifecycleState::Draining;
+        }
+
+        let error = service
+            .try_serve_timeline_state_handle_with_guard(
+                &AllocateTimestampsRequest {
+                    timeline_key: route.timeline_key.clone(),
+                    count: 1,
+                    expected_epoch: route.epoch,
+                    expected_route_version: route.route_version,
+                    client_request_id: "cached-state-drift".to_string(),
+                },
+                timeline_state_handle,
+                route.generator_id,
+                service.clock.now_ms(),
+                service
+                    .valid_generator_lease_upper_bound(route.generator_id, service.clock.now_ms()),
+                CachedServeGuardOptions {
+                    cancellation: None,
+                    revalidate_authority: false,
+                    path: AllocationPath::Cached,
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            TsoError::TimelineNotReady {
+                timeline_key: route.timeline_key.clone(),
+                state: TimelineLifecycleState::Draining,
+            }
+        );
+        assert!(service
+            .timeline_runtime
+            .timeline_handle(&route.timeline_key)
+            .is_none());
+    }
+
+    #[tokio::test]
     async fn allocation_degrades_to_transient_timeline_state_when_runtime_cache_is_saturated() {
         let clock = Arc::new(ManualClock::new(24_500));
         let metadata = Arc::new(MemoryMetadataStore::new());
@@ -1678,6 +1822,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shared_allocation_waits_for_generator_admission_gate() {
+        let service = TsoService::new(
+            with_worker(TsoConfig::default(), "worker-a"),
+            Arc::new(ManualClock::new(52_000)),
+            Arc::new(MemoryMetadataStore::new()),
+        )
+        .unwrap();
+
+        let route = service
+            .ensure_timeline("shared.admission.wait")
+            .await
+            .unwrap();
+        assert_eq!(route.resource_tier, ResourceTier::Shared);
+
+        let permit = service.generator_admission_gates[route.generator_id as usize]
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+
+        let service_clone = service.clone();
+        let route_clone = route.clone();
+        let mut allocate_task = tokio::spawn(async move {
+            service_clone
+                .allocate_timestamps(AllocateTimestampsRequest {
+                    timeline_key: route_clone.timeline_key.clone(),
+                    count: 1,
+                    expected_epoch: route_clone.epoch,
+                    expected_route_version: route_clone.route_version,
+                    client_request_id: "shared-admission-wait".to_string(),
+                })
+                .await
+        });
+
+        assert!(
+            timeout(Duration::from_millis(50), &mut allocate_task)
+                .await
+                .is_err(),
+            "shared allocation should wait while the generator admission gate is held"
+        );
+
+        drop(permit);
+        let response = allocate_task.await.unwrap().unwrap();
+        assert_eq!(response.timeline_key, route.timeline_key);
+    }
+
+    #[tokio::test]
     async fn dedicated_tier_keeps_global_batch_limit() {
         let global_limit = crate::SEQUENCE_CAPACITY + 32;
         let service = TsoService::new(
@@ -1713,6 +1904,51 @@ mod tests {
             .unwrap();
 
         assert!(!response.ranges.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dedicated_allocation_bypasses_generator_admission_gate() {
+        let service = TsoService::new(
+            with_worker(
+                TsoConfig {
+                    default_resource_tier: ResourceTier::Dedicated,
+                    ..TsoConfig::default()
+                },
+                "worker-a",
+            ),
+            Arc::new(ManualClock::new(53_000)),
+            Arc::new(MemoryMetadataStore::new()),
+        )
+        .unwrap();
+
+        let route = service
+            .ensure_timeline("dedicated.admission.bypass")
+            .await
+            .unwrap();
+        assert_eq!(route.resource_tier, ResourceTier::Dedicated);
+
+        let permit = service.generator_admission_gates[route.generator_id as usize]
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+
+        let response = timeout(
+            Duration::from_millis(100),
+            service.allocate_timestamps(AllocateTimestampsRequest {
+                timeline_key: route.timeline_key.clone(),
+                count: 1,
+                expected_epoch: route.epoch,
+                expected_route_version: route.route_version,
+                client_request_id: "dedicated-admission-bypass".to_string(),
+            }),
+        )
+        .await
+        .expect("dedicated allocation should bypass the shared admission gate")
+        .unwrap();
+
+        drop(permit);
+        assert_eq!(response.timeline_key, route.timeline_key);
     }
 
     #[tokio::test]
@@ -1805,6 +2041,7 @@ mod tests {
                 CachedServeGuardOptions {
                     cancellation: None,
                     revalidate_authority: true,
+                    path: AllocationPath::Metadata,
                 },
             )
             .await
