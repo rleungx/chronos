@@ -126,6 +126,7 @@ cleanup() {
   RESULT=$([[ ${exit_code} -eq 0 ]] && echo success || echo failure)
   write_summary
   write_artifact_index "${ARTIFACT_DIR}" "${INDEX_LOG}"
+  make etcd-reset >/dev/null 2>&1 || true
   if [[ -n "${CHRONOS_PID_A}" ]] && kill -0 "${CHRONOS_PID_A}" 2>/dev/null; then
     kill "${CHRONOS_PID_A}" 2>/dev/null || true
     wait "${CHRONOS_PID_A}" 2>/dev/null || true
@@ -230,5 +231,5 @@ assert_zero_metric "monotonicity_violations_total" "${REBALANCE_LOG}"
 
 RESULT="success"
 write_summary
-write_artifact_index
+write_artifact_index "${ARTIFACT_DIR}" "${INDEX_LOG}"
 echo "[rebalance] success"

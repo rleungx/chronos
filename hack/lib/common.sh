@@ -33,6 +33,19 @@ wait_for_http() {
   return 1
 }
 
+wait_for_etcd() {
+  local wait_attempts=$1
+  local wait_interval_secs=$2
+  for _attempt in $(seq 1 "${wait_attempts}"); do
+    if make etcd-health >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep "${wait_interval_secs}"
+  done
+  echo "etcd did not become healthy after ${wait_attempts} attempts" >&2
+  return 1
+}
+
 extract_metric() {
   local key=$1
   local file=$2

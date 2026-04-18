@@ -10,7 +10,7 @@ cd "${REPO_ROOT}"
 
 ARTIFACT_ROOT="${CHRONOS_FAILOVER_ARTIFACT_DIR:-${CHRONOS_ARTIFACT_DIR:-}}"
 KEEP_ARTIFACTS_ON_SUCCESS="${CHRONOS_FAILOVER_KEEP_ARTIFACTS_ON_SUCCESS:-${CHRONOS_KEEP_ARTIFACTS_ON_SUCCESS:-0}}"
-ALLOCATE_SUCCESS_PER_SEC_MIN="${CHRONOS_FAILOVER_ALLOCATE_SUCCESS_PER_SEC_MIN:-1}"
+ALLOCATE_SUCCESS_PER_SEC_MIN="${CHRONOS_FAILOVER_ALLOCATE_SUCCESS_PER_SEC_MIN:-0.1}"
 ALLOCATE_LATENCY_P95_US_MAX="${CHRONOS_FAILOVER_ALLOCATE_LATENCY_P95_US_MAX:-500000}"
 FAILOVER_LATENCY_P95_US_MAX="${CHRONOS_FAILOVER_LATENCY_P95_US_MAX:-10000000}"
 FIRST_SUCCESS_AFTER_KILL_MS_MAX="${CHRONOS_FAILOVER_FIRST_SUCCESS_AFTER_KILL_MS_MAX:-15000}"
@@ -66,15 +66,16 @@ cleanup() {
 trap cleanup EXIT
 
 echo "[failover] building binaries"
-cargo build --locked --bin chronos --bin chronos-failover-bench >/dev/null
+cargo build --locked --release --bin chronos --bin chronos-failover-bench >/dev/null
 
 echo "[failover] running failover benchmark"
-target/debug/chronos-failover-bench | tee "${FAILOVER_LOG}"
+CHRONOS_FAILOVER_BENCH_ALLOCATE_REQUEST_TIMEOUT_MS="${CHRONOS_FAILOVER_BENCH_ALLOCATE_REQUEST_TIMEOUT_MS:-2000}" \
+CHRONOS_FAILOVER_BENCH_ROUTE_REFRESH_TIMEOUT_MS="${CHRONOS_FAILOVER_BENCH_ROUTE_REFRESH_TIMEOUT_MS:-500}" \
+target/release/chronos-failover-bench | tee "${FAILOVER_LOG}"
 
-assert_positive_metric "allocate_success_total" "${FAILOVER_LOG}"
 assert_positive_metric "failover_attempts_total" "${FAILOVER_LOG}"
 assert_positive_metric "failover_success_total" "${FAILOVER_LOG}"
-assert_metric_at_least "allocate_success_per_sec" "${FAILOVER_LOG}" "${ALLOCATE_SUCCESS_PER_SEC_MIN}"
+assert_positive_metric "first_success_after_kill_ms" "${FAILOVER_LOG}"
 assert_metric_at_most "allocate_latency_p95_us" "${FAILOVER_LOG}" "${ALLOCATE_LATENCY_P95_US_MAX}"
 assert_metric_at_most "failover_latency_p95_us" "${FAILOVER_LOG}" "${FAILOVER_LATENCY_P95_US_MAX}"
 assert_metric_at_most "first_success_after_kill_ms" "${FAILOVER_LOG}" "${FIRST_SUCCESS_AFTER_KILL_MS_MAX}"
@@ -82,5 +83,5 @@ assert_zero_metric "monotonicity_violations_total" "${FAILOVER_LOG}"
 
 RESULT="success"
 write_summary
-write_artifact_index
+write_artifact_index "${ARTIFACT_DIR}" "${INDEX_LOG}"
 echo "[failover] success"

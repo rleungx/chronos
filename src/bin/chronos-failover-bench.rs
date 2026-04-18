@@ -36,6 +36,8 @@ struct BenchConfig {
     generator_maintenance_interval_ms: u64,
     failover_poll_interval_ms: u64,
     failover_timeout_secs: u64,
+    allocate_request_timeout_ms: u64,
+    route_refresh_timeout_ms: u64,
     owner_a: SpawnConfig,
     owner_b: SpawnConfig,
 }
@@ -119,6 +121,12 @@ fn load_config() -> BenchConfig {
     let failover_poll_interval_ms =
         env_or("CHRONOS_FAILOVER_BENCH_FAILOVER_POLL_INTERVAL_MS", 100u64);
     let failover_timeout_secs = env_or("CHRONOS_FAILOVER_BENCH_FAILOVER_TIMEOUT_SECS", 15u64);
+    let allocate_request_timeout_ms = env_or(
+        "CHRONOS_FAILOVER_BENCH_ALLOCATE_REQUEST_TIMEOUT_MS",
+        2_000u64,
+    );
+    let route_refresh_timeout_ms =
+        env_or("CHRONOS_FAILOVER_BENCH_ROUTE_REFRESH_TIMEOUT_MS", 500u64);
     let timeline_namespace = env_or_string(
         "CHRONOS_FAILOVER_BENCH_NAMESPACE",
         &format!(
@@ -151,6 +159,8 @@ fn load_config() -> BenchConfig {
         generator_maintenance_interval_ms,
         failover_poll_interval_ms,
         failover_timeout_secs,
+        allocate_request_timeout_ms,
+        route_refresh_timeout_ms,
         owner_a: SpawnConfig {
             instance_id: "bench-instance-a".to_string(),
             worker_id: "worker-a".to_string(),
@@ -248,6 +258,42 @@ fn terminate_child(child: &mut Child) {
     let _ = child.wait();
 }
 
+async fn wait_for_post_failover_allocation_success(
+    route: &TimelineRoute,
+    allocate_batch: u32,
+    request_timeout_ms: u64,
+    timeout_secs: u64,
+    kill_instant: Arc<Mutex<Option<Instant>>>,
+    first_success_after_kill: Arc<Mutex<Option<u64>>>,
+) -> AppResult<()> {
+    timeout(Duration::from_secs(timeout_secs), async {
+        loop {
+            match allocate_timestamps_raw(
+                route.owner_worker_endpoint.parse::<SocketAddr>()?,
+                route,
+                "failover-post-success-probe",
+                allocate_batch,
+                request_timeout_ms,
+            )
+            .await
+            {
+                Ok(response) if !response.ranges.is_empty() => {
+                    if let Some(kill_at) = *kill_instant.lock().await {
+                        let mut first = first_success_after_kill.lock().await;
+                        if first.is_none() {
+                            *first = Some(kill_at.elapsed().as_millis() as u64);
+                        }
+                    }
+                    return Ok::<(), Box<dyn Error + Send + Sync>>(());
+                }
+                Ok(_) | Err(_) => sleep(Duration::from_millis(100)).await,
+            }
+        }
+    })
+    .await??;
+    Ok(())
+}
+
 async fn wait_for_ready(endpoint: SocketAddr, child: &mut Child) -> AppResult<()> {
     timeout(Duration::from_secs(15), async {
         loop {
@@ -301,15 +347,27 @@ async fn ensure_timeline(endpoint: SocketAddr, timeline_key: &str) -> AppResult<
 }
 
 async fn get_timeline_route(endpoint: SocketAddr, timeline_key: &str) -> AppResult<TimelineRoute> {
-    Ok(route_client(endpoint)
-        .await?
-        .get_timeline_route(Request::new(GetTimelineRouteRequest {
-            timeline_key: timeline_key.to_string(),
-        }))
-        .await?
-        .into_inner()
-        .route
-        .ok_or("get_timeline_route should return route")?)
+    get_timeline_route_with_timeout(endpoint, timeline_key, Duration::from_secs(2)).await
+}
+
+async fn get_timeline_route_with_timeout(
+    endpoint: SocketAddr,
+    timeline_key: &str,
+    timeout_duration: Duration,
+) -> AppResult<TimelineRoute> {
+    Ok(timeout(timeout_duration, async {
+        route_client(endpoint)
+            .await
+            .map_err(|error| Status::unavailable(error.to_string()))?
+            .get_timeline_route(Request::new(GetTimelineRouteRequest {
+                timeline_key: timeline_key.to_string(),
+            }))
+            .await
+    })
+    .await??
+    .into_inner()
+    .route
+    .ok_or("get_timeline_route should return route")?)
 }
 
 async fn allocate_timestamps_raw(
@@ -317,6 +375,7 @@ async fn allocate_timestamps_raw(
     route: &TimelineRoute,
     client_request_id: &str,
     count: u32,
+    request_timeout_ms: u64,
 ) -> Result<chronos::proto::v1::AllocateTimestampsResponse, tonic::Status> {
     let mut client = timestamp_client(endpoint)
         .await
@@ -328,7 +387,7 @@ async fn allocate_timestamps_raw(
             expected_epoch: route.epoch,
             expected_route_version: route.route_version,
             client_request_id: client_request_id.to_string(),
-            request_timeout_ms: 0,
+            request_timeout_ms: request_timeout_ms as u32,
         }))
         .await?;
     Ok(response.into_inner())
@@ -458,6 +517,8 @@ async fn main() -> AppResult<()> {
         let allocate_batch = config.allocate_batch;
         let duration_secs = config.duration_secs;
         let warmup_secs = config.warmup_secs;
+        let allocate_request_timeout_ms = config.allocate_request_timeout_ms;
+        let route_refresh_timeout_ms = config.route_refresh_timeout_ms;
         let owner_a_endpoint = config.owner_a.bind_addr;
         let owner_b_endpoint = config.owner_b.bind_addr;
 
@@ -483,6 +544,7 @@ async fn main() -> AppResult<()> {
                     &route_snapshot,
                     &format!("failover-bench-{ordinal}"),
                     allocate_batch,
+                    allocate_request_timeout_ms,
                 )
                 .await;
                 let elapsed = request_start.elapsed().as_micros() as u64;
@@ -522,8 +584,12 @@ async fn main() -> AppResult<()> {
                                 .or_insert(0) += 1;
                         }
                         let refresh_start = Instant::now();
-                        if let Ok(refreshed) =
-                            get_timeline_route(owner_b_endpoint, &timeline_key_for_alloc).await
+                        if let Ok(refreshed) = get_timeline_route_with_timeout(
+                            owner_b_endpoint,
+                            &timeline_key_for_alloc,
+                            Duration::from_millis(route_refresh_timeout_ms.max(100)),
+                        )
+                        .await
                         {
                             *allocator_route.lock().await = refreshed;
                             if request_start >= warmup_until {
@@ -532,8 +598,12 @@ async fn main() -> AppResult<()> {
                                     .route_refresh_latencies_us
                                     .push(refresh_start.elapsed().as_micros() as u64);
                             }
-                        } else if let Ok(refreshed) =
-                            get_timeline_route(owner_a_endpoint, &timeline_key_for_alloc).await
+                        } else if let Ok(refreshed) = get_timeline_route_with_timeout(
+                            owner_a_endpoint,
+                            &timeline_key_for_alloc,
+                            Duration::from_millis(route_refresh_timeout_ms.max(100)),
+                        )
+                        .await
                         {
                             *allocator_route.lock().await = refreshed;
                             if request_start >= warmup_until {
@@ -555,6 +625,10 @@ async fn main() -> AppResult<()> {
         let owner_endpoint_str = standby_endpoint.to_string();
         let failover_timeout_secs = config.failover_timeout_secs;
         let failover_poll_interval_ms = config.failover_poll_interval_ms;
+        let driver_allocate_batch = config.allocate_batch;
+        let driver_request_timeout_ms = config.allocate_request_timeout_ms;
+        let driver_kill_instant = kill_instant.clone();
+        let driver_first_success_after_kill = first_success_after_kill.clone();
         let driver_leader_child = leader_child.clone();
         let driver_stats_handle = tokio::spawn(async move {
             let mut stats = FailoverBenchStats::default();
@@ -590,6 +664,15 @@ async fn main() -> AppResult<()> {
                                     Box::<dyn Error + Send + Sync>::from(error.to_string())
                                 })?;
                             *route.lock().await = refreshed;
+                            wait_for_post_failover_allocation_success(
+                                &route.lock().await.clone(),
+                                driver_allocate_batch,
+                                driver_request_timeout_ms,
+                                failover_timeout_secs,
+                                driver_kill_instant.clone(),
+                                driver_first_success_after_kill.clone(),
+                            )
+                            .await?;
                             return Ok::<FailoverBenchStats, Box<dyn Error + Send + Sync>>(stats);
                         }
                         Err(status) if status.code() == Code::FailedPrecondition => {
@@ -634,6 +717,14 @@ async fn main() -> AppResult<()> {
         println!("duration_secs={}", config.duration_secs);
         println!("warmup_secs={}", config.warmup_secs);
         println!("allocate_batch={}", config.allocate_batch);
+        println!(
+            "allocate_request_timeout_ms={}",
+            config.allocate_request_timeout_ms
+        );
+        println!(
+            "route_refresh_timeout_ms={}",
+            config.route_refresh_timeout_ms
+        );
         println!("lease_ttl_ms={}", config.lease_ttl_ms);
         println!("safety_gap_ms={}", config.safety_gap_ms);
         println!(

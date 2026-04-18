@@ -126,6 +126,7 @@ cleanup() {
   RESULT=$([[ ${exit_code} -eq 0 ]] && echo success || echo failure)
   write_summary
   write_artifact_index "${ARTIFACT_DIR}" "${INDEX_LOG}"
+  make etcd-reset >/dev/null 2>&1 || true
   if [[ -n "${CHRONOS_PID}" ]] && kill -0 "${CHRONOS_PID}" 2>/dev/null; then
     kill "${CHRONOS_PID}" 2>/dev/null || true
     wait "${CHRONOS_PID}" 2>/dev/null || true
@@ -148,7 +149,7 @@ echo "[soak] resetting etcd"
 make etcd-reset >/dev/null
 echo "[soak] starting etcd"
 make etcd-up >/dev/null
-make etcd-health >/dev/null
+wait_for_etcd "${WAIT_ATTEMPTS}" "${WAIT_INTERVAL_SECS}"
 
 echo "[soak] building release binaries"
 cargo build --locked --release --bin chronos --bin chronos-bench --bin chronos-control-bench >/dev/null
@@ -220,5 +221,5 @@ assert_metric_at_most "scan_latency_p95_us" "${CONTROL_FILTERED_LOG}" "${FILTERE
 
 RESULT="success"
 write_summary
-write_artifact_index
+write_artifact_index "${ARTIFACT_DIR}" "${INDEX_LOG}"
 echo "[soak] success"

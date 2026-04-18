@@ -175,7 +175,7 @@ echo "[chaos] resetting etcd"
 make etcd-reset >/dev/null
 echo "[chaos] starting etcd"
 make etcd-up >/dev/null
-make etcd-health >/dev/null
+wait_for_etcd "${WAIT_ATTEMPTS}" "${WAIT_INTERVAL_SECS}"
 
 echo "[chaos] building release binaries"
 cargo build --locked --release --bin chronos --bin chronos-bench >/dev/null
@@ -189,7 +189,7 @@ wait_for_degrade_or_exit
 
 echo "[chaos] restoring etcd"
 docker start chronos-etcd >/dev/null
-make etcd-health >/dev/null
+wait_for_etcd "${WAIT_ATTEMPTS}" "${WAIT_INTERVAL_SECS}"
 
 if [[ -n "${CHRONOS_PID}" ]] && kill -0 "${CHRONOS_PID}" 2>/dev/null; then
   kill "${CHRONOS_PID}" 2>/dev/null || true
