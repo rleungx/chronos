@@ -133,10 +133,10 @@ fn parse_timeline_filter_record(value: &[u8]) -> Result<TimelineFilterRecord, se
 
 fn route_update_for_watch_event(
     prev_value: Option<&[u8]>,
-    next_record: &TimelineRecord,
+    next_route: &TimelineRoute,
 ) -> Option<TimelineRoute> {
     let previous_route = prev_value.and_then(parse_prev_route);
-    timeline_route_update_from_routes(previous_route.as_ref(), &next_record.route)
+    timeline_route_update_from_routes(previous_route.as_ref(), next_route)
 }
 
 fn prefix_range_end(prefix: &str) -> Vec<u8> {
@@ -450,9 +450,9 @@ impl EtcdMetadataStore {
                                     let _ = route_updates.send(RouteUpdateSignal::Reset);
                                     continue;
                                 };
-                                let Ok(record) =
-                                    serde_json::from_slice::<TimelineRecord>(key_value.value())
-                                else {
+                                let Ok(record) = serde_json::from_slice::<RouteOnlyTimelineRecord>(
+                                    key_value.value(),
+                                ) else {
                                     metrics::TSO_METADATA_ERRORS_TOTAL
                                         .with_label_values(&["route_watch_event_decode"])
                                         .inc();
@@ -467,7 +467,7 @@ impl EtcdMetadataStore {
                                 };
                                 if let Some(route_update) = route_update_for_watch_event(
                                     event.prev_kv().map(|prev_key_value| prev_key_value.value()),
-                                    &record,
+                                    &record.route,
                                 ) {
                                     info!(
                                         component = "route_watch",
@@ -1251,13 +1251,14 @@ impl Drop for EtcdMetadataStore {
 
 #[cfg(test)]
 mod tests {
-    use crate::{ResourceTier, TimelineLifecycleState};
+    use crate::ResourceTier;
 
     use super::EtcdMetadataStore;
     use super::{
         parse_prev_route, parse_timeline_filter_record, route_update_for_watch_event,
-        TimelineRecord, TimelineRoute, TimelineRouteRecord,
+        RouteOnlyTimelineRecord, TimelineRoute, TimelineRouteRecord,
     };
+    use crate::metadata::types::CURRENT_METADATA_SCHEMA_VERSION;
     use tokio::time::Duration;
 
     fn sample_route(generator_id: u32, route_version: u64) -> TimelineRoute {
@@ -1268,19 +1269,6 @@ mod tests {
             route_version,
             resource_tier: ResourceTier::Shared,
             owner_worker_endpoint: "worker-a:50051".into(),
-        }
-    }
-
-    fn sample_record(route: TimelineRoute) -> TimelineRecord {
-        TimelineRecord {
-            schema_version: 1,
-            route,
-            state: TimelineLifecycleState::Active,
-            recovery_floor_tso: None,
-            issued_upper_bound: Some(10),
-            last_graceful_issued: Some(9),
-            lease_expire_at_ms: Some(100),
-            updated_at_ms: 1,
         }
     }
 
@@ -1300,7 +1288,7 @@ mod tests {
     #[test]
     fn route_update_for_watch_event_skips_same_route_when_prev_route_is_known() {
         let route = sample_route(7, 1);
-        let next = sample_record(route.clone());
+        let next = route.clone();
         let payload = serde_json::json!({ "route": route });
 
         assert_eq!(
@@ -1311,13 +1299,13 @@ mod tests {
 
     #[test]
     fn route_update_for_watch_event_preserves_unknown_prev_as_changed() {
-        let next = sample_record(sample_route(7, 1));
+        let next = sample_route(7, 1);
 
         assert_eq!(
             route_update_for_watch_event(Some(br#"{not-json}"#), &next),
-            Some(next.route.clone())
+            Some(next.clone())
         );
-        assert_eq!(route_update_for_watch_event(None, &next), Some(next.route));
+        assert_eq!(route_update_for_watch_event(None, &next), Some(next));
     }
 
     #[test]
@@ -1349,6 +1337,35 @@ mod tests {
         let record: TimelineRouteRecord =
             serde_json::from_slice(payload.to_string().as_bytes()).unwrap();
         assert_eq!(record.route, sample_route(7, 3));
+        assert!(record.validate_schema_version().is_ok());
+    }
+
+    #[test]
+    fn route_watch_projection_accepts_newer_schema_version() {
+        let next = sample_route(7, 4);
+        let payload = serde_json::json!({
+            "schema_version": CURRENT_METADATA_SCHEMA_VERSION + 1,
+            "route": next,
+            "state": "Active",
+            "issued_upper_bound": 88,
+        });
+
+        let record: RouteOnlyTimelineRecord =
+            serde_json::from_slice(payload.to_string().as_bytes()).unwrap();
+        assert_eq!(record.route, sample_route(7, 4));
+    }
+
+    #[test]
+    fn parse_timeline_filter_record_accepts_newer_schema_version() {
+        let payload = serde_json::json!({
+            "schema_version": CURRENT_METADATA_SCHEMA_VERSION + 1,
+            "route": sample_route(7, 5),
+            "state": "Recovering",
+            "issued_upper_bound": 88,
+        });
+
+        let record = parse_timeline_filter_record(payload.to_string().as_bytes()).unwrap();
+        assert_eq!(record.schema_version, CURRENT_METADATA_SCHEMA_VERSION + 1);
         assert!(record.validate_schema_version().is_ok());
     }
 

@@ -262,14 +262,12 @@ impl TimelineAuthority for MemoryMetadataStore {
             .get(timeline_key)
             .map(|entry| {
                 let (record, revision) = entry.value().clone();
-                record.validate_schema_version()?;
-                Ok((
-                    TimelineRouteRecord {
-                        schema_version: record.schema_version,
-                        route: record.route,
-                    },
-                    revision,
-                ))
+                let route_record = TimelineRouteRecord {
+                    schema_version: record.schema_version,
+                    route: record.route,
+                };
+                route_record.validate_schema_version()?;
+                Ok((route_record, revision))
             })
             .transpose()
     }
@@ -352,12 +350,13 @@ impl TimelineAuthority for MemoryMetadataStore {
         for timeline_key in timeline_keys.iter().skip(start_index).take(limit + 1) {
             if let Some(record) = self.records.get(timeline_key.as_str()) {
                 let record = record.value().0.clone();
-                record.validate_schema_version()?;
-                page_records.push(TimelineFilterRecord {
+                let filter_record = TimelineFilterRecord {
                     schema_version: record.schema_version,
                     route: record.route,
                     state: record.state,
-                });
+                };
+                filter_record.validate_schema_version()?;
+                page_records.push(filter_record);
             }
         }
         let next_start_after_timeline_key = (page_records.len() > limit)
@@ -658,6 +657,7 @@ mod tests {
     use crate::{metrics, ResourceTier, TimelineLifecycleState, TimelineRoute};
 
     use super::*;
+    use crate::metadata::types::CURRENT_METADATA_SCHEMA_VERSION;
 
     fn sample_record(timeline_key: &str, generator_id: u32) -> TimelineRecord {
         TimelineRecord {
@@ -677,6 +677,63 @@ mod tests {
             lease_expire_at_ms: Some(100),
             updated_at_ms: 1,
         }
+    }
+
+    #[tokio::test]
+    async fn load_timeline_route_accepts_newer_schema_projection() {
+        let store = MemoryMetadataStore::new();
+        let mut record = sample_record("timeline-route-future", 1);
+        record.schema_version = CURRENT_METADATA_SCHEMA_VERSION + 1;
+        store
+            .records
+            .insert(record.route.timeline_key.clone(), (record, 1));
+
+        let (route_record, revision) = store
+            .load_timeline_route("timeline-route-future")
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            route_record.schema_version,
+            CURRENT_METADATA_SCHEMA_VERSION + 1
+        );
+        assert_eq!(route_record.route.timeline_key, "timeline-route-future");
+        assert_eq!(revision, 1);
+    }
+
+    #[tokio::test]
+    async fn list_timeline_filters_page_accepts_newer_schema_projection() {
+        let store = MemoryMetadataStore::new();
+        let mut record = sample_record("timeline-filter-future", 1);
+        record.schema_version = CURRENT_METADATA_SCHEMA_VERSION + 1;
+        store
+            .records
+            .insert(record.route.timeline_key.clone(), (record, 1));
+
+        let page = store.list_timeline_filters_page(None, 10).await.unwrap();
+
+        assert_eq!(page.records.len(), 1);
+        assert_eq!(
+            page.records[0].schema_version,
+            CURRENT_METADATA_SCHEMA_VERSION + 1
+        );
+        assert_eq!(page.records[0].route.timeline_key, "timeline-filter-future");
+    }
+
+    #[tokio::test]
+    async fn load_timeline_still_rejects_newer_schema_full_record() {
+        let store = MemoryMetadataStore::new();
+        let mut record = sample_record("timeline-full-future", 1);
+        record.schema_version = CURRENT_METADATA_SCHEMA_VERSION + 1;
+        store
+            .records
+            .insert(record.route.timeline_key.clone(), (record, 1));
+
+        assert!(matches!(
+            store.load_timeline("timeline-full-future").await,
+            Err(TsoError::Internal(message)) if message.contains("unsupported timeline metadata schema_version")
+        ));
     }
 
     #[tokio::test]

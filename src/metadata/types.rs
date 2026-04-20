@@ -91,7 +91,7 @@ impl TimelineRecord {
 
 impl TimelineFilterRecord {
     pub fn validate_schema_version(&self) -> Result<(), TsoError> {
-        if self.schema_version == CURRENT_METADATA_SCHEMA_VERSION {
+        if self.schema_version >= CURRENT_METADATA_SCHEMA_VERSION {
             Ok(())
         } else {
             Err(TsoError::Internal(format!(
@@ -104,7 +104,7 @@ impl TimelineFilterRecord {
 
 impl TimelineRouteRecord {
     pub fn validate_schema_version(&self) -> Result<(), TsoError> {
-        if self.schema_version == CURRENT_METADATA_SCHEMA_VERSION {
+        if self.schema_version >= CURRENT_METADATA_SCHEMA_VERSION {
             Ok(())
         } else {
             Err(TsoError::Internal(format!(
@@ -460,7 +460,7 @@ mod tests {
     #[test]
     fn timeline_filter_record_rejects_unknown_schema_version() {
         let mut record = TimelineFilterRecord {
-            schema_version: CURRENT_METADATA_SCHEMA_VERSION + 1,
+            schema_version: CURRENT_METADATA_SCHEMA_VERSION.saturating_sub(1),
             route: sample_route(7, 1),
             state: TimelineLifecycleState::Active,
         };
@@ -472,5 +472,31 @@ mod tests {
 
         record.schema_version = CURRENT_METADATA_SCHEMA_VERSION;
         assert!(record.validate_schema_version().is_ok());
+
+        record.schema_version = CURRENT_METADATA_SCHEMA_VERSION + 1;
+        assert!(record.validate_schema_version().is_ok());
+    }
+
+    #[test]
+    fn timeline_route_record_accepts_newer_schema_version() {
+        let record = TimelineRouteRecord {
+            schema_version: CURRENT_METADATA_SCHEMA_VERSION + 1,
+            route: sample_route(7, 1),
+        };
+
+        assert!(record.validate_schema_version().is_ok());
+    }
+
+    #[test]
+    fn timeline_route_record_rejects_older_schema_version() {
+        let record = TimelineRouteRecord {
+            schema_version: CURRENT_METADATA_SCHEMA_VERSION.saturating_sub(1),
+            route: sample_route(7, 1),
+        };
+
+        assert!(matches!(
+            record.validate_schema_version(),
+            Err(TsoError::Internal(_))
+        ));
     }
 }
