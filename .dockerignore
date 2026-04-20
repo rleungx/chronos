@@ -1,0 +1,10 @@
+.git
+.github
+target
+artifacts
+docs
+observability
+hack
+tests
+**/*.log
+**/.DS_Store

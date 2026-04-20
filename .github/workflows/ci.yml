@@ -32,6 +32,10 @@ jobs:
         run: make test-layer-2
       - name: Run Layer 3 memory-path semantic regression
         run: make test-layer-3
+      - name: Validate production-shape release config
+        run: make release-shape-check
+      - name: Validate container delivery asset
+        run: make container-check
       - name: Validate observability rules
         run: make observability-check
       - name: Validate dependency policy
