@@ -12,6 +12,8 @@ pub(crate) fn build_timeline_state(
         last_issued_tso: recovered_last_issued_tso,
         recovery_floor_tso: recovered_last_issued_tso,
         last_graceful_issued: timeline_record.last_graceful_issued,
+        timeline_quota_tokens: None,
+        timeline_quota_last_refill_ms: None,
         revision,
     }
 }

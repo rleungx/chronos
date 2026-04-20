@@ -13,6 +13,8 @@ pub(crate) struct TimelineState {
     pub(crate) last_issued_tso: Option<u64>,
     pub(crate) recovery_floor_tso: Option<u64>,
     pub(crate) last_graceful_issued: Option<u64>,
+    pub(crate) timeline_quota_tokens: Option<f64>,
+    pub(crate) timeline_quota_last_refill_ms: Option<u64>,
     pub(crate) revision: u64,
 }
 
@@ -105,6 +107,8 @@ mod tests {
             last_issued_tso: Some(41),
             recovery_floor_tso: Some(41),
             last_graceful_issued: Some(40),
+            timeline_quota_tokens: None,
+            timeline_quota_last_refill_ms: None,
             revision: 9,
         }))
     }

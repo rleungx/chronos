@@ -8,11 +8,12 @@ mod transfer;
 mod worker_readiness;
 
 use std::cmp::max;
+use std::collections::{HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
 
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
 
 use crate::metadata::{ControlPlaneStore, GeneratorRecord};
@@ -37,6 +38,8 @@ pub struct TsoService {
     pub(super) generator_runtime: GeneratorRuntimeState,
     pub(super) timeline_runtime: TimelineRuntimeState,
     pub(super) generator_admission_gates: Vec<Arc<Semaphore>>,
+    pub(super) generator_fairness_trackers: Vec<Arc<Mutex<GeneratorFairnessState>>>,
+    pub(super) generator_fairness_notifiers: Vec<Arc<Notify>>,
     timeline_load_coordinator: TimelineLoadCoordinator,
     timeline_load_limiter: Arc<Semaphore>,
     generator_lease_coordinator: GeneratorLeaseCoordinator,
@@ -46,7 +49,47 @@ pub struct TsoService {
     shutdown_gate: AtomicBool,
 }
 
+#[derive(Default)]
+pub(super) struct GeneratorFairnessState {
+    active_timeline_key: Option<String>,
+    waiting_timeline_keys: HashSet<String>,
+    wait_queue: VecDeque<String>,
+}
+
 impl TsoService {
+    async fn remove_generator_waiter(&self, generator_id: u32, timeline_key: &str) {
+        let mut fairness = self.generator_fairness_trackers[generator_id as usize]
+            .lock()
+            .await;
+        if fairness.waiting_timeline_keys.remove(timeline_key) {
+            fairness.wait_queue.retain(|queued| queued != timeline_key);
+        }
+    }
+
+    pub(super) async fn release_generator_admission_turn(
+        &self,
+        generator_id: u32,
+        resource_tier: crate::ResourceTier,
+        timeline_key: &str,
+    ) {
+        if !matches!(
+            resource_tier,
+            crate::ResourceTier::Shared | crate::ResourceTier::Warm
+        ) {
+            return;
+        }
+
+        let notifier = self.generator_fairness_notifiers[generator_id as usize].clone();
+        let mut fairness = self.generator_fairness_trackers[generator_id as usize]
+            .lock()
+            .await;
+        if fairness.active_timeline_key.as_deref() == Some(timeline_key) {
+            fairness.active_timeline_key = None;
+            drop(fairness);
+            notifier.notify_waiters();
+        }
+    }
+
     pub(super) async fn backoff_after_metadata_contention(
         &self,
         retries: u32,
@@ -83,6 +126,7 @@ impl TsoService {
         &self,
         generator_id: u32,
         resource_tier: crate::ResourceTier,
+        timeline_key: &str,
         cancellation: Option<RequestCancellation>,
     ) -> Result<Option<OwnedSemaphorePermit>, TsoError> {
         if !matches!(
@@ -92,10 +136,72 @@ impl TsoService {
             return Ok(None);
         }
 
+        let fairness = self.generator_fairness_trackers[generator_id as usize].clone();
+        let notifier = self.generator_fairness_notifiers[generator_id as usize].clone();
+
+        loop {
+            Self::check_request_cancellation(cancellation.as_ref())?;
+
+            let grant_turn = {
+                let mut fairness_state = fairness.lock().await;
+                if fairness_state.active_timeline_key.is_none() {
+                    match fairness_state.wait_queue.front() {
+                        Some(front) if front == timeline_key => {
+                            fairness_state.wait_queue.pop_front();
+                            fairness_state.waiting_timeline_keys.remove(timeline_key);
+                            fairness_state.active_timeline_key = Some(timeline_key.to_string());
+                            true
+                        }
+                        Some(_) => {
+                            if fairness_state
+                                .waiting_timeline_keys
+                                .insert(timeline_key.to_string())
+                            {
+                                fairness_state
+                                    .wait_queue
+                                    .push_back(timeline_key.to_string());
+                            }
+                            false
+                        }
+                        None => {
+                            fairness_state.active_timeline_key = Some(timeline_key.to_string());
+                            true
+                        }
+                    }
+                } else {
+                    if fairness_state
+                        .waiting_timeline_keys
+                        .insert(timeline_key.to_string())
+                    {
+                        fairness_state
+                            .wait_queue
+                            .push_back(timeline_key.to_string());
+                    }
+                    false
+                }
+            };
+
+            if grant_turn {
+                break;
+            }
+
+            if let Some(cancellation) = cancellation.as_ref() {
+                tokio::select! {
+                    _ = notifier.notified() => continue,
+                    _ = cancellation.cancelled() => {
+                        self.remove_generator_waiter(generator_id, timeline_key).await;
+                        return Err(TsoError::RequestCancelled);
+                    }
+                }
+            } else {
+                notifier.notified().await;
+            }
+        }
+
         let permit = self.generator_admission_gates[generator_id as usize]
             .clone()
             .acquire_owned();
-        if let Some(cancellation) = cancellation {
+        let permit_result = if let Some(cancellation) = cancellation {
             tokio::select! {
                 permit = permit => permit
                     .map(Some)
@@ -107,7 +213,13 @@ impl TsoService {
                 .await
                 .map(Some)
                 .map_err(|_| TsoError::ServiceShuttingDown)
+        };
+
+        if permit_result.is_err() {
+            self.release_generator_admission_turn(generator_id, resource_tier, timeline_key)
+                .await;
         }
+        permit_result
     }
 
     pub(super) fn check_request_cancellation(
