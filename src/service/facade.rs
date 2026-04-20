@@ -79,6 +79,16 @@ impl TsoService {
             generator_admission_gates: (0..MAX_GENERATORS)
                 .map(|_| Arc::new(Semaphore::new(1)))
                 .collect(),
+            generator_fairness_trackers: (0..MAX_GENERATORS)
+                .map(|_| {
+                    Arc::new(tokio::sync::Mutex::new(
+                        super::GeneratorFairnessState::default(),
+                    ))
+                })
+                .collect(),
+            generator_fairness_notifiers: (0..MAX_GENERATORS)
+                .map(|_| Arc::new(tokio::sync::Notify::new()))
+                .collect(),
             timeline_load_coordinator: TimelineLoadCoordinator::default(),
             timeline_load_limiter: Arc::new(Semaphore::new(max_concurrent_timeline_loads)),
             generator_lease_coordinator: GeneratorLeaseCoordinator::default(),
@@ -487,21 +497,10 @@ mod tests {
 
     use super::{ShutdownTransferCandidates, ShutdownTransferState, TsoService};
     use crate::metadata::{GeneratorLeaseAuthority, MemoryMetadataStore, TimelineAuthority};
-    use crate::{
-        AllocateTimestampsRequest, ManualClock, ResourceTier, TsoConfig, TsoError, TsoSecurityMode,
-    };
+    use crate::{AllocateTimestampsRequest, ManualClock, ResourceTier, TsoConfig, TsoError};
 
     fn required_test_config(config: TsoConfig) -> TsoConfig {
-        TsoConfig {
-            security_mode: Some(TsoSecurityMode::Required),
-            grpc_tls_cert_file: Some("server.crt".into()),
-            grpc_tls_key_file: Some("server.key".into()),
-            grpc_client_ca_file: Some("ca.pem".into()),
-            grpc_request_timeout_ms: Some(100),
-            grpc_max_request_bytes: Some(1024),
-            grpc_max_concurrent_requests: Some(16),
-            ..config
-        }
+        crate::test_tls::required_grpc_tls_test_config(config, 100)
     }
 
     fn with_worker(mut config: TsoConfig, worker_id: &str) -> TsoConfig {
@@ -547,13 +546,10 @@ mod tests {
             metadata_kind: "etcd".into(),
             etcd_endpoints: vec!["127.0.0.1:2379".into()],
             advertise_endpoint: "10.0.0.10:50051".into(),
-            security_mode: Some(TsoSecurityMode::Required),
-            grpc_tls_cert_file: Some("server.crt".into()),
-            grpc_tls_key_file: Some("server.key".into()),
-            grpc_client_ca_file: Some("ca.pem".into()),
             safety_gap_ms: 1,
             ..TsoConfig::default()
         };
+        let config = crate::test_tls::required_grpc_tls_test_config(config, 100);
 
         let error = match TsoService::new(
             config,

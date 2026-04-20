@@ -17,6 +17,8 @@ pub mod rpc;
 mod runtime;
 mod service;
 mod status;
+#[cfg(test)]
+mod test_tls;
 pub mod timeline_proxy;
 mod timeline_state;
 #[doc(hidden)]
