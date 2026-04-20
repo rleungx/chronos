@@ -30,8 +30,6 @@ struct SpawnedChronosConfig<'a> {
     worker_id: &'a str,
     bind_addr: SocketAddr,
     metrics_bind_addr: SocketAddr,
-    lease_ttl_ms: u64,
-    generator_maintenance_interval_ms: u64,
     safety_gap_ms: u64,
 }
 
@@ -60,11 +58,6 @@ fn spawn_chronos_process(config: SpawnedChronosConfig<'_>) -> Child {
         .env("CHRONOS_ETCD_PREFIX", config.prefix)
         .env("CHRONOS_SECURITY_MODE", "dev-insecure")
         .env("CHRONOS_SAFETY_GAP_MS", config.safety_gap_ms.to_string())
-        .env("CHRONOS_LEASE_TTL_MS", config.lease_ttl_ms.to_string())
-        .env(
-            "CHRONOS_GENERATOR_MAINTENANCE_INTERVAL_MS",
-            config.generator_maintenance_interval_ms.to_string(),
-        )
         .env("CHRONOS_WORKER_ID", config.worker_id)
         .env("CHRONOS_INSTANCE_ID", config.instance_id)
         .env("CHRONOS_BIND_ADDR", config.bind_addr.to_string())
@@ -294,8 +287,6 @@ async fn etcd_spawned_process_rejects_duplicate_instance_identity() {
         worker_id: "worker-a",
         bind_addr: free_loopback_addr(),
         metrics_bind_addr: free_loopback_addr(),
-        lease_ttl_ms: 30_000,
-        generator_maintenance_interval_ms: 200,
         safety_gap_ms: 1,
     });
 
@@ -307,8 +298,6 @@ async fn etcd_spawned_process_rejects_duplicate_instance_identity() {
         worker_id: "worker-b",
         bind_addr: free_loopback_addr(),
         metrics_bind_addr: free_loopback_addr(),
-        lease_ttl_ms: 30_000,
-        generator_maintenance_interval_ms: 200,
         safety_gap_ms: 1,
     });
 
@@ -343,8 +332,6 @@ async fn etcd_spawned_process_rejects_duplicate_instance_identity() {
 async fn etcd_spawned_process_failover_preserves_tso_monotonicity() {
     let prefix = unique_test_etcd_prefix("multiprocess-failover");
     let timeline_key = "spawned.failover.timeline";
-    let lease_ttl_ms = 1_500;
-    let generator_maintenance_interval_ms = 100;
     let safety_gap_ms = 200;
 
     let bind_a = free_loopback_addr();
@@ -358,8 +345,6 @@ async fn etcd_spawned_process_failover_preserves_tso_monotonicity() {
         worker_id: "worker-a",
         bind_addr: bind_a,
         metrics_bind_addr: free_loopback_addr(),
-        lease_ttl_ms,
-        generator_maintenance_interval_ms,
         safety_gap_ms,
     });
     wait_for_ready(bind_a, &mut first).await;
@@ -374,8 +359,6 @@ async fn etcd_spawned_process_failover_preserves_tso_monotonicity() {
         worker_id: "worker-b",
         bind_addr: bind_b,
         metrics_bind_addr: free_loopback_addr(),
-        lease_ttl_ms,
-        generator_maintenance_interval_ms,
         safety_gap_ms,
     });
     wait_for_ready(bind_b, &mut second).await;

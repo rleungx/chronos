@@ -31,9 +31,7 @@ struct BenchConfig {
     duration_secs: u64,
     warmup_secs: u64,
     allocate_batch: u32,
-    lease_ttl_ms: u64,
     safety_gap_ms: u64,
-    generator_maintenance_interval_ms: u64,
     failover_poll_interval_ms: u64,
     failover_timeout_secs: u64,
     allocate_request_timeout_ms: u64,
@@ -47,6 +45,7 @@ struct SpawnConfig {
     instance_id: String,
     worker_id: String,
     bind_addr: SocketAddr,
+    advertise_endpoint: String,
     metrics_bind_addr: SocketAddr,
 }
 
@@ -101,6 +100,10 @@ fn free_loopback_addr() -> SocketAddr {
     addr
 }
 
+fn local_advertise_endpoint(alias: &str, bind_addr: SocketAddr) -> String {
+    format!("{alias}.localhost:{}", bind_addr.port())
+}
+
 fn timeline_key(config: &BenchConfig) -> String {
     format!(
         "{}.allocate_during_failover.{}",
@@ -112,12 +115,7 @@ fn load_config() -> BenchConfig {
     let duration_secs = env_or("CHRONOS_FAILOVER_BENCH_DURATION_SECS", 10u64);
     let warmup_secs = env_or("CHRONOS_FAILOVER_BENCH_WARMUP_SECS", 2u64);
     let allocate_batch = env_or("CHRONOS_FAILOVER_BENCH_ALLOCATE_BATCH", 1u32);
-    let lease_ttl_ms = env_or("CHRONOS_FAILOVER_BENCH_LEASE_TTL_MS", 1_500u64);
     let safety_gap_ms = env_or("CHRONOS_FAILOVER_BENCH_SAFETY_GAP_MS", 200u64);
-    let generator_maintenance_interval_ms = env_or(
-        "CHRONOS_FAILOVER_BENCH_GENERATOR_MAINTENANCE_INTERVAL_MS",
-        100u64,
-    );
     let failover_poll_interval_ms =
         env_or("CHRONOS_FAILOVER_BENCH_FAILOVER_POLL_INTERVAL_MS", 100u64);
     let failover_timeout_secs = env_or("CHRONOS_FAILOVER_BENCH_FAILOVER_TIMEOUT_SECS", 15u64);
@@ -154,9 +152,7 @@ fn load_config() -> BenchConfig {
         duration_secs,
         warmup_secs,
         allocate_batch,
-        lease_ttl_ms,
         safety_gap_ms,
-        generator_maintenance_interval_ms,
         failover_poll_interval_ms,
         failover_timeout_secs,
         allocate_request_timeout_ms,
@@ -165,12 +161,14 @@ fn load_config() -> BenchConfig {
             instance_id: "bench-instance-a".to_string(),
             worker_id: "worker-a".to_string(),
             bind_addr: bind_a,
+            advertise_endpoint: local_advertise_endpoint("chronos-failover-a", bind_a),
             metrics_bind_addr: free_loopback_addr(),
         },
         owner_b: SpawnConfig {
             instance_id: "bench-instance-b".to_string(),
             worker_id: "worker-b".to_string(),
             bind_addr: bind_b,
+            advertise_endpoint: local_advertise_endpoint("chronos-failover-b", bind_b),
             metrics_bind_addr: free_loopback_addr(),
         },
     }
@@ -226,15 +224,10 @@ fn spawn_chronos_process(config: &BenchConfig, spawn: &SpawnConfig) -> AppResult
         )
         .env("CHRONOS_SECURITY_MODE", "dev-insecure")
         .env("CHRONOS_SAFETY_GAP_MS", config.safety_gap_ms.to_string())
-        .env("CHRONOS_LEASE_TTL_MS", config.lease_ttl_ms.to_string())
-        .env(
-            "CHRONOS_GENERATOR_MAINTENANCE_INTERVAL_MS",
-            config.generator_maintenance_interval_ms.to_string(),
-        )
         .env("CHRONOS_WORKER_ID", &spawn.worker_id)
         .env("CHRONOS_INSTANCE_ID", &spawn.instance_id)
         .env("CHRONOS_BIND_ADDR", spawn.bind_addr.to_string())
-        .env("CHRONOS_ADVERTISE_ENDPOINT", spawn.bind_addr.to_string())
+        .env("CHRONOS_ADVERTISE_ENDPOINT", &spawn.advertise_endpoint)
         .env(
             "CHRONOS_METRICS_BIND_ADDR",
             spawn.metrics_bind_addr.to_string(),
@@ -258,7 +251,18 @@ fn terminate_child(child: &mut Child) {
     let _ = child.wait();
 }
 
+fn owner_endpoint_addr(config: &BenchConfig, owner_endpoint: &str) -> AppResult<SocketAddr> {
+    if owner_endpoint == config.owner_a.advertise_endpoint {
+        return Ok(config.owner_a.bind_addr);
+    }
+    if owner_endpoint == config.owner_b.advertise_endpoint {
+        return Ok(config.owner_b.bind_addr);
+    }
+    Ok(owner_endpoint.parse::<SocketAddr>()?)
+}
+
 async fn wait_for_post_failover_allocation_success(
+    config: &BenchConfig,
     route: &TimelineRoute,
     allocate_batch: u32,
     request_timeout_ms: u64,
@@ -269,7 +273,7 @@ async fn wait_for_post_failover_allocation_success(
     timeout(Duration::from_secs(timeout_secs), async {
         loop {
             match allocate_timestamps_raw(
-                route.owner_worker_endpoint.parse::<SocketAddr>()?,
+                owner_endpoint_addr(config, &route.owner_worker_endpoint)?,
                 route,
                 "failover-post-success-probe",
                 allocate_batch,
@@ -491,7 +495,7 @@ async fn main() -> AppResult<()> {
         );
         let route = Arc::new(Mutex::new(initial_route.clone()));
         let (leader_endpoint, standby_endpoint) = select_leader_and_standby(
-            initial_route.owner_worker_endpoint.parse::<SocketAddr>()?,
+            owner_endpoint_addr(&config, &initial_route.owner_worker_endpoint)?,
             config.owner_a.bind_addr,
             config.owner_b.bind_addr,
         );
@@ -521,6 +525,7 @@ async fn main() -> AppResult<()> {
         let route_refresh_timeout_ms = config.route_refresh_timeout_ms;
         let owner_a_endpoint = config.owner_a.bind_addr;
         let owner_b_endpoint = config.owner_b.bind_addr;
+        let allocator_config = config.clone();
 
         let allocator_handle = tokio::spawn(async move {
             let warmup_until = Instant::now() + Duration::from_secs(warmup_secs);
@@ -538,7 +543,8 @@ async fn main() -> AppResult<()> {
 
                 ordinal = ordinal.saturating_add(1);
                 let route_snapshot = allocator_route.lock().await.clone();
-                let owner_endpoint = route_snapshot.owner_worker_endpoint.parse::<SocketAddr>()?;
+                let owner_endpoint =
+                    owner_endpoint_addr(&allocator_config, &route_snapshot.owner_worker_endpoint)?;
                 let allocate_result = allocate_timestamps_raw(
                     owner_endpoint,
                     &route_snapshot,
@@ -622,7 +628,11 @@ async fn main() -> AppResult<()> {
 
         let driver_barrier = barrier.clone();
         let timeline_key_for_failover = timeline_key.clone();
-        let owner_endpoint_str = standby_endpoint.to_string();
+        let owner_endpoint_str = if standby_endpoint == config.owner_a.bind_addr {
+            config.owner_a.advertise_endpoint.clone()
+        } else {
+            config.owner_b.advertise_endpoint.clone()
+        };
         let failover_timeout_secs = config.failover_timeout_secs;
         let failover_poll_interval_ms = config.failover_poll_interval_ms;
         let driver_allocate_batch = config.allocate_batch;
@@ -630,6 +640,7 @@ async fn main() -> AppResult<()> {
         let driver_kill_instant = kill_instant.clone();
         let driver_first_success_after_kill = first_success_after_kill.clone();
         let driver_leader_child = leader_child.clone();
+        let driver_config = config.clone();
         let driver_stats_handle = tokio::spawn(async move {
             let mut stats = FailoverBenchStats::default();
             driver_barrier.wait().await;
@@ -665,6 +676,7 @@ async fn main() -> AppResult<()> {
                                 })?;
                             *route.lock().await = refreshed;
                             wait_for_post_failover_allocation_success(
+                                &driver_config,
                                 &route.lock().await.clone(),
                                 driver_allocate_batch,
                                 driver_request_timeout_ms,
@@ -725,12 +737,7 @@ async fn main() -> AppResult<()> {
             "route_refresh_timeout_ms={}",
             config.route_refresh_timeout_ms
         );
-        println!("lease_ttl_ms={}", config.lease_ttl_ms);
         println!("safety_gap_ms={}", config.safety_gap_ms);
-        println!(
-            "generator_maintenance_interval_ms={}",
-            config.generator_maintenance_interval_ms
-        );
         println!("allocate_requests_total={}", stats.allocate_requests_total);
         println!("allocate_success_total={}", stats.allocate_success_total);
         println!("allocate_failed_total={}", stats.allocate_failed_total);
@@ -846,5 +853,47 @@ mod tests {
             detail.encode_to_vec().into(),
         );
         assert_eq!(error_label(&status), "lease_expired");
+    }
+
+    #[test]
+    fn owner_endpoint_addr_maps_localhost_subdomains_to_child_bind_addresses() {
+        let owner_a_bind: SocketAddr = "127.0.0.1:50051".parse().unwrap();
+        let owner_b_bind: SocketAddr = "127.0.0.1:50052".parse().unwrap();
+        let config = BenchConfig {
+            etcd_endpoints: vec!["127.0.0.1:2379".to_string()],
+            timeline_namespace: "ns".to_string(),
+            timeline_key: "key".to_string(),
+            duration_secs: 1,
+            warmup_secs: 0,
+            allocate_batch: 1,
+            safety_gap_ms: 1,
+            failover_poll_interval_ms: 100,
+            failover_timeout_secs: 1,
+            allocate_request_timeout_ms: 100,
+            route_refresh_timeout_ms: 100,
+            owner_a: SpawnConfig {
+                instance_id: "a".to_string(),
+                worker_id: "worker-a".to_string(),
+                bind_addr: owner_a_bind,
+                advertise_endpoint: "chronos-failover-a.localhost:50051".to_string(),
+                metrics_bind_addr: "127.0.0.1:9898".parse().unwrap(),
+            },
+            owner_b: SpawnConfig {
+                instance_id: "b".to_string(),
+                worker_id: "worker-b".to_string(),
+                bind_addr: owner_b_bind,
+                advertise_endpoint: "chronos-failover-b.localhost:50052".to_string(),
+                metrics_bind_addr: "127.0.0.1:9899".parse().unwrap(),
+            },
+        };
+
+        assert_eq!(
+            owner_endpoint_addr(&config, "chronos-failover-a.localhost:50051").unwrap(),
+            owner_a_bind
+        );
+        assert_eq!(
+            owner_endpoint_addr(&config, "chronos-failover-b.localhost:50052").unwrap(),
+            owner_b_bind
+        );
     }
 }
