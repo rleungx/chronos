@@ -1,6 +1,10 @@
 use std::fmt;
+use std::fs::File;
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 use thiserror::Error;
 
@@ -107,7 +111,7 @@ pub(crate) fn advertise_endpoint_rejected_for_authoritative_metadata(endpoint: &
     }
 
     match normalized.parse::<IpAddr>() {
-        Ok(ip) => ip.is_unspecified(),
+        Ok(ip) => ip.is_unspecified() || ip.is_loopback(),
         Err(_) => false,
     }
 }
@@ -329,7 +333,7 @@ impl TsoConfig {
         }
         if advertise_endpoint_rejected_for_authoritative_metadata(&self.advertise_endpoint) {
             return Err(TsoConfigValidationError::Security(
-                "CHRONOS_ADVERTISE_ENDPOINT must not use localhost or a wildcard address when metadata=etcd"
+                "CHRONOS_ADVERTISE_ENDPOINT must not use localhost, a loopback IP, or a wildcard address when metadata=etcd"
                     .into(),
             ));
         }
@@ -512,6 +516,25 @@ impl TsoConfig {
             ],
             false,
         )?;
+        validate_readable_files(&[
+            ("CHRONOS_GRPC_TLS_CERT_FILE", &self.grpc_tls_cert_file),
+            ("CHRONOS_GRPC_TLS_KEY_FILE", &self.grpc_tls_key_file),
+            ("CHRONOS_GRPC_CLIENT_CA_FILE", &self.grpc_client_ca_file),
+            ("CHRONOS_METRICS_TLS_CERT_FILE", &self.metrics_tls_cert_file),
+            ("CHRONOS_METRICS_TLS_KEY_FILE", &self.metrics_tls_key_file),
+            (
+                "CHRONOS_METRICS_CLIENT_CA_FILE",
+                &self.metrics_client_ca_file,
+            ),
+            ("CHRONOS_ETCD_CA_FILE", &self.etcd_ca_file),
+            ("CHRONOS_ETCD_CERT_FILE", &self.etcd_cert_file),
+            ("CHRONOS_ETCD_KEY_FILE", &self.etcd_key_file),
+        ])?;
+        validate_private_key_files(&[
+            ("CHRONOS_GRPC_TLS_KEY_FILE", &self.grpc_tls_key_file),
+            ("CHRONOS_METRICS_TLS_KEY_FILE", &self.metrics_tls_key_file),
+            ("CHRONOS_ETCD_KEY_FILE", &self.etcd_key_file),
+        ])?;
         validate_positive_optional_u64(
             "CHRONOS_GRPC_REQUEST_TIMEOUT_MS",
             self.grpc_request_timeout_ms,
@@ -663,7 +686,7 @@ fn endpoint_host_is_local(endpoint: &str) -> Result<bool, TsoConfigValidationErr
         .trim()
         .trim_matches(|ch| ch == '[' || ch == ']')
         .to_ascii_lowercase();
-    if normalized == "localhost" {
+    if normalized == "localhost" || normalized.ends_with(".localhost") {
         return Ok(true);
     }
     match normalized.parse::<IpAddr>() {
@@ -737,6 +760,58 @@ fn validate_tls_bundle(
         return Err(TsoConfigValidationError::Security(format!(
             "{bundle_name} requires a complete bundle: {field_list}"
         )));
+    }
+    Ok(())
+}
+
+fn validate_readable_files(
+    fields: &[(&str, &Option<String>)],
+) -> Result<(), TsoConfigValidationError> {
+    for (field_name, value) in fields {
+        let Some(path) = value.as_deref() else {
+            continue;
+        };
+        File::open(path).map_err(|error| {
+            TsoConfigValidationError::Security(format!(
+                "{field_name} could not read {path}: {error}"
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+fn validate_private_key_files(
+    fields: &[(&str, &Option<String>)],
+) -> Result<(), TsoConfigValidationError> {
+    for (field_name, value) in fields {
+        let Some(path) = value.as_deref() else {
+            continue;
+        };
+        let metadata = std::fs::symlink_metadata(path).map_err(|error| {
+            TsoConfigValidationError::Security(format!(
+                "{field_name} could not stat {path}: {error}"
+            ))
+        })?;
+        let file_type = metadata.file_type();
+        if file_type.is_symlink() {
+            return Err(TsoConfigValidationError::Security(format!(
+                "{field_name} must not be a symlink: {path}"
+            )));
+        }
+        if !file_type.is_file() {
+            return Err(TsoConfigValidationError::Security(format!(
+                "{field_name} must reference a regular file: {path}"
+            )));
+        }
+        #[cfg(unix)]
+        {
+            let mode = metadata.permissions().mode() & 0o777;
+            if mode & 0o077 != 0 {
+                return Err(TsoConfigValidationError::Security(format!(
+                    "{field_name} must not be group/other accessible: {path} has mode {mode:o}"
+                )));
+            }
+        }
     }
     Ok(())
 }
@@ -835,6 +910,24 @@ mod tests {
         PRODUCTION_MAX_TIMELINE_PROXY_LANES, PRODUCTION_MAX_TIMELINE_RUNTIME_ENTRIES,
     };
     use crate::ResourceTier;
+    use std::path::PathBuf;
+
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    fn unique_temp_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "chronos-{}-{}-{}",
+            label,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
 
     fn valid_config() -> TsoConfig {
         TsoConfig {
@@ -1032,6 +1125,20 @@ mod tests {
     }
 
     #[test]
+    fn resolve_effective_security_mode_accepts_localhost_subdomain_for_local_only_topology() {
+        let config = TsoConfig {
+            bind_addr: "127.0.0.1:50051".into(),
+            metrics_bind_addr: "127.0.0.1:9898".into(),
+            advertise_endpoint: "chronos-soak.localhost:50051".into(),
+            ..TsoConfig::default().with_security_mode(TsoSecurityMode::DevInsecure)
+        };
+        assert_eq!(
+            config.resolve_effective_security_mode(),
+            Ok(TsoSecurityMode::DevInsecure)
+        );
+    }
+
+    #[test]
     fn resolve_effective_security_mode_infers_required_for_nonlocal_topology() {
         let config = TsoConfig {
             advertise_endpoint: "10.0.0.10:50051".into(),
@@ -1078,14 +1185,170 @@ mod tests {
     }
 
     #[test]
-    fn validate_for_startup_rejects_required_remote_exposed_grpc_with_zero_timeout() {
+    fn validate_for_startup_rejects_unreadable_grpc_tls_files() {
         let config = TsoConfig {
             bind_addr: "0.0.0.0:50052".into(),
             advertise_endpoint: "10.0.0.10:50052".into(),
             security_mode: Some(TsoSecurityMode::Required),
-            grpc_tls_cert_file: Some("server.crt".into()),
-            grpc_tls_key_file: Some("server.key".into()),
-            grpc_client_ca_file: Some("ca.pem".into()),
+            grpc_tls_cert_file: Some("/definitely/missing/server.crt".into()),
+            grpc_tls_key_file: Some("/definitely/missing/server.key".into()),
+            grpc_client_ca_file: Some("/definitely/missing/ca.pem".into()),
+            grpc_request_timeout_ms: Some(100),
+            grpc_max_request_bytes: Some(1024),
+            grpc_max_concurrent_requests: Some(16),
+            ..TsoConfig::default()
+        };
+        assert!(matches!(
+            config.validate_for_startup(),
+            Err(TsoConfigValidationError::Security(message))
+                if message.contains("CHRONOS_GRPC_TLS_CERT_FILE could not read")
+        ));
+    }
+
+    #[test]
+    fn validate_for_startup_rejects_unreadable_metrics_tls_files() {
+        let config = TsoConfig {
+            metrics_tls_cert_file: Some("/definitely/missing/metrics.crt".into()),
+            metrics_tls_key_file: Some("/definitely/missing/metrics.key".into()),
+            metrics_client_ca_file: Some("/definitely/missing/metrics-ca.pem".into()),
+            ..valid_config()
+        };
+        assert!(matches!(
+            config.validate_for_startup(),
+            Err(TsoConfigValidationError::Security(message))
+                if message.contains("CHRONOS_METRICS_TLS_CERT_FILE could not read")
+        ));
+    }
+
+    #[test]
+    fn validate_for_startup_rejects_unreadable_etcd_tls_files() {
+        let config = TsoConfig {
+            metadata_kind: "etcd".into(),
+            etcd_endpoints: vec!["https://10.0.0.20:2379".into()],
+            advertise_endpoint: "10.0.0.10:50051".into(),
+            security_mode: Some(TsoSecurityMode::Required),
+            etcd_ca_file: Some("/definitely/missing/ca.pem".into()),
+            etcd_cert_file: Some("/definitely/missing/client.pem".into()),
+            etcd_key_file: Some("/definitely/missing/client-key.pem".into()),
+            etcd_timeout_ms: Some(100),
+            worker_id: "worker-a".into(),
+            safety_gap_ms: 1,
+            ..valid_config()
+        };
+        assert!(matches!(
+            config.validate_for_startup(),
+            Err(TsoConfigValidationError::Security(message))
+                if message.contains("CHRONOS_ETCD_CA_FILE could not read")
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_for_startup_rejects_group_readable_private_key_files() {
+        let dir = unique_temp_dir("config-key-perms-reject");
+        let cert_path = dir.join("server.crt");
+        let key_path = dir.join("server.key");
+        let ca_path = dir.join("ca.pem");
+        std::fs::write(&cert_path, b"cert").unwrap();
+        std::fs::write(&key_path, b"key").unwrap();
+        std::fs::write(&ca_path, b"ca").unwrap();
+        std::fs::set_permissions(&cert_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        std::fs::set_permissions(&ca_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let config = TsoConfig {
+            bind_addr: "0.0.0.0:50052".into(),
+            advertise_endpoint: "10.0.0.10:50052".into(),
+            security_mode: Some(TsoSecurityMode::Required),
+            grpc_tls_cert_file: Some(cert_path.to_string_lossy().into_owned()),
+            grpc_tls_key_file: Some(key_path.to_string_lossy().into_owned()),
+            grpc_client_ca_file: Some(ca_path.to_string_lossy().into_owned()),
+            grpc_request_timeout_ms: Some(100),
+            grpc_max_request_bytes: Some(1024),
+            grpc_max_concurrent_requests: Some(16),
+            ..TsoConfig::default()
+        };
+        assert!(matches!(
+            config.validate_for_startup(),
+            Err(TsoConfigValidationError::Security(message))
+                if message.contains("CHRONOS_GRPC_TLS_KEY_FILE must not be group/other accessible")
+        ));
+    }
+
+    #[test]
+    fn validate_for_startup_rejects_symlink_private_key_files() {
+        let dir = unique_temp_dir("config-key-symlink-reject");
+        let cert_path = dir.join("server.crt");
+        let key_target_path = dir.join("server.key.real");
+        let key_link_path = dir.join("server.key");
+        let ca_path = dir.join("ca.pem");
+        std::fs::write(&cert_path, b"cert").unwrap();
+        std::fs::write(&key_target_path, b"key").unwrap();
+        std::fs::write(&ca_path, b"ca").unwrap();
+
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&key_target_path, &key_link_path).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(&key_target_path, &key_link_path).unwrap();
+
+        let config = TsoConfig {
+            bind_addr: "0.0.0.0:50052".into(),
+            advertise_endpoint: "10.0.0.10:50052".into(),
+            security_mode: Some(TsoSecurityMode::Required),
+            grpc_tls_cert_file: Some(cert_path.to_string_lossy().into_owned()),
+            grpc_tls_key_file: Some(key_link_path.to_string_lossy().into_owned()),
+            grpc_client_ca_file: Some(ca_path.to_string_lossy().into_owned()),
+            grpc_request_timeout_ms: Some(100),
+            grpc_max_request_bytes: Some(1024),
+            grpc_max_concurrent_requests: Some(16),
+            ..TsoConfig::default()
+        };
+        assert!(matches!(
+            config.validate_for_startup(),
+            Err(TsoConfigValidationError::Security(message))
+                if message.contains("CHRONOS_GRPC_TLS_KEY_FILE must not be a symlink")
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_for_startup_accepts_owner_only_private_key_files() {
+        let dir = unique_temp_dir("config-key-owner-only-accept");
+        let cert_path = dir.join("server.crt");
+        let key_path = dir.join("server.key");
+        let ca_path = dir.join("ca.pem");
+        std::fs::write(&cert_path, b"cert").unwrap();
+        std::fs::write(&key_path, b"key").unwrap();
+        std::fs::write(&ca_path, b"ca").unwrap();
+        std::fs::set_permissions(&cert_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::set_permissions(&ca_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let config = TsoConfig {
+            bind_addr: "0.0.0.0:50052".into(),
+            advertise_endpoint: "10.0.0.10:50052".into(),
+            security_mode: Some(TsoSecurityMode::Required),
+            grpc_tls_cert_file: Some(cert_path.to_string_lossy().into_owned()),
+            grpc_tls_key_file: Some(key_path.to_string_lossy().into_owned()),
+            grpc_client_ca_file: Some(ca_path.to_string_lossy().into_owned()),
+            grpc_request_timeout_ms: Some(100),
+            grpc_max_request_bytes: Some(1024),
+            grpc_max_concurrent_requests: Some(16),
+            ..TsoConfig::default()
+        };
+        assert!(config.validate_for_startup().is_ok());
+    }
+
+    #[test]
+    fn validate_for_startup_rejects_required_remote_exposed_grpc_with_zero_timeout() {
+        let (cert_path, key_path, ca_path) = crate::test_tls::readable_test_tls_paths();
+        let config = TsoConfig {
+            bind_addr: "0.0.0.0:50052".into(),
+            advertise_endpoint: "10.0.0.10:50052".into(),
+            security_mode: Some(TsoSecurityMode::Required),
+            grpc_tls_cert_file: Some(cert_path.into()),
+            grpc_tls_key_file: Some(key_path.into()),
+            grpc_client_ca_file: Some(ca_path.into()),
             grpc_request_timeout_ms: Some(0),
             grpc_max_request_bytes: Some(1024),
             grpc_max_concurrent_requests: Some(16),
@@ -1128,6 +1391,24 @@ mod tests {
             Err(TsoConfigValidationError::Security(message))
                 if message.contains("localhost")
         ));
+    }
+
+    #[test]
+    fn authoritative_metadata_runtime_contract_rejects_loopback_advertise_endpoint() {
+        for advertise_endpoint in ["127.0.0.1:50051", "[::1]:50051"] {
+            let config = TsoConfig {
+                metadata_kind: "etcd".into(),
+                worker_id: "worker-a".into(),
+                advertise_endpoint: advertise_endpoint.into(),
+                safety_gap_ms: 1,
+                ..valid_config()
+            };
+            assert!(matches!(
+                config.validate_authoritative_metadata_runtime_contract(),
+                Err(TsoConfigValidationError::Security(message))
+                    if message.contains("loopback IP")
+            ));
+        }
     }
 
     #[test]
