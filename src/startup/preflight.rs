@@ -1,10 +1,7 @@
 use std::error::Error;
 
-use chronos::{
-    TsoConfig, TsoError, TsoSecurityMode, DEFAULT_MAX_BATCH_PER_REQUEST,
-    DEFAULT_MAX_TIMELINE_PROXY_LANES, DEFAULT_MAX_TIMELINE_RUNTIME_ENTRIES,
-};
-use tracing::{info, warn};
+use chronos::{TsoConfig, TsoError, TsoSecurityMode};
+use tracing::info;
 
 use crate::AppResult;
 
@@ -45,32 +42,11 @@ impl MetricsTransport {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct StartupAdvisory {
-    field: &'static str,
-    value: u64,
-}
-
-impl StartupAdvisory {
-    fn new(field: &'static str, value: u64) -> Self {
-        Self { field, value }
-    }
-
-    pub(crate) fn field(self) -> &'static str {
-        self.field
-    }
-
-    pub(crate) fn value(self) -> u64 {
-        self.value
-    }
-}
-
 #[derive(Debug, Clone)]
 pub(crate) struct ValidatedStartupPlan<'a> {
     startup: &'a LoadedStartupConfig,
     effective_security_mode: TsoSecurityMode,
     metrics_transport: MetricsTransport,
-    advisories: Vec<StartupAdvisory>,
 }
 
 impl<'a> ValidatedStartupPlan<'a> {
@@ -85,33 +61,19 @@ impl<'a> ValidatedStartupPlan<'a> {
     pub(crate) fn metrics_transport(&self) -> MetricsTransport {
         self.metrics_transport
     }
-
-    pub(crate) fn advisories(&self) -> &[StartupAdvisory] {
-        &self.advisories
-    }
 }
 
-fn build_startup_advisories(config: &TsoConfig) -> Vec<StartupAdvisory> {
-    let mut advisories = Vec::new();
-    if config.max_timeline_proxy_lanes > DEFAULT_MAX_TIMELINE_PROXY_LANES {
-        advisories.push(StartupAdvisory::new(
-            "max_timeline_proxy_lanes",
-            config.max_timeline_proxy_lanes as u64,
-        ));
+fn validate_production_profile_contract(startup: &LoadedStartupConfig) -> AppResult<()> {
+    if !startup.config.production_profile {
+        return Ok(());
     }
-    if config.max_timeline_runtime_entries > DEFAULT_MAX_TIMELINE_RUNTIME_ENTRIES {
-        advisories.push(StartupAdvisory::new(
-            "max_timeline_runtime_entries",
-            config.max_timeline_runtime_entries as u64,
-        ));
+
+    match &startup.metadata {
+        StartupMetadata::Etcd(_) => Ok(()),
+        StartupMetadata::Memory => {
+            Err("CHRONOS_PROFILE=production requires CHRONOS_METADATA=etcd".into())
+        }
     }
-    if config.max_batch_per_request > DEFAULT_MAX_BATCH_PER_REQUEST {
-        advisories.push(StartupAdvisory::new(
-            "max_batch_per_request",
-            config.max_batch_per_request as u64,
-        ));
-    }
-    advisories
 }
 
 fn build_validated_startup_plan(
@@ -126,7 +88,6 @@ fn build_validated_startup_plan(
         } else {
             MetricsTransport::Plain
         },
-        advisories: build_startup_advisories(config),
     })
 }
 
@@ -136,6 +97,7 @@ pub(crate) fn validate_startup_preflight(
     let config: &TsoConfig = &startup.config;
     config.validate_for_startup()?;
     validate_build_identity_for_profile(config, chronos::build_identity())?;
+    validate_production_profile_contract(startup)?;
 
     match &startup.metadata {
         StartupMetadata::Memory => build_validated_startup_plan(startup),
@@ -166,23 +128,6 @@ pub(crate) fn log_startup_preflight(plan: &ValidatedStartupPlan<'_>) {
         advertise_endpoint = %config.advertise_endpoint,
         build_version = chronos::build_version(),
         build_commit = chronos::build_commit(),
-        default_resource_tier = %config.default_resource_tier,
-        shared_generators = config.shared_generators,
-        warm_generators = config.warm_generators,
-        max_timeline_proxy_lanes = config.max_timeline_proxy_lanes,
-        max_timeline_runtime_entries = config.max_timeline_runtime_entries,
-        generator_ownership_modulo = config.generator_ownership_modulo,
-        generator_ownership_remainder = config.generator_ownership_remainder
+        safety_gap_ms = config.safety_gap_ms
     );
-
-    for advisory in plan.advisories() {
-        warn!(
-            component = "startup",
-            event = "preflight_advisory",
-            result = "degraded",
-            reason = "override_above_production_default",
-            field = advisory.field(),
-            value = advisory.value()
-        );
-    }
 }

@@ -17,6 +17,8 @@ enum CliCommand {
 }
 
 pub(crate) async fn run_cli_or_service() -> AppResult<()> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     match parse_cli_command(env::args().skip(1))? {
         CliCommand::Run => super::runtime::run().await,
         CliCommand::Help => {
@@ -101,28 +103,7 @@ fn print_config_lines(config: &TsoConfig) {
     println!("bind_addr={}", config.bind_addr);
     println!("metrics_bind_addr={}", config.metrics_bind_addr);
     println!("production_profile={}", config.production_profile);
-    println!("default_resource_tier={}", config.default_resource_tier);
-    println!("shared_generators={}", config.shared_generators);
-    println!("warm_generators={}", config.warm_generators);
-    println!("max_batch_per_request={}", config.max_batch_per_request);
-    println!("lease_ttl_ms={}", config.lease_ttl_ms);
-    println!(
-        "generator_maintenance_interval_ms={}",
-        config.generator_maintenance_interval_ms
-    );
     println!("safety_gap_ms={}", config.safety_gap_ms);
-    println!(
-        "max_timeline_proxy_lanes={}",
-        config.max_timeline_proxy_lanes
-    );
-    println!(
-        "max_timeline_runtime_entries={}",
-        config.max_timeline_runtime_entries
-    );
-    println!(
-        "generator_ownership={}/{}",
-        config.generator_ownership_remainder, config.generator_ownership_modulo
-    );
 }
 
 fn metrics_transport_label(transport: MetricsTransport) -> &'static str {
