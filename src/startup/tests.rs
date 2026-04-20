@@ -20,10 +20,12 @@ use chronos::{ManualClock, SystemClock, TsoError};
 use futures::FutureExt;
 use std::env;
 use std::net::SocketAddr;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::sync::{MutexGuard, Once};
+use std::sync::{MutexGuard, Once, OnceLock};
 use std::time::Duration;
 use tokio::sync::watch;
 
@@ -68,17 +70,23 @@ fn startup_ready_guard() -> MutexGuard<'static, ()> {
 }
 
 fn explicit_required_config() -> TsoConfig {
+    let fixture = shared_test_tls_fixture();
     TsoConfig {
         security_mode: Some(TsoSecurityMode::Required),
         safety_gap_ms: 1,
-        grpc_tls_cert_file: Some("server.crt".into()),
-        grpc_tls_key_file: Some("server.key".into()),
-        grpc_client_ca_file: Some("ca.pem".into()),
+        grpc_tls_cert_file: Some(fixture.server_cert_path.clone()),
+        grpc_tls_key_file: Some(fixture.server_key_path.clone()),
+        grpc_client_ca_file: Some(fixture.ca_cert_path.clone()),
         grpc_request_timeout_ms: Some(100),
         grpc_max_request_bytes: Some(1024),
         grpc_max_concurrent_requests: Some(16),
         ..TsoConfig::default()
     }
+}
+
+fn shared_test_tls_fixture() -> &'static MetricsTlsFixture {
+    static FIXTURE: OnceLock<MetricsTlsFixture> = OnceLock::new();
+    FIXTURE.get_or_init(build_metrics_tls_fixture)
 }
 
 fn explicit_dev_insecure_local_config(bind_addr: SocketAddr) -> TsoConfig {
@@ -188,6 +196,11 @@ fn build_metrics_tls_fixture() -> MetricsTlsFixture {
     std::fs::write(&server_key_path, server_key.serialize_pem()).unwrap();
     std::fs::write(&client_cert_path, client_cert.pem()).unwrap();
     std::fs::write(&client_key_path, client_key.serialize_pem()).unwrap();
+    #[cfg(unix)]
+    {
+        std::fs::set_permissions(&server_key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::set_permissions(&client_key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
 
     MetricsTlsFixture {
         _dir: dir,
@@ -310,6 +323,40 @@ fn production_profile_accepts_known_build_commit() {
 }
 
 #[test]
+fn startup_preflight_rejects_production_profile_with_memory_metadata() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    clear_tso_env();
+
+    let startup = memory_startup_config(TsoConfig {
+        production_profile: true,
+        ..explicit_required_config()
+    });
+
+    let error = validate_startup_preflight(&startup).unwrap_err();
+    assert!(error.to_string().contains("CHRONOS_METADATA=etcd"));
+}
+
+#[test]
+fn startup_preflight_accepts_production_profile_with_etcd_metadata() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    clear_tso_env();
+
+    let startup = etcd_startup_config(
+        TsoConfig {
+            production_profile: true,
+            metadata_kind: "etcd".into(),
+            worker_id: "worker-a".into(),
+            advertise_endpoint: "10.0.0.10:50051".into(),
+            etcd_endpoints: vec!["127.0.0.1:2379".into()],
+            ..explicit_required_config()
+        },
+        "/chronos",
+    );
+
+    validate_startup_preflight(&startup).unwrap();
+}
+
+#[test]
 fn non_production_profile_allows_unknown_build_commit() {
     let config = explicit_required_config();
 
@@ -396,6 +443,25 @@ fn startup_preflight_rejects_localhost_advertise_endpoint_for_etcd_metadata() {
 }
 
 #[test]
+fn startup_preflight_rejects_loopback_advertise_endpoint_for_etcd_metadata() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    clear_tso_env();
+
+    for advertise_endpoint in ["127.0.0.1:50051", "[::1]:50051"] {
+        let config = TsoConfig {
+            metadata_kind: "etcd".into(),
+            etcd_endpoints: vec!["127.0.0.1:2379".into()],
+            worker_id: "worker-a".into(),
+            advertise_endpoint: advertise_endpoint.into(),
+            ..explicit_required_config()
+        };
+        let error =
+            validate_startup_preflight(&etcd_startup_config(config, "/chronos")).unwrap_err();
+        assert!(error.to_string().contains("loopback IP"));
+    }
+}
+
+#[test]
 fn startup_preflight_rejects_wildcard_advertise_endpoint_for_etcd_metadata() {
     let _guard = ENV_LOCK.lock().unwrap();
     clear_tso_env();
@@ -441,6 +507,20 @@ fn startup_preflight_accepts_explicit_routable_advertise_endpoint_for_etcd_metad
 }
 
 #[test]
+fn startup_preflight_accepts_localhost_subdomain_advertise_endpoint_for_etcd_metadata() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    clear_tso_env();
+    let config = TsoConfig {
+        metadata_kind: "etcd".into(),
+        etcd_endpoints: vec!["127.0.0.1:2379".into()],
+        worker_id: "worker-a".into(),
+        advertise_endpoint: "chronos-soak.localhost:50051".into(),
+        ..explicit_required_config()
+    };
+    validate_startup_preflight(&etcd_startup_config(config, "/chronos")).unwrap();
+}
+
+#[test]
 fn startup_preflight_rejects_invalid_advertise_endpoint_format_for_etcd_metadata() {
     let _guard = ENV_LOCK.lock().unwrap();
     clear_tso_env();
@@ -459,15 +539,16 @@ fn startup_preflight_rejects_invalid_advertise_endpoint_format_for_etcd_metadata
 fn startup_preflight_rejects_http_etcd_endpoints_when_tls_is_configured() {
     let _guard = ENV_LOCK.lock().unwrap();
     clear_tso_env();
+    let fixture = shared_test_tls_fixture();
 
     let config = TsoConfig {
         metadata_kind: "etcd".into(),
         worker_id: "worker-a".into(),
         advertise_endpoint: "10.0.0.10:50051".into(),
         etcd_endpoints: vec!["http://10.0.0.20:2379".into()],
-        etcd_ca_file: Some("ca.pem".into()),
-        etcd_cert_file: Some("client.pem".into()),
-        etcd_key_file: Some("client-key.pem".into()),
+        etcd_ca_file: Some(fixture.ca_cert_path.clone()),
+        etcd_cert_file: Some(fixture.client_cert_path.clone()),
+        etcd_key_file: Some(fixture.client_key_path.clone()),
         etcd_timeout_ms: Some(100),
         ..explicit_required_config()
     };
@@ -906,13 +987,12 @@ fn startup_shell_raw_env_metadata_reads_remain_centralized_in_config_loader() {
 fn startup_preflight_returns_validated_plan_with_logging_state() {
     let _guard = ENV_LOCK.lock().unwrap();
     clear_tso_env();
+    let fixture = shared_test_tls_fixture();
 
     let startup = memory_startup_config(TsoConfig {
-        metrics_tls_cert_file: Some("metrics-server.crt".into()),
-        metrics_tls_key_file: Some("metrics-server.key".into()),
-        metrics_client_ca_file: Some("metrics-ca.pem".into()),
-        max_batch_per_request: chronos::DEFAULT_MAX_BATCH_PER_REQUEST + 1,
-        max_timeline_proxy_lanes: chronos::DEFAULT_MAX_TIMELINE_PROXY_LANES + 1,
+        metrics_tls_cert_file: Some(fixture.server_cert_path.clone()),
+        metrics_tls_key_file: Some(fixture.server_key_path.clone()),
+        metrics_client_ca_file: Some(fixture.ca_cert_path.clone()),
         ..explicit_required_config()
     });
 
@@ -921,22 +1001,6 @@ fn startup_preflight_returns_validated_plan_with_logging_state() {
     assert_eq!(
         plan.metrics_transport(),
         super::preflight::MetricsTransport::Mtls
-    );
-    assert_eq!(
-        plan.advisories()
-            .iter()
-            .map(|advisory| (advisory.field(), advisory.value()))
-            .collect::<Vec<_>>(),
-        vec![
-            (
-                "max_timeline_proxy_lanes",
-                (chronos::DEFAULT_MAX_TIMELINE_PROXY_LANES + 1) as u64,
-            ),
-            (
-                "max_batch_per_request",
-                (chronos::DEFAULT_MAX_BATCH_PER_REQUEST + 1) as u64,
-            ),
-        ]
     );
 }
 
@@ -955,28 +1019,7 @@ fn startup_preflight_logger_uses_validated_plan_instead_of_rederiving_state() {
 }
 
 #[test]
-fn load_tso_config_accepts_combined_generator_ownership() {
-    let _guard = ENV_LOCK.lock().unwrap();
-    clear_tso_env();
-    unsafe { env::set_var("CHRONOS_GENERATOR_OWNERSHIP", "1/4") };
-
-    let config = load_tso_config().unwrap();
-    assert_eq!(config.generator_ownership_remainder, 1);
-    assert_eq!(config.generator_ownership_modulo, 4);
-}
-
-#[test]
-fn load_tso_config_rejects_invalid_generator_ownership_format() {
-    let _guard = ENV_LOCK.lock().unwrap();
-    clear_tso_env();
-    unsafe { env::set_var("CHRONOS_GENERATOR_OWNERSHIP", "1:4") };
-
-    let error = load_tso_config().unwrap_err();
-    assert!(error.to_string().contains("CHRONOS_GENERATOR_OWNERSHIP"));
-}
-
-#[test]
-fn load_tso_config_applies_production_profile_before_overrides() {
+fn load_tso_config_applies_production_profile_without_exposing_internal_overrides() {
     let _guard = ENV_LOCK.lock().unwrap();
     clear_tso_env();
     unsafe { env::set_var("CHRONOS_PROFILE", "production") };
@@ -996,12 +1039,46 @@ fn load_tso_config_applies_production_profile_before_overrides() {
     );
 
     clear_tso_env();
-    unsafe {
-        env::set_var("CHRONOS_PROFILE", "production");
-        env::set_var("CHRONOS_MAX_BATCH_PER_REQUEST", "8192");
-    }
+    unsafe { env::set_var("CHRONOS_PROFILE", "production") };
     let config = load_tso_config().unwrap();
-    assert_eq!(config.max_batch_per_request, 8192);
+    assert_eq!(
+        config.max_batch_per_request,
+        chronos::PRODUCTION_MAX_BATCH_PER_REQUEST
+    );
+    assert_eq!(config.generator_ownership_remainder, 0);
+    assert_eq!(config.generator_ownership_modulo, 1);
+}
+
+#[test]
+fn load_tso_config_rejects_removed_internal_tuning_env_vars() {
+    let _guard = ENV_LOCK.lock().unwrap();
+
+    for key in [
+        "CHRONOS_ROUTE_CACHE_TTL_MS",
+        "CHRONOS_MAX_BATCH_PER_REQUEST",
+        "CHRONOS_GENERATOR_OWNERSHIP",
+        "CHRONOS_LEASE_TTL_MS",
+    ] {
+        clear_tso_env();
+        unsafe { env::set_var(key, "test-value") };
+
+        let error = load_tso_config().unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("unsupported startup tuning env var(s)"));
+        assert!(message.contains(key));
+    }
+}
+
+#[test]
+fn load_startup_config_rejects_removed_internal_tuning_env_vars() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    clear_tso_env();
+    unsafe { env::set_var("CHRONOS_MAX_TIMELINE_RUNTIME_ENTRIES", "123") };
+
+    let error = load_startup_config().unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("unsupported startup tuning env var(s)"));
+    assert!(message.contains("CHRONOS_MAX_TIMELINE_RUNTIME_ENTRIES"));
 }
 
 #[tokio::test]
