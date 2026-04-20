@@ -46,6 +46,30 @@ wait_for_etcd() {
   return 1
 }
 
+derive_local_advertise_endpoint() {
+  local service_endpoint=$1
+  local alias=$2
+  local override=${3:-}
+
+  if [[ -n "${override}" ]]; then
+    printf '%s\n' "${override}"
+    return 0
+  fi
+
+  if [[ "${service_endpoint}" != *:* ]]; then
+    echo "service endpoint must be host:port, got: ${service_endpoint}" >&2
+    return 1
+  fi
+
+  local port=${service_endpoint##*:}
+  if [[ -z "${port}" ]]; then
+    echo "service endpoint must include a port, got: ${service_endpoint}" >&2
+    return 1
+  fi
+
+  printf '%s.localhost:%s\n' "${alias}" "${port}"
+}
+
 extract_metric() {
   local key=$1
   local file=$2
