@@ -84,23 +84,19 @@ mod tests {
         ControlPlaneStore, GeneratorBatchOp, GeneratorLeaseAuthority, GeneratorRecord,
         RouteUpdateSource, TimelineAuthority, TimelineBatchOp, TimelineRecord,
     };
-    use crate::{ManualClock, ResourceTier, TimelineRoute, TsoConfig, TsoSecurityMode, TsoService};
+    use crate::{ManualClock, ResourceTier, TimelineRoute, TsoConfig, TsoService};
 
     use super::*;
 
     fn required_test_config(config: TsoConfig) -> TsoConfig {
-        TsoConfig {
-            security_mode: Some(TsoSecurityMode::Required),
-            grpc_tls_cert_file: Some("server.crt".into()),
-            grpc_tls_key_file: Some("server.key".into()),
-            grpc_client_ca_file: Some("ca.pem".into()),
-            grpc_request_timeout_ms: Some(1),
-            grpc_max_request_bytes: Some(1024),
-            grpc_max_concurrent_requests: Some(16),
-            advertise_endpoint: "127.0.0.1:50052".into(),
-            instance_id: "activation-instance".into(),
-            ..config
-        }
+        crate::test_tls::required_grpc_tls_test_config(
+            TsoConfig {
+                advertise_endpoint: "127.0.0.1:50052".into(),
+                instance_id: "activation-instance".into(),
+                ..config
+            },
+            1,
+        )
     }
 
     #[derive(Clone)]
