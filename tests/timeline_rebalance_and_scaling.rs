@@ -269,8 +269,11 @@ async fn allocations_remain_globally_unique_across_many_timelines() {
     let config = TsoConfig {
         shared_generators: 8,
         warm_generators: 0,
-        max_batch_per_request: 32,
+        max_batch_per_request: 256,
         max_future_borrow_ms: 10000,
+        lease_ttl_ms: 1_000_000,
+        generator_lease_ttl_ms: 1_000_000,
+        generator_maintenance_interval_ms: 1_000,
         default_resource_tier: ResourceTier::Shared,
         ..TsoConfig::default()
     };

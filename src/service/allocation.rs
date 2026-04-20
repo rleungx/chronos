@@ -61,6 +61,83 @@ impl TsoService {
         base.max(catchup_gap_ms.min(self.config.recovery_catchup_budget_ms))
     }
 
+    fn timeline_quota_capacity_for_route(&self, route: &TimelineRoute) -> Option<f64> {
+        match route.resource_tier {
+            ResourceTier::Shared => Some(
+                self.config
+                    .max_batch_per_request
+                    .min(crate::SEQUENCE_CAPACITY) as f64,
+            ),
+            ResourceTier::Warm => Some(self.config.max_batch_per_request as f64),
+            ResourceTier::Dedicated => None,
+        }
+    }
+
+    fn timeline_quota_wait_ms_for_route(&self, route: &TimelineRoute, deficit: f64) -> u64 {
+        let window_ms = self.effective_future_borrow_ms_for_route(route).max(1) as f64;
+        let capacity = self
+            .timeline_quota_capacity_for_route(route)
+            .unwrap_or(0.0)
+            .max(1.0);
+        let refill_per_ms = capacity / window_ms;
+        (deficit / refill_per_ms).ceil().max(1.0) as u64
+    }
+
+    fn charge_timeline_quota(
+        &self,
+        timeline_state: &mut crate::runtime::TimelineState,
+        count: u32,
+        now_ms: u64,
+    ) -> Result<Option<f64>, TsoError> {
+        let Some(capacity) = self.timeline_quota_capacity_for_route(&timeline_state.route) else {
+            return Ok(None);
+        };
+
+        let window_ms = self
+            .effective_future_borrow_ms_for_timeline_state(timeline_state, now_ms)
+            .max(1) as f64;
+        let refill_per_ms = capacity / window_ms;
+        let elapsed_ms = timeline_state
+            .timeline_quota_last_refill_ms
+            .map(|last| now_ms.saturating_sub(last) as f64)
+            .unwrap_or(0.0);
+        let available = timeline_state
+            .timeline_quota_tokens
+            .unwrap_or(capacity)
+            .min(capacity)
+            + elapsed_ms * refill_per_ms;
+        let available = available.min(capacity);
+        let requested = count as f64;
+
+        if requested > available {
+            let wait_ms =
+                self.timeline_quota_wait_ms_for_route(&timeline_state.route, requested - available);
+            return Err(TsoError::FutureBorrowExceeded {
+                requested_physical_ms: now_ms + wait_ms,
+                allowed_physical_ms: now_ms,
+            });
+        }
+
+        timeline_state.timeline_quota_tokens = Some((available - requested).max(0.0));
+        timeline_state.timeline_quota_last_refill_ms = Some(now_ms);
+        Ok(Some(requested))
+    }
+
+    fn refund_timeline_quota(
+        &self,
+        timeline_state: &mut crate::runtime::TimelineState,
+        charged: Option<f64>,
+    ) {
+        let Some(charged) = charged else {
+            return;
+        };
+        let Some(capacity) = self.timeline_quota_capacity_for_route(&timeline_state.route) else {
+            return;
+        };
+        let available = timeline_state.timeline_quota_tokens.unwrap_or(capacity);
+        timeline_state.timeline_quota_tokens = Some((available + charged).min(capacity));
+    }
+
     pub async fn ensure_timeline(&self, timeline_key: &str) -> Result<TimelineRoute, TsoError> {
         self.ensure_timeline_with_tier(timeline_key, self.config.default_resource_tier)
             .await
@@ -297,9 +374,13 @@ impl TsoService {
 mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::OnceLock;
+
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     use async_trait::async_trait;
-    use tokio::sync::{broadcast, oneshot};
+    use tokio::sync::{broadcast, mpsc, oneshot};
     use tokio::time::{timeout, Duration};
 
     use super::serve::{AllocationPath, CachedServeGuardOptions};
@@ -310,7 +391,7 @@ mod tests {
     use crate::plane::RequestCancellation;
     use crate::{
         AllocateTimestampsRequest, Clock, ManualClock, ResourceTier, TimelineLifecycleState,
-        TsoConfig, TsoError, TsoSecurityMode, TsoService,
+        TsoConfig, TsoError, TsoSecurityMode, TsoService, MAX_GENERATORS,
     };
 
     #[derive(Clone)]
@@ -684,16 +765,39 @@ mod tests {
     impl ControlPlaneStore for SilentRouteUpdateStore {}
 
     fn required_test_config(config: TsoConfig) -> TsoConfig {
+        let (cert_path, key_path, ca_path) = readable_test_tls_paths();
         TsoConfig {
             security_mode: Some(TsoSecurityMode::Required),
-            grpc_tls_cert_file: Some("server.crt".into()),
-            grpc_tls_key_file: Some("server.key".into()),
-            grpc_client_ca_file: Some("ca.pem".into()),
+            grpc_tls_cert_file: Some(cert_path.to_string()),
+            grpc_tls_key_file: Some(key_path.to_string()),
+            grpc_client_ca_file: Some(ca_path.to_string()),
             grpc_request_timeout_ms: Some(100),
             grpc_max_request_bytes: Some(1024),
             grpc_max_concurrent_requests: Some(16),
             ..config
         }
+    }
+
+    fn readable_test_tls_paths() -> (&'static str, &'static str, &'static str) {
+        static PATHS: OnceLock<(String, String, String)> = OnceLock::new();
+        let (cert, key, ca) = PATHS.get_or_init(|| {
+            let dir = std::env::temp_dir().join("chronos-service-allocation-test-tls");
+            std::fs::create_dir_all(&dir).unwrap();
+            let cert = dir.join("server.crt");
+            let key = dir.join("server.key");
+            let ca = dir.join("ca.pem");
+            std::fs::write(&cert, b"allocation-test-cert").unwrap();
+            std::fs::write(&key, b"allocation-test-key").unwrap();
+            std::fs::write(&ca, b"allocation-test-ca").unwrap();
+            #[cfg(unix)]
+            std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+            (
+                cert.to_string_lossy().into_owned(),
+                key.to_string_lossy().into_owned(),
+                ca.to_string_lossy().into_owned(),
+            )
+        });
+        (cert.as_str(), key.as_str(), ca.as_str())
     }
 
     fn with_worker(mut config: TsoConfig, worker_id: &str) -> TsoConfig {
@@ -1866,6 +1970,568 @@ mod tests {
         drop(permit);
         let response = allocate_task.await.unwrap().unwrap();
         assert_eq!(response.timeline_key, route.timeline_key);
+    }
+
+    async fn ensure_shared_timeline_on_generator(
+        service: &TsoService,
+        generator_id: u32,
+        prefix: &str,
+    ) -> crate::TimelineRoute {
+        for attempt in 0..(MAX_GENERATORS as usize * 8).max(8) {
+            let route = service
+                .ensure_timeline(&format!("{prefix}.{attempt}"))
+                .await
+                .unwrap();
+            if route.resource_tier == ResourceTier::Shared && route.generator_id == generator_id {
+                return route;
+            }
+        }
+        panic!("failed to find shared timeline for generator {generator_id}");
+    }
+
+    #[tokio::test]
+    async fn shared_large_batch_repeat_waits_behind_other_timeline() {
+        let service = TsoService::new(
+            with_worker(
+                TsoConfig {
+                    shared_generators: 1,
+                    warm_generators: 0,
+                    max_batch_per_request: 8,
+                    ..TsoConfig::default()
+                },
+                "worker-a",
+            ),
+            Arc::new(ManualClock::new(54_000)),
+            Arc::new(MemoryMetadataStore::new()),
+        )
+        .unwrap();
+
+        let route_a = service.ensure_timeline("shared.fairness.a").await.unwrap();
+        let route_b = ensure_shared_timeline_on_generator(
+            &service,
+            route_a.generator_id,
+            "shared.fairness.b",
+        )
+        .await;
+
+        service
+            .allocate_timestamps(AllocateTimestampsRequest {
+                timeline_key: route_a.timeline_key.clone(),
+                count: 4,
+                expected_epoch: route_a.epoch,
+                expected_route_version: route_a.route_version,
+                client_request_id: "shared-large-first".into(),
+            })
+            .await
+            .unwrap();
+
+        let permit = service.generator_admission_gates[route_a.generator_id as usize]
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let service_clone = service.clone();
+        let route_b_clone = route_b.clone();
+        let tx_b = tx.clone();
+        let mut blocked_task = tokio::spawn(async move {
+            let response = service_clone
+                .allocate_timestamps(AllocateTimestampsRequest {
+                    timeline_key: route_b_clone.timeline_key.clone(),
+                    count: 1,
+                    expected_epoch: route_b_clone.epoch,
+                    expected_route_version: route_b_clone.route_version,
+                    client_request_id: "shared-other-waiter".into(),
+                })
+                .await;
+            if let Ok(response) = &response {
+                let _ = tx_b.send(response.timeline_key.clone());
+            }
+            response
+        });
+
+        assert!(timeout(Duration::from_millis(50), &mut blocked_task)
+            .await
+            .is_err());
+
+        let service_clone = service.clone();
+        let route_a_clone = route_a.clone();
+        let tx_a = tx.clone();
+        let mut repeat_task = tokio::spawn(async move {
+            let response = service_clone
+                .allocate_timestamps(AllocateTimestampsRequest {
+                    timeline_key: route_a_clone.timeline_key.clone(),
+                    count: 4,
+                    expected_epoch: route_a_clone.epoch,
+                    expected_route_version: route_a_clone.route_version,
+                    client_request_id: "shared-large-repeat".into(),
+                })
+                .await;
+            if let Ok(response) = &response {
+                let _ = tx_a.send(response.timeline_key.clone());
+            }
+            response
+        });
+
+        assert!(timeout(Duration::from_millis(50), &mut repeat_task)
+            .await
+            .is_err());
+
+        drop(permit);
+        assert_eq!(rx.recv().await.unwrap(), route_b.timeline_key);
+        assert_eq!(rx.recv().await.unwrap(), route_a.timeline_key);
+        assert_eq!(
+            blocked_task.await.unwrap().unwrap().timeline_key,
+            route_b.timeline_key
+        );
+        assert_eq!(
+            repeat_task.await.unwrap().unwrap().timeline_key,
+            route_a.timeline_key
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_small_batch_repeat_waits_behind_other_timeline() {
+        let service = TsoService::new(
+            with_worker(
+                TsoConfig {
+                    shared_generators: 1,
+                    warm_generators: 0,
+                    max_batch_per_request: 8,
+                    ..TsoConfig::default()
+                },
+                "worker-a",
+            ),
+            Arc::new(ManualClock::new(55_000)),
+            Arc::new(MemoryMetadataStore::new()),
+        )
+        .unwrap();
+
+        let route_a = service.ensure_timeline("shared.small.a").await.unwrap();
+        let route_b =
+            ensure_shared_timeline_on_generator(&service, route_a.generator_id, "shared.small.b")
+                .await;
+
+        service
+            .allocate_timestamps(AllocateTimestampsRequest {
+                timeline_key: route_a.timeline_key.clone(),
+                count: 4,
+                expected_epoch: route_a.epoch,
+                expected_route_version: route_a.route_version,
+                client_request_id: "shared-large-seed".into(),
+            })
+            .await
+            .unwrap();
+
+        let permit = service.generator_admission_gates[route_a.generator_id as usize]
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let service_clone = service.clone();
+        let route_b_clone = route_b.clone();
+        let tx_b = tx.clone();
+        let mut blocked_b = tokio::spawn(async move {
+            let response = service_clone
+                .allocate_timestamps(AllocateTimestampsRequest {
+                    timeline_key: route_b_clone.timeline_key.clone(),
+                    count: 1,
+                    expected_epoch: route_b_clone.epoch,
+                    expected_route_version: route_b_clone.route_version,
+                    client_request_id: "shared-small-waiter".into(),
+                })
+                .await;
+            if let Ok(response) = &response {
+                let _ = tx_b.send(response.timeline_key.clone());
+            }
+            response
+        });
+        assert!(timeout(Duration::from_millis(50), &mut blocked_b)
+            .await
+            .is_err());
+
+        let service_clone = service.clone();
+        let route_a_clone = route_a.clone();
+        let tx_a = tx.clone();
+        let mut repeat_a = tokio::spawn(async move {
+            let response = service_clone
+                .allocate_timestamps(AllocateTimestampsRequest {
+                    timeline_key: route_a_clone.timeline_key.clone(),
+                    count: 1,
+                    expected_epoch: route_a_clone.epoch,
+                    expected_route_version: route_a_clone.route_version,
+                    client_request_id: "shared-small-repeat".into(),
+                })
+                .await;
+            if let Ok(response) = &response {
+                let _ = tx_a.send(response.timeline_key.clone());
+            }
+            response
+        });
+        assert!(timeout(Duration::from_millis(50), &mut repeat_a)
+            .await
+            .is_err());
+
+        drop(permit);
+        assert_eq!(rx.recv().await.unwrap(), route_b.timeline_key);
+        assert_eq!(rx.recv().await.unwrap(), route_a.timeline_key);
+        assert_eq!(
+            blocked_b.await.unwrap().unwrap().timeline_key,
+            route_b.timeline_key
+        );
+        assert_eq!(
+            repeat_a.await.unwrap().unwrap().timeline_key,
+            route_a.timeline_key
+        );
+    }
+
+    async fn ensure_warm_timeline_on_generator(
+        service: &TsoService,
+        generator_id: u32,
+        prefix: &str,
+    ) -> crate::TimelineRoute {
+        for attempt in 0..(MAX_GENERATORS as usize * 8).max(8) {
+            let route = service
+                .ensure_timeline(&format!("{prefix}.{attempt}"))
+                .await
+                .unwrap();
+            if route.resource_tier == ResourceTier::Warm && route.generator_id == generator_id {
+                return route;
+            }
+        }
+        panic!("failed to find warm timeline for generator {generator_id}");
+    }
+
+    #[tokio::test]
+    async fn warm_repeat_winner_waits_behind_other_timeline() {
+        let service = TsoService::new(
+            with_worker(
+                TsoConfig {
+                    default_resource_tier: ResourceTier::Warm,
+                    shared_generators: 0,
+                    warm_generators: 1,
+                    max_batch_per_request: 8,
+                    ..TsoConfig::default()
+                },
+                "worker-a",
+            ),
+            Arc::new(ManualClock::new(56_000)),
+            Arc::new(MemoryMetadataStore::new()),
+        )
+        .unwrap();
+
+        let route_a = service.ensure_timeline("warm.fairness.a").await.unwrap();
+        let route_b =
+            ensure_warm_timeline_on_generator(&service, route_a.generator_id, "warm.fairness.b")
+                .await;
+
+        service
+            .allocate_timestamps(AllocateTimestampsRequest {
+                timeline_key: route_a.timeline_key.clone(),
+                count: 1,
+                expected_epoch: route_a.epoch,
+                expected_route_version: route_a.route_version,
+                client_request_id: "warm-first".into(),
+            })
+            .await
+            .unwrap();
+
+        let permit = service.generator_admission_gates[route_a.generator_id as usize]
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let service_clone = service.clone();
+        let route_b_clone = route_b.clone();
+        let tx_b = tx.clone();
+        let mut blocked_task = tokio::spawn(async move {
+            let response = service_clone
+                .allocate_timestamps(AllocateTimestampsRequest {
+                    timeline_key: route_b_clone.timeline_key.clone(),
+                    count: 1,
+                    expected_epoch: route_b_clone.epoch,
+                    expected_route_version: route_b_clone.route_version,
+                    client_request_id: "warm-waiter".into(),
+                })
+                .await;
+            if let Ok(response) = &response {
+                let _ = tx_b.send(response.timeline_key.clone());
+            }
+            response
+        });
+
+        assert!(timeout(Duration::from_millis(50), &mut blocked_task)
+            .await
+            .is_err());
+
+        let service_clone = service.clone();
+        let route_a_clone = route_a.clone();
+        let tx_a = tx.clone();
+        let mut repeat_task = tokio::spawn(async move {
+            let response = service_clone
+                .allocate_timestamps(AllocateTimestampsRequest {
+                    timeline_key: route_a_clone.timeline_key.clone(),
+                    count: 1,
+                    expected_epoch: route_a_clone.epoch,
+                    expected_route_version: route_a_clone.route_version,
+                    client_request_id: "warm-repeat".into(),
+                })
+                .await;
+            if let Ok(response) = &response {
+                let _ = tx_a.send(response.timeline_key.clone());
+            }
+            response
+        });
+
+        assert!(timeout(Duration::from_millis(50), &mut repeat_task)
+            .await
+            .is_err());
+
+        drop(permit);
+        assert_eq!(rx.recv().await.unwrap(), route_b.timeline_key);
+        assert_eq!(rx.recv().await.unwrap(), route_a.timeline_key);
+        assert_eq!(
+            blocked_task.await.unwrap().unwrap().timeline_key,
+            route_b.timeline_key
+        );
+        assert_eq!(
+            repeat_task.await.unwrap().unwrap().timeline_key,
+            route_a.timeline_key
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_waiters_are_served_in_fifo_timeline_order() {
+        let service = TsoService::new(
+            with_worker(
+                TsoConfig {
+                    shared_generators: 1,
+                    warm_generators: 0,
+                    max_batch_per_request: 8,
+                    ..TsoConfig::default()
+                },
+                "worker-a",
+            ),
+            Arc::new(ManualClock::new(57_000)),
+            Arc::new(MemoryMetadataStore::new()),
+        )
+        .unwrap();
+
+        let route_a = service.ensure_timeline("shared.queue.a").await.unwrap();
+        let route_b =
+            ensure_shared_timeline_on_generator(&service, route_a.generator_id, "shared.queue.b")
+                .await;
+        let route_c =
+            ensure_shared_timeline_on_generator(&service, route_a.generator_id, "shared.queue.c")
+                .await;
+
+        service
+            .allocate_timestamps(AllocateTimestampsRequest {
+                timeline_key: route_a.timeline_key.clone(),
+                count: 1,
+                expected_epoch: route_a.epoch,
+                expected_route_version: route_a.route_version,
+                client_request_id: "shared-queue-seed".into(),
+            })
+            .await
+            .unwrap();
+
+        let permit = service.generator_admission_gates[route_a.generator_id as usize]
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        for (route, request_id) in [
+            (route_b.clone(), "shared-queue-b"),
+            (route_c.clone(), "shared-queue-c"),
+        ] {
+            let service_clone = service.clone();
+            let tx_clone = tx.clone();
+            tokio::spawn(async move {
+                let response = service_clone
+                    .allocate_timestamps(AllocateTimestampsRequest {
+                        timeline_key: route.timeline_key.clone(),
+                        count: 1,
+                        expected_epoch: route.epoch,
+                        expected_route_version: route.route_version,
+                        client_request_id: request_id.into(),
+                    })
+                    .await
+                    .unwrap();
+                let _ = tx_clone.send(response.timeline_key);
+            });
+        }
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        drop(permit);
+
+        assert_eq!(rx.recv().await.unwrap(), route_b.timeline_key);
+        assert_eq!(rx.recv().await.unwrap(), route_c.timeline_key);
+    }
+
+    #[tokio::test]
+    async fn shared_timeline_hits_per_timeline_quota_before_repeated_large_allocation() {
+        let service = TsoService::new(
+            with_worker(
+                TsoConfig {
+                    shared_generators: 1,
+                    warm_generators: 0,
+                    max_batch_per_request: 8,
+                    max_future_borrow_ms: 2_000,
+                    ..TsoConfig::default()
+                },
+                "worker-a",
+            ),
+            Arc::new(ManualClock::new(58_000)),
+            Arc::new(MemoryMetadataStore::new()),
+        )
+        .unwrap();
+
+        let route = service.ensure_timeline("shared.quota.a").await.unwrap();
+
+        service
+            .allocate_timestamps(AllocateTimestampsRequest {
+                timeline_key: route.timeline_key.clone(),
+                count: 8,
+                expected_epoch: route.epoch,
+                expected_route_version: route.route_version,
+                client_request_id: "shared-quota-first".into(),
+            })
+            .await
+            .unwrap();
+
+        let error = service
+            .allocate_timestamps(AllocateTimestampsRequest {
+                timeline_key: route.timeline_key.clone(),
+                count: 8,
+                expected_epoch: route.epoch,
+                expected_route_version: route.route_version,
+                client_request_id: "shared-quota-repeat".into(),
+            })
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            TsoError::FutureBorrowExceeded {
+                requested_physical_ms,
+                allowed_physical_ms,
+            } if requested_physical_ms > allowed_physical_ms
+        ));
+    }
+
+    #[tokio::test]
+    async fn shared_timeline_quota_does_not_block_peer_timeline() {
+        let service = TsoService::new(
+            with_worker(
+                TsoConfig {
+                    shared_generators: 1,
+                    warm_generators: 0,
+                    max_batch_per_request: 8,
+                    max_future_borrow_ms: 2_000,
+                    ..TsoConfig::default()
+                },
+                "worker-a",
+            ),
+            Arc::new(ManualClock::new(59_000)),
+            Arc::new(MemoryMetadataStore::new()),
+        )
+        .unwrap();
+
+        let route_a = service
+            .ensure_timeline("shared.quota.peer.a")
+            .await
+            .unwrap();
+        let route_b = ensure_shared_timeline_on_generator(
+            &service,
+            route_a.generator_id,
+            "shared.quota.peer.b",
+        )
+        .await;
+
+        service
+            .allocate_timestamps(AllocateTimestampsRequest {
+                timeline_key: route_a.timeline_key.clone(),
+                count: 8,
+                expected_epoch: route_a.epoch,
+                expected_route_version: route_a.route_version,
+                client_request_id: "shared-peer-seed".into(),
+            })
+            .await
+            .unwrap();
+
+        let peer_response = service
+            .allocate_timestamps(AllocateTimestampsRequest {
+                timeline_key: route_b.timeline_key.clone(),
+                count: 1,
+                expected_epoch: route_b.epoch,
+                expected_route_version: route_b.route_version,
+                client_request_id: "shared-peer-alloc".into(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(peer_response.timeline_key, route_b.timeline_key);
+    }
+
+    #[tokio::test]
+    async fn warm_timeline_hits_per_timeline_quota_before_repeated_allocation() {
+        let service = TsoService::new(
+            with_worker(
+                TsoConfig {
+                    default_resource_tier: ResourceTier::Warm,
+                    shared_generators: 0,
+                    warm_generators: 1,
+                    max_batch_per_request: 8,
+                    max_future_borrow_ms: 2_000,
+                    ..TsoConfig::default()
+                },
+                "worker-a",
+            ),
+            Arc::new(ManualClock::new(60_000)),
+            Arc::new(MemoryMetadataStore::new()),
+        )
+        .unwrap();
+
+        let route = service.ensure_timeline("warm.quota.a").await.unwrap();
+
+        service
+            .allocate_timestamps(AllocateTimestampsRequest {
+                timeline_key: route.timeline_key.clone(),
+                count: 8,
+                expected_epoch: route.epoch,
+                expected_route_version: route.route_version,
+                client_request_id: "warm-quota-first".into(),
+            })
+            .await
+            .unwrap();
+
+        let error = service
+            .allocate_timestamps(AllocateTimestampsRequest {
+                timeline_key: route.timeline_key.clone(),
+                count: 8,
+                expected_epoch: route.epoch,
+                expected_route_version: route.route_version,
+                client_request_id: "warm-quota-repeat".into(),
+            })
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            TsoError::FutureBorrowExceeded {
+                requested_physical_ms,
+                allowed_physical_ms,
+            } if requested_physical_ms > allowed_physical_ms
+        ));
     }
 
     #[tokio::test]

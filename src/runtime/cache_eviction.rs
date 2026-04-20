@@ -391,6 +391,8 @@ mod tests {
             last_issued_tso: None,
             recovery_floor_tso: None,
             last_graceful_issued: None,
+            timeline_quota_tokens: None,
+            timeline_quota_last_refill_ms: None,
             revision: 1,
         }))
     }

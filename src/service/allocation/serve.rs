@@ -48,6 +48,13 @@ pub(super) struct AllocationServeOptions {
 
 const MAX_ALLOCATION_CONTENTION_RETRIES: u32 = 8;
 
+enum ServeOutcome {
+    Served(AllocateTimestampsResponse),
+    Contended,
+    RetryAfterLeaseRefresh,
+    Error(TsoError),
+}
+
 impl CachedTimelineChecks {
     fn new(
         service: &TsoService,
@@ -258,6 +265,10 @@ impl TsoService {
         let generator = self.lookup_generator(generator_id)?;
         let mut contention_retries = 0u32;
         let serve_started = Instant::now();
+        let charged_quota = {
+            let mut timeline_state = timeline_state_handle.lock().await;
+            self.charge_timeline_quota(&mut timeline_state, request.count, now_ms)?
+        };
 
         loop {
             Self::check_request_cancellation(options.cancellation.as_ref())?;
@@ -268,13 +279,22 @@ impl TsoService {
             drop(timeline_state);
 
             let admission_wait_started = Instant::now();
-            let _admission_permit = self
+            let _admission_permit = match self
                 .acquire_generator_admission(
                     generator_id,
                     resource_tier,
+                    &request.timeline_key,
                     options.cancellation.clone(),
                 )
-                .await?;
+                .await
+            {
+                Ok(permit) => permit,
+                Err(error) => {
+                    let mut timeline_state = timeline_state_handle.lock().await;
+                    self.refund_timeline_quota(&mut timeline_state, charged_quota);
+                    return Err(error);
+                }
+            };
             Self::record_allocation_stage_latency(
                 options.path,
                 "admission_wait",
@@ -282,7 +302,7 @@ impl TsoService {
             );
 
             let mut timeline_state = timeline_state_handle.lock().await;
-            match generator.allocate_after(
+            let outcome = match generator.allocate_after(
                 request.count,
                 timeline_state.last_issued_tso,
                 now_ms,
@@ -292,31 +312,63 @@ impl TsoService {
             ) {
                 Ok(AllocateAfterResult::Allocated(ranges)) => {
                     timeline_state.last_issued_tso = ranges.last().map(|r| r.end_tso);
+                    let timeline_key = timeline_state.route.timeline_key.clone();
+                    let epoch = timeline_state.route.epoch;
+                    let route_version = timeline_state.route.route_version;
                     metrics::TSO_ALLOCATE_TOTAL.inc();
                     Self::record_allocation_outcome(options.path, "served");
                     Self::record_allocation_ranges(&ranges);
                     Self::record_allocation_stage_latency(options.path, "serve", serve_started);
-                    return Ok(Some(AllocateTimestampsResponse {
-                        timeline_key: timeline_state.route.timeline_key.clone(),
+                    drop(timeline_state);
+                    ServeOutcome::Served(AllocateTimestampsResponse {
+                        timeline_key,
                         generator_id,
-                        epoch: timeline_state.route.epoch,
-                        route_version: timeline_state.route.route_version,
+                        epoch,
+                        route_version,
                         ranges,
-                    }));
+                    })
                 }
                 Ok(AllocateAfterResult::Contended) => {
                     drop(timeline_state);
+                    ServeOutcome::Contended
+                }
+                Err(TsoError::IssuedUpperBoundExceeded { .. }) => {
+                    drop(timeline_state);
+                    ServeOutcome::RetryAfterLeaseRefresh
+                }
+                Err(error) => {
+                    drop(timeline_state);
+                    ServeOutcome::Error(error)
+                }
+            };
+
+            self.release_generator_admission_turn(
+                generator_id,
+                resource_tier,
+                &request.timeline_key,
+            )
+            .await;
+
+            match outcome {
+                ServeOutcome::Served(response) => {
+                    return Ok(Some(response));
+                }
+                ServeOutcome::Contended => {
                     contention_retries = contention_retries.saturating_add(1);
                     if contention_retries >= MAX_ALLOCATION_CONTENTION_RETRIES {
                         Self::record_allocation_outcome(options.path, "contention_exhausted");
                         Self::record_allocation_stage_latency(options.path, "serve", serve_started);
+                        let mut timeline_state = timeline_state_handle.lock().await;
+                        self.refund_timeline_quota(&mut timeline_state, charged_quota);
                         return Err(TsoError::AllocationContention { generator_id });
                     }
                     yield_now().await;
                 }
-                Err(TsoError::IssuedUpperBoundExceeded { .. }) => {
-                    drop(timeline_state);
+                ServeOutcome::RetryAfterLeaseRefresh => {
                     Self::record_allocation_outcome(options.path, "lease_refresh_retry");
+                    let mut timeline_state = timeline_state_handle.lock().await;
+                    self.refund_timeline_quota(&mut timeline_state, charged_quota);
+                    drop(timeline_state);
                     self.refresh_generator_lease_if_unchanged_with_cancellation(
                         generator_id,
                         issued_upper_bound,
@@ -326,8 +378,10 @@ impl TsoService {
                     Self::record_allocation_stage_latency(options.path, "serve", serve_started);
                     return Ok(None);
                 }
-                Err(error) => {
+                ServeOutcome::Error(error) => {
                     Self::record_allocation_stage_latency(options.path, "serve", serve_started);
+                    let mut timeline_state = timeline_state_handle.lock().await;
+                    self.refund_timeline_quota(&mut timeline_state, charged_quota);
                     return Err(error);
                 }
             }
