@@ -3,7 +3,12 @@ set -euo pipefail
 
 manifest="${1:-deploy/kubernetes/chronos.yaml}"
 
-ruby -ryaml -e '
+if ! command -v ruby >/dev/null 2>&1; then
+  echo "ruby is required for Kubernetes manifest validation" >&2
+  exit 1
+fi
+
+ruby --disable=gems -ryaml -e '
 path = ARGV.fetch(0)
 docs = YAML.load_stream(File.read(path)).compact
 

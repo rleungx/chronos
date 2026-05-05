@@ -260,16 +260,27 @@ container-vulnerability-scan:
 
 container-check:
 	@tmpdir=$$(mktemp -d); \
-	trap 'rm -rf "$$tmpdir"' EXIT; \
+	tls_volume=chronos-container-check-tls-$$$$; \
+	cleanup() { docker volume rm -f "$$tls_volume" >/dev/null 2>&1 || true; rm -rf "$$tmpdir"; }; \
+	trap cleanup EXIT; \
 	touch "$$tmpdir/server.crt" "$$tmpdir/server.key" "$$tmpdir/ca.pem"; \
+	chmod 755 "$$tmpdir"; \
 	chmod 600 "$$tmpdir/server.key"; \
 	$(MAKE) CONTAINER_CHECK_IMAGE=$(CONTAINER_CHECK_IMAGE) CONTAINER_CHECK_FORCE_BUILD=$(CONTAINER_CHECK_FORCE_BUILD) container-image-check && \
+	docker volume create "$$tls_volume" >/dev/null && \
 	docker run --rm \
-		-v "$$tmpdir:/tls:ro" \
+		--user 0 \
+		--entrypoint /bin/sh \
+		-v "$$tmpdir:/input:ro" \
+		-v "$$tls_volume:/tls" \
+		$(CONTAINER_CHECK_IMAGE) \
+		-ec 'cp -R /input/. /tls/ && chown -R 10001:10001 /tls && chmod 0644 /tls/server.crt /tls/ca.pem && chmod 0600 /tls/server.key' && \
+	docker run --rm \
+		-v "$$tls_volume:/tls:ro" \
 		$(call DOCKER_PRODUCTION_SHAPE_ENV,/chronos-container-check,container-check-worker,/tls/server.crt,/tls/server.key,/tls/ca.pem) \
 		$(CONTAINER_CHECK_IMAGE) --check-config && \
 	docker run --rm \
-		-v "$$tmpdir:/tls:ro" \
+		-v "$$tls_volume:/tls:ro" \
 		$(call DOCKER_PRODUCTION_SHAPE_ENV,/chronos-container-check,container-check-worker,/tls/server.crt,/tls/server.key,/tls/ca.pem) \
 		$(CONTAINER_CHECK_IMAGE) --print-effective-config && \
 		CHRONOS_CONTAINER_SMOKE_IMAGE=$(CONTAINER_CHECK_IMAGE) bash hack/container-startup-smoke.sh && \
@@ -296,7 +307,7 @@ release-package:
 	cp target/release/chronos-bench artifacts/release/
 	cp target/release/chronos-control-bench artifacts/release/
 	cp target/release/chronos-failover-bench artifacts/release/
-	(cd artifacts/release && shasum -a 256 chronos chronos-bench chronos-control-bench chronos-failover-bench > SHA256SUMS)
+	(cd artifacts/release && if command -v shasum >/dev/null 2>&1; then shasum -a 256 chronos chronos-bench chronos-control-bench chronos-failover-bench; else sha256sum chronos chronos-bench chronos-control-bench chronos-failover-bench; fi > SHA256SUMS)
 	docker run --rm -v "$(CURDIR)/artifacts/release:/artifacts" $(SYFT_IMAGE) dir:/artifacts -o spdx-json > artifacts/release/chronos-release.spdx.json
 
 release-check:

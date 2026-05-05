@@ -26,10 +26,10 @@ jobs:
         with:
           toolchain: 1.94.0
           components: rustfmt, clippy
-      - name: Install protoc
+      - name: Install CI prerequisites
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
+          sudo apt-get install -y protobuf-compiler ruby
       - name: Run Layer 0 static
         run: make test-layer-0
       - name: Run Layer 1 smoke

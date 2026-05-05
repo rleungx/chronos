@@ -69,11 +69,21 @@ required_layer4_tests=(
 assert_layer4_tests_present() {
   local test_name
   for test_name in "${required_layer4_tests[@]}"; do
-    if ! rg -q "(async[[:space:]]+)?fn[[:space:]]+${test_name}\\b" src tests; then
+    if ! source_has_test "${test_name}"; then
       echo "Layer 4 required ignored test '${test_name}' is missing from source tree" >&2
       exit 1
     fi
   done
+}
+
+source_has_test() {
+  local test_name="$1"
+  local pattern="(async[[:space:]]+)?fn[[:space:]]+${test_name}([^[:alnum:]_]|$)"
+  if command -v rg >/dev/null 2>&1; then
+    rg -q "${pattern}" src tests
+    return
+  fi
+  find src tests -type f -name '*.rs' -print0 | xargs -0 grep -E -q "${pattern}"
 }
 
 require_local_endpoints_or_override
