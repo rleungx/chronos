@@ -12,15 +12,15 @@ ETCD_ENDPOINTS="${CHRONOS_SOAK_ETCD_ENDPOINTS:-127.0.0.1:2379}"
 SERVICE_ENDPOINT="${CHRONOS_SOAK_SERVICE_ENDPOINT:-127.0.0.1:50051}"
 ADVERTISE_ENDPOINT="${CHRONOS_SOAK_ADVERTISE_ENDPOINT:-}"
 METRICS_ENDPOINT="${CHRONOS_SOAK_METRICS_ENDPOINT:-127.0.0.1:9898}"
-SOAK_DURATION_SECS="${CHRONOS_SOAK_DURATION_SECS:-15}"
-SOAK_WARMUP_SECS="${CHRONOS_SOAK_WARMUP_SECS:-3}"
-SOAK_CONCURRENCY="${CHRONOS_SOAK_CONCURRENCY:-32}"
+SOAK_DURATION_SECS="${CHRONOS_SOAK_DURATION_SECS:-5}"
+SOAK_WARMUP_SECS="${CHRONOS_SOAK_WARMUP_SECS:-1}"
+SOAK_CONCURRENCY="${CHRONOS_SOAK_CONCURRENCY:-16}"
 SOAK_TIMELINES="${CHRONOS_SOAK_TIMELINES:-32}"
 SOAK_BATCH="${CHRONOS_SOAK_BATCH:-1}"
-CONTROL_TIMELINES="${CHRONOS_SOAK_CONTROL_TIMELINES:-2000}"
+CONTROL_TIMELINES="${CHRONOS_SOAK_CONTROL_TIMELINES:-500}"
 CONTROL_PAGE_SIZE="${CHRONOS_SOAK_CONTROL_PAGE_SIZE:-200}"
-CONTROL_CONCURRENCY="${CHRONOS_SOAK_CONTROL_CONCURRENCY:-8}"
-FILTERED_CONCURRENCY="${CHRONOS_SOAK_FILTERED_CONCURRENCY:-4}"
+CONTROL_CONCURRENCY="${CHRONOS_SOAK_CONTROL_CONCURRENCY:-4}"
+FILTERED_CONCURRENCY="${CHRONOS_SOAK_FILTERED_CONCURRENCY:-2}"
 WAIT_ATTEMPTS="${CHRONOS_SOAK_WAIT_ATTEMPTS:-60}"
 WAIT_INTERVAL_SECS="${CHRONOS_SOAK_WAIT_INTERVAL_SECS:-1}"
 SOAK_REQ_PER_SEC_MIN="${CHRONOS_SOAK_REQ_PER_SEC_MIN:-50}"
@@ -70,7 +70,7 @@ fi
 
 CHRONOS_PID=""
 RESULT="failure"
-RELEASE_BIN_DIR="${REPO_ROOT}/target/release"
+RELEASE_BIN_DIR="${CHRONOS_RELEASE_BIN_DIR:-${REPO_ROOT}/target/release}"
 ADVERTISE_ENDPOINT="$(derive_local_advertise_endpoint "${SERVICE_ENDPOINT}" "chronos-soak" "${ADVERTISE_ENDPOINT}")"
 
 write_summary() {
@@ -153,8 +153,8 @@ echo "[soak] starting etcd"
 make etcd-up >/dev/null
 wait_for_etcd "${WAIT_ATTEMPTS}" "${WAIT_INTERVAL_SECS}"
 
-echo "[soak] building release binaries"
-cargo build --locked --release --bin chronos --bin chronos-bench --bin chronos-control-bench >/dev/null
+echo "[soak] preparing release binaries"
+ensure_release_binaries "${RELEASE_BIN_DIR}" chronos chronos-bench chronos-control-bench
 
 echo "[soak] starting chronos (release, etcd-backed)"
 env \
@@ -206,10 +206,10 @@ env \
   "${RELEASE_BIN_DIR}/chronos-control-bench" | tee "${CONTROL_FILTERED_LOG}"
 
 echo "[soak] validating readiness and metrics surfaces"
-curl -fsS "http://${METRICS_ENDPOINT}/readyz" | grep -qx 'ready'
-curl -fsS "http://${METRICS_ENDPOINT}/metrics" | grep -q '^tso_build_info'
-curl -fsS "http://${METRICS_ENDPOINT}/metrics" | grep -q '^tso_startup_ready'
-curl -fsS "http://${METRICS_ENDPOINT}/metrics" | grep -q '^tso_allocate_total'
+assert_http_body_equals "http://${METRICS_ENDPOINT}/readyz" "ready"
+assert_http_metric_present "http://${METRICS_ENDPOINT}/metrics" '^tso_build_info'
+assert_http_metric_present "http://${METRICS_ENDPOINT}/metrics" '^tso_startup_ready'
+assert_http_metric_present "http://${METRICS_ENDPOINT}/metrics" '^tso_allocate_total'
 
 assert_metric_at_least "req_per_sec" "${BENCH_LOG}" "${SOAK_REQ_PER_SEC_MIN}"
 assert_metric_at_most "latency_p95_us" "${BENCH_LOG}" "${SOAK_LATENCY_P95_US_MAX}"

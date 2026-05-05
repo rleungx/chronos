@@ -3,8 +3,16 @@ name: Release Candidate
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+  attestations: write
+  id-token: write
+
+env:
+  CHRONOS_ARTIFACT_RETENTION_DAYS: 14
+
 jobs:
-  release-candidate:
+  release-check:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
@@ -22,14 +30,248 @@ jobs:
           sudo apt-get install -y protobuf-compiler
       - name: Run release checks
         run: make release-check
-      - name: Package release artifacts
+
+  layer-4-clustered-etcd:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CHRONOS_BUILD_COMMIT: ${{ github.sha }}
+      RUST_BACKTRACE: 1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.94.0
+      - name: Install protoc
         run: |
-          mkdir -p artifacts/release
-          cp target/release/chronos artifacts/release/
-          cp target/release/chronos-bench artifacts/release/
-          cp target/release/chronos-control-bench artifacts/release/
-          cp target/release/chronos-failover-bench artifacts/release/
-          (cd artifacts/release && shasum -a 256 chronos chronos-bench chronos-control-bench chronos-failover-bench > SHA256SUMS)
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+      - name: Start clustered etcd
+        run: make etcd-cluster-up
+      - name: Wait for clustered etcd health
+        run: |
+          for attempt in $(seq 1 60); do
+            if make etcd-cluster-health; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "clustered etcd did not become healthy within 60 attempts" >&2
+          exit 1
+      - name: Run clustered Layer 4 validation
+        run: make test-layer-4-clustered
+      - name: Stop clustered etcd
+        if: always()
+        run: make etcd-cluster-reset
+
+  soak-real-etcd:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CHRONOS_BUILD_COMMIT: ${{ github.sha }}
+      RUST_BACKTRACE: 1
+      CHRONOS_ARTIFACT_DIR: ${{ github.workspace }}/artifacts
+      CHRONOS_KEEP_ARTIFACTS_ON_SUCCESS: 1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.94.0
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+      - name: Run etcd-backed soak validation
+        run: make test-soak
+      - name: Upload soak artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chronos-rc-soak-artifacts
+          path: artifacts/soak/
+          if-no-files-found: error
+          retention-days: ${{ env.CHRONOS_ARTIFACT_RETENTION_DAYS }}
+      - name: Verify soak evidence
+        if: always()
+        run: bash hack/verify-evidence.sh artifacts soak
+      - name: Reset etcd after soak job
+        if: always()
+        run: make etcd-reset
+
+  chaos-lease-loss:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CHRONOS_BUILD_COMMIT: ${{ github.sha }}
+      RUST_BACKTRACE: 1
+      CHRONOS_ARTIFACT_DIR: ${{ github.workspace }}/artifacts
+      CHRONOS_KEEP_ARTIFACTS_ON_SUCCESS: 1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.94.0
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+      - name: Run etcd-backed chaos recovery validation
+        run: make test-chaos
+      - name: Upload chaos artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chronos-rc-chaos-artifacts
+          path: artifacts/chaos/
+          if-no-files-found: error
+          retention-days: ${{ env.CHRONOS_ARTIFACT_RETENTION_DAYS }}
+      - name: Verify chaos evidence
+        if: always()
+        run: bash hack/verify-evidence.sh artifacts chaos
+      - name: Reset etcd after chaos job
+        if: always()
+        run: make etcd-reset
+
+  failover-real-etcd:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CHRONOS_BUILD_COMMIT: ${{ github.sha }}
+      RUST_BACKTRACE: 1
+      CHRONOS_ARTIFACT_DIR: ${{ github.workspace }}/artifacts
+      CHRONOS_KEEP_ARTIFACTS_ON_SUCCESS: 1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.94.0
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+      - name: Run etcd-backed failover benchmark
+        run: make test-failover-bench
+      - name: Upload failover artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chronos-rc-failover-artifacts
+          path: artifacts/failover/
+          if-no-files-found: error
+          retention-days: ${{ env.CHRONOS_ARTIFACT_RETENTION_DAYS }}
+      - name: Verify failover evidence
+        if: always()
+        run: bash hack/verify-evidence.sh artifacts failover
+      - name: Reset etcd after failover job
+        if: always()
+        run: make etcd-reset
+
+  rebalance-real-etcd:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CHRONOS_BUILD_COMMIT: ${{ github.sha }}
+      RUST_BACKTRACE: 1
+      CHRONOS_ARTIFACT_DIR: ${{ github.workspace }}/artifacts
+      CHRONOS_KEEP_ARTIFACTS_ON_SUCCESS: 1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.94.0
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+      - name: Run etcd-backed rebalance benchmark
+        run: make test-rebalance-bench
+      - name: Upload rebalance artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chronos-rc-rebalance-artifacts
+          path: artifacts/rebalance/
+          if-no-files-found: error
+          retention-days: ${{ env.CHRONOS_ARTIFACT_RETENTION_DAYS }}
+      - name: Verify rebalance evidence
+        if: always()
+        run: bash hack/verify-evidence.sh artifacts rebalance
+      - name: Reset etcd after rebalance job
+        if: always()
+        run: make etcd-reset
+
+  restore-dr-etcd:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CHRONOS_BUILD_COMMIT: ${{ github.sha }}
+      RUST_BACKTRACE: 1
+      CHRONOS_ARTIFACT_DIR: ${{ github.workspace }}/artifacts
+      CHRONOS_KEEP_ARTIFACTS_ON_SUCCESS: 1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.94.0
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+      - name: Run restore DR validation
+        run: make test-restore-dr
+      - name: Upload restore artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chronos-rc-restore-artifacts
+          path: artifacts/restore/
+          if-no-files-found: error
+          retention-days: ${{ env.CHRONOS_ARTIFACT_RETENTION_DAYS }}
+      - name: Verify restore evidence
+        if: always()
+        run: bash hack/verify-evidence.sh artifacts restore
+
+  container-vulnerability-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CHRONOS_BUILD_COMMIT: ${{ github.sha }}
+      RUST_BACKTRACE: 1
+    steps:
+      - uses: actions/checkout@v4
+      - name: Scan container image vulnerabilities
+        run: make CONTAINER_CHECK_IMAGE=chronos:rc-vulnerability-scan container-vulnerability-scan
+
+  package-release-artifacts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs:
+      - release-check
+      - layer-4-clustered-etcd
+      - soak-real-etcd
+      - chaos-lease-loss
+      - failover-real-etcd
+      - rebalance-real-etcd
+      - restore-dr-etcd
+      - container-vulnerability-scan
+    env:
+      CHRONOS_BUILD_COMMIT: ${{ github.sha }}
+      RUST_BACKTRACE: 1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.94.0
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+      - name: Package release artifacts
+        run: make release-package
+      - name: Attest release artifacts
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: artifacts/release/*
       - name: Upload release candidate artifacts
         uses: actions/upload-artifact@v4
         with:

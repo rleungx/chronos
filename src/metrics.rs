@@ -113,6 +113,20 @@ pub static TSO_ALLOCATE_STAGE_LATENCY: LazyLock<HistogramVec> = LazyLock::new(||
         &["path", "stage"],
     )
 });
+pub static TSO_REQUEST_IDEMPOTENCY_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec_metric(
+        "tso_request_idempotency_total",
+        "TSO client request idempotency outcomes",
+        &["outcome"],
+    )
+});
+pub static TSO_REQUEST_RECORD_CLEANUP_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec_metric(
+        "tso_request_record_cleanup_total",
+        "Request record cleanup outcomes",
+        &["outcome"],
+    )
+});
 pub static TSO_ALLOCATE_LATENCY: LazyLock<Histogram> = LazyLock::new(|| {
     register_histogram_metric(
         "tso_allocate_latency_seconds",
@@ -129,6 +143,18 @@ pub static TSO_LEASE_EXPIRED_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
     register_int_counter_metric(
         "tso_lease_expired_total",
         "Total number of lease expiration events",
+    )
+});
+pub static TSO_GENERATOR_ACTIVE_LEASES: LazyLock<IntGauge> = LazyLock::new(|| {
+    register_int_gauge_metric(
+        "tso_generator_active_leases",
+        "Current number of locally owned active generator leases",
+    )
+});
+pub static TSO_GENERATOR_MIN_LEASE_HEADROOM_MS: LazyLock<IntGauge> = LazyLock::new(|| {
+    register_int_gauge_metric(
+        "tso_generator_min_lease_headroom_ms",
+        "Minimum remaining milliseconds across locally owned active generator leases",
     )
 });
 pub static TSO_CLOCK_BACKWARDS_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
@@ -187,22 +213,10 @@ pub static TSO_TIMELINE_PROXY_TIMEOUT_TOTAL: LazyLock<IntCounter> = LazyLock::ne
         "Total number of timeline proxy timeout events",
     )
 });
-pub static TSO_WATCH_KEEPALIVE_DROPPED_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
-    register_int_counter_metric(
-        "tso_watch_keepalive_dropped_total",
-        "Total number of watch keepalive events dropped due to backpressure",
-    )
-});
-pub static TSO_WATCH_ROUTE_SEND_TIMEOUT_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
-    register_int_counter_metric(
-        "tso_watch_route_send_timeout_total",
-        "Total number of watch route/event sends that timed out due to slow consumers",
-    )
-});
 pub static TSO_WATCH_RESYNC_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     register_int_counter_vec_metric(
         "tso_watch_resync_total",
-        "Route watch resync lifecycle events",
+        "Route watch resync and reset events by cause",
         &["event"],
     )
 });
@@ -265,6 +279,13 @@ pub static TSO_TRANSFER_OUTCOMES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(
         "tso_transfer_outcomes_total",
         "Transfer and failover action outcomes",
         &["action", "reason", "outcome"],
+    )
+});
+pub static TSO_AUTO_FAILOVER_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec_metric(
+        "tso_auto_failover_total",
+        "Automatic failover scan outcomes",
+        &["outcome"],
     )
 });
 pub static TSO_RECOVERY_EVENTS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {

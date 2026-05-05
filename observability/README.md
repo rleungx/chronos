@@ -49,7 +49,7 @@ validation, dashboard assets, and links to the runbooks that explain what to do 
 - `ChronosIdentityLeaseLost`
 - `ChronosClockBackwards`
 - `ChronosMetadataErrors`
-- `ChronosWatchSendTimeouts`
+- `ChronosWatchResyncs`
 - `ChronosProxySaturation`
 - `ChronosStartupPreflightFailures`
 - `ChronosStartupBootstrapFailures`
@@ -105,8 +105,9 @@ Useful overrides for local runs:
 
 ## CI artifact handoff
 
-The `soak-real-etcd` and `chaos-lease-loss` workflows upload `artifacts/soak/` and
-`artifacts/chaos/` respectively. Start with `summary.txt`, then inspect `chronos.log` and
+The `soak-real-etcd`, `chaos-lease-loss`, `failover-real-etcd`, and `rebalance-real-etcd`
+workflows upload `artifacts/soak/`, `artifacts/chaos/`, `artifacts/failover/`, and
+`artifacts/rebalance/` respectively. Start with `summary.txt`, then inspect `chronos.log` and
 `etcd.log` before diving into bench output. `artifact-index.txt` is the fastest way to confirm what
 the job actually captured.
 

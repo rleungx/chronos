@@ -14,13 +14,71 @@ import com.chronos.tso.v1.TimestampServiceGrpc;
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
 import io.grpc.Status;
+import io.grpc.netty.shaded.io.grpc.netty.GrpcSslContexts;
+import io.grpc.netty.shaded.io.grpc.netty.NettyChannelBuilder;
 import io.grpc.protobuf.StatusProto;
+import java.io.ByteArrayInputStream;
+import java.io.InputStream;
 import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import javax.net.ssl.SSLException;
 
 public class Client implements AutoCloseable {
+  public static final class TransportConfig {
+    private final boolean plaintext;
+    private final byte[] trustedCaPem;
+    private final byte[] clientCertPem;
+    private final byte[] clientKeyPem;
+    private final String authorityOverride;
+
+    private TransportConfig(
+        boolean plaintext,
+        byte[] trustedCaPem,
+        byte[] clientCertPem,
+        byte[] clientKeyPem,
+        String authorityOverride) {
+      this.plaintext = plaintext;
+      this.trustedCaPem = trustedCaPem;
+      this.clientCertPem = clientCertPem;
+      this.clientKeyPem = clientKeyPem;
+      this.authorityOverride = authorityOverride;
+    }
+
+    public static TransportConfig secure() {
+      return new TransportConfig(false, null, null, null, null);
+    }
+
+    public TransportConfig withPlaintext(boolean plaintext) {
+      return new TransportConfig(
+          plaintext, copy(trustedCaPem), copy(clientCertPem), copy(clientKeyPem), authorityOverride);
+    }
+
+    public TransportConfig withTrustedCaPem(byte[] trustedCaPem) {
+      return new TransportConfig(
+          plaintext, copy(trustedCaPem), copy(clientCertPem), copy(clientKeyPem), authorityOverride);
+    }
+
+    public TransportConfig withClientIdentityPem(byte[] clientCertPem, byte[] clientKeyPem) {
+      return new TransportConfig(
+          plaintext, copy(trustedCaPem), copy(clientCertPem), copy(clientKeyPem), authorityOverride);
+    }
+
+    public TransportConfig withAuthorityOverride(String authorityOverride) {
+      return new TransportConfig(
+          plaintext,
+          copy(trustedCaPem),
+          copy(clientCertPem),
+          copy(clientKeyPem),
+          authorityOverride);
+    }
+
+    private static byte[] copy(byte[] value) {
+      return value == null ? null : value.clone();
+    }
+  }
+
   @FunctionalInterface
   interface AllocationChannelFactory {
     ManagedChannel create(String ownerWorkerEndpoint);
@@ -37,10 +95,14 @@ public class Client implements AutoCloseable {
   private final AllocationChannelFactory allocationChannelFactory;
 
   public Client(String addr, String timelineKey) {
+    this(addr, timelineKey, TransportConfig.secure());
+  }
+
+  public Client(String addr, String timelineKey, TransportConfig transportConfig) {
     this(
-        ManagedChannelBuilder.forTarget(addr).usePlaintext().build(),
+        createManagedChannel(addr, transportConfig),
         timelineKey,
-        ownerWorkerEndpoint -> ManagedChannelBuilder.forTarget(ownerWorkerEndpoint).usePlaintext().build());
+        ownerWorkerEndpoint -> createManagedChannel(ownerWorkerEndpoint, transportConfig));
   }
 
   Client(ManagedChannel routeChannel, String timelineKey) {
@@ -63,14 +125,15 @@ public class Client implements AutoCloseable {
 
   public synchronized List<TimestampRange> allocateTimestamps(int count) {
     TimelineRoute route = ensureRoute();
+    String clientRequestId = nextClientRequestId(route.getTimelineKey());
     try {
-      return allocateOnce(route, count).getRangesList();
+      return allocateOnce(route, count, clientRequestId).getRangesList();
     } catch (RuntimeException err) {
       if (!isStaleRouteError(err)) {
         throw err;
       }
       route = refreshRoute();
-      return allocateOnce(route, count).getRangesList();
+      return allocateOnce(route, count, clientRequestId).getRangesList();
     }
   }
 
@@ -105,15 +168,20 @@ public class Client implements AutoCloseable {
     return route;
   }
 
-  private AllocateTimestampsResponse allocateOnce(TimelineRoute route, int count) {
+  private AllocateTimestampsResponse allocateOnce(
+      TimelineRoute route, int count, String clientRequestId) {
     return tsoStub.get().allocateTimestamps(
         AllocateTimestampsRequest.newBuilder()
             .setTimelineKey(route.getTimelineKey())
             .setCount(count)
             .setExpectedEpoch(route.getEpoch())
             .setExpectedRouteVersion(route.getRouteVersion())
-            .setClientRequestId(route.getTimelineKey() + "-" + requestId.getAndIncrement())
+            .setClientRequestId(clientRequestId)
             .build());
+  }
+
+  private String nextClientRequestId(String timelineKey) {
+    return timelineKey + "-" + requestId.getAndIncrement();
   }
 
   private static boolean isStaleRouteError(RuntimeException err) {
@@ -145,5 +213,42 @@ public class Client implements AutoCloseable {
       currentTsoChannel.shutdownNow();
     }
     routeChannel.shutdownNow();
+  }
+
+  private static ManagedChannel createManagedChannel(String target, TransportConfig transportConfig) {
+    validateTransportConfig(transportConfig);
+    if (transportConfig.plaintext) {
+      return ManagedChannelBuilder.forTarget(target).usePlaintext().build();
+    }
+
+    NettyChannelBuilder builder = NettyChannelBuilder.forTarget(target);
+    if (transportConfig.authorityOverride != null && !transportConfig.authorityOverride.isBlank()) {
+      builder = builder.overrideAuthority(transportConfig.authorityOverride);
+    }
+
+    try {
+      var sslContextBuilder = GrpcSslContexts.forClient();
+      if (transportConfig.trustedCaPem != null) {
+        sslContextBuilder =
+            sslContextBuilder.trustManager(new ByteArrayInputStream(transportConfig.trustedCaPem));
+      }
+      if (transportConfig.clientCertPem != null && transportConfig.clientKeyPem != null) {
+        InputStream certStream = new ByteArrayInputStream(transportConfig.clientCertPem);
+        InputStream keyStream = new ByteArrayInputStream(transportConfig.clientKeyPem);
+        sslContextBuilder = sslContextBuilder.keyManager(certStream, keyStream);
+      }
+      return builder.sslContext(sslContextBuilder.build()).build();
+    } catch (SSLException err) {
+      throw new IllegalArgumentException("invalid Chronos TLS transport configuration", err);
+    }
+  }
+
+  private static void validateTransportConfig(TransportConfig transportConfig) {
+    boolean hasClientCert = transportConfig.clientCertPem != null;
+    boolean hasClientKey = transportConfig.clientKeyPem != null;
+    if (hasClientCert != hasClientKey) {
+      throw new IllegalArgumentException(
+          "Chronos TLS client certificate and private key must be configured together");
+    }
   }
 }

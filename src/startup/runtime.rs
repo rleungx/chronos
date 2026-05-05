@@ -23,27 +23,38 @@ use chronos::{
 use crate::AppResult;
 
 use super::bootstrap::build_tso_service;
-use super::config::load_startup_config;
+use super::config::{load_startup_config, StartupLogFormat, StartupLoggingConfig};
 use super::preflight::{log_startup_preflight, startup_failure_stage, validate_startup_preflight};
 use super::readiness_reason::{
     startup_bootstrap_failure_reason, startup_preflight_failure_reason, ShutdownTrigger,
 };
 use super::serving_gate::{CriticalStartupListener, StartupServingGate};
 use super::transport::{
-    bind_grpc_listener, bind_metrics_listener, build_grpc_server, grpc_listener_stream,
-    serve_metrics_listener, wait_for_shutdown_signal,
+    bind_grpc_listener, bind_health_listener, bind_metrics_listener, build_grpc_server,
+    grpc_listener_stream, serve_health_listener, serve_metrics_listener, wait_for_shutdown_signal,
 };
 
-fn init_tracing() {
+fn init_tracing(logging: &StartupLoggingConfig) {
     static INIT: Once = Once::new();
 
     INIT.call_once(|| {
-        let _ = tracing_subscriber::fmt()
-            .with_ansi(false)
-            .with_target(false)
-            .json()
-            .flatten_event(true)
-            .try_init();
+        let filter = tracing_subscriber::EnvFilter::try_new(logging.filter.as_str())
+            .expect("startup logging filter should be validated during config load");
+        let _ = match logging.format {
+            StartupLogFormat::Json => tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_target(false)
+                .with_env_filter(filter)
+                .json()
+                .flatten_event(true)
+                .try_init(),
+            StartupLogFormat::Text => tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_target(false)
+                .with_env_filter(filter)
+                .compact()
+                .try_init(),
+        };
     });
 }
 
@@ -550,24 +561,30 @@ fn spawn_process_signal_monitor(shutdown: ShutdownContext) -> tokio::task::JoinH
 fn build_route_service(
     config: &TsoConfig,
     service: &Arc<TsoService>,
-) -> TimelineRouteServiceServer<TsoRouteService> {
-    let server = TimelineRouteServiceServer::new(TsoRouteService::new(service.control_plane()));
+) -> AppResult<TimelineRouteServiceServer<TsoRouteService>> {
+    let server = TimelineRouteServiceServer::new(TsoRouteService::with_allowlist(
+        service.control_plane(),
+        &config.grpc_route_cert_allowlist,
+    )?);
     if let Some(limit) = config.grpc_max_request_bytes {
-        server.max_decoding_message_size(limit)
+        Ok(server.max_decoding_message_size(limit))
     } else {
-        server
+        Ok(server)
     }
 }
 
 fn build_timestamp_service(
     config: &TsoConfig,
     service: &Arc<TsoService>,
-) -> TimestampServiceServer<TsoTimestampService> {
-    let server = TimestampServiceServer::new(TsoTimestampService::new(service.data_plane()));
+) -> AppResult<TimestampServiceServer<TsoTimestampService>> {
+    let server = TimestampServiceServer::new(TsoTimestampService::with_allowlist(
+        service.data_plane(),
+        &config.grpc_timestamp_cert_allowlist,
+    )?);
     if let Some(limit) = config.grpc_max_request_bytes {
-        server.max_decoding_message_size(limit)
+        Ok(server.max_decoding_message_size(limit))
     } else {
-        server
+        Ok(server)
     }
 }
 
@@ -575,33 +592,38 @@ fn build_control_service(
     config: &TsoConfig,
     service: &Arc<TsoService>,
     health_status: HealthStatusHandle,
-) -> TimelineControlServiceServer<TsoControlService> {
-    let server = TimelineControlServiceServer::new(TsoControlService::with_health_status(
-        service.control_plane(),
-        health_status,
-    ));
+) -> AppResult<TimelineControlServiceServer<TsoControlService>> {
+    let server =
+        TimelineControlServiceServer::new(TsoControlService::with_health_status_and_allowlist(
+            service.control_plane(),
+            health_status,
+            &config.grpc_control_cert_allowlist,
+        )?);
     if let Some(limit) = config.grpc_max_request_bytes {
-        server.max_decoding_message_size(limit)
+        Ok(server.max_decoding_message_size(limit))
     } else {
-        server
+        Ok(server)
     }
 }
 
 fn build_timeline_status_service(
     config: &TsoConfig,
     service: &Arc<TsoService>,
-) -> TimelineStatusServiceServer<TsoTimelineStatusService> {
-    let server =
-        TimelineStatusServiceServer::new(TsoTimelineStatusService::new(service.control_plane()));
+) -> AppResult<TimelineStatusServiceServer<TsoTimelineStatusService>> {
+    let server = TimelineStatusServiceServer::new(TsoTimelineStatusService::with_allowlist(
+        service.control_plane(),
+        &config.grpc_status_cert_allowlist,
+    )?);
     if let Some(limit) = config.grpc_max_request_bytes {
-        server.max_decoding_message_size(limit)
+        Ok(server.max_decoding_message_size(limit))
     } else {
-        server
+        Ok(server)
     }
 }
 
 pub(crate) async fn run() -> AppResult<()> {
-    init_tracing();
+    let startup = load_startup_config()?;
+    init_tracing(&startup.logging);
     info!(
         component = "startup",
         event = "startup_begin",
@@ -610,7 +632,6 @@ pub(crate) async fn run() -> AppResult<()> {
     );
 
     let clock = Arc::new(SystemClock);
-    let startup = load_startup_config()?;
     let config = &startup.config;
     let ready = Arc::new(AtomicBool::new(false));
     let startup_complete = Arc::new(AtomicBool::new(false));
@@ -705,6 +726,10 @@ pub(crate) async fn run() -> AppResult<()> {
     let mut serving_gate = StartupServingGate::default();
     let (metrics_listener, metrics_tls_acceptor) = bind_metrics_listener(config).await?;
     let metrics_addr = metrics_listener.local_addr()?;
+    let health_listener = bind_health_listener(config).await?;
+    let health_addr = health_listener
+        .as_ref()
+        .and_then(|listener| listener.local_addr().ok());
     info!(
         component = "startup",
         event = "listener_bound",
@@ -718,6 +743,21 @@ pub(crate) async fn run() -> AppResult<()> {
         instance_id = %config.effective_instance_id(),
         advertise_endpoint = %config.advertise_endpoint
     );
+    if let Some(health_addr) = health_addr {
+        info!(
+            component = "startup",
+            event = "listener_bound",
+            result = "success",
+            reason = "bind_complete",
+            transport = "health",
+            listen_addr = %health_addr,
+            bind_addr = %health_addr,
+            metadata_kind = %startup.metadata_kind(),
+            worker_id = %config.worker_id,
+            instance_id = %config.effective_instance_id(),
+            advertise_endpoint = %config.advertise_endpoint
+        );
+    }
     serving_gate.mark_listener_bound(CriticalStartupListener::Admin);
 
     let grpc_listener = bind_grpc_listener(config).await?;
@@ -737,16 +777,30 @@ pub(crate) async fn run() -> AppResult<()> {
     );
     serving_gate.mark_listener_bound(CriticalStartupListener::Grpc);
 
-    let route_service = build_route_service(config, &service);
-    let timestamp_service = build_timestamp_service(config, &service);
-    let control_service = build_control_service(config, &service, health_status.clone());
-    let timeline_status_service = build_timeline_status_service(config, &service);
+    let route_service = build_route_service(config, &service)?;
+    let timestamp_service = build_timestamp_service(config, &service)?;
+    let control_service = build_control_service(config, &service, health_status.clone())?;
+    let timeline_status_service = build_timeline_status_service(config, &service)?;
 
-    let metrics_server = {
-        let ready = ready.clone();
-        let shutdown_rx = shutdown_rx.clone();
+    let admin_server = {
+        let metrics_ready = ready.clone();
+        let health_ready = ready.clone();
+        let metrics_shutdown_rx = shutdown_rx.clone();
+        let health_shutdown_rx = shutdown_rx.clone();
         async move {
-            serve_metrics_listener(metrics_listener, metrics_tls_acceptor, ready, shutdown_rx).await
+            let metrics_server = serve_metrics_listener(
+                metrics_listener,
+                metrics_tls_acceptor,
+                metrics_ready,
+                metrics_shutdown_rx,
+            );
+            if let Some(health_listener) = health_listener {
+                let health_server =
+                    serve_health_listener(health_listener, health_ready, health_shutdown_rx);
+                tokio::try_join!(metrics_server, health_server).map(|_| ())
+            } else {
+                metrics_server.await
+            }
         }
     };
 
@@ -809,7 +863,7 @@ pub(crate) async fn run() -> AppResult<()> {
             advertise_endpoint: &config.advertise_endpoint,
         },
         grpc_server,
-        metrics_server,
+        admin_server,
     )
     .await;
     signal_monitor.abort();

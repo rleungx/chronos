@@ -11,9 +11,11 @@ pub use etcd::EtcdMetadataStore;
 pub use identity::InstanceIdentityLease;
 pub use memory::MemoryMetadataStore;
 pub use types::{
-    ControlPlaneStore, GeneratorBatchOp, GeneratorLeaseAuthority, GeneratorRecord,
-    RouteUpdateSignal, RouteUpdateSource, TimelineAuthority, TimelineBatchOp, TimelineFilterRecord,
-    TimelineFilterRecordListPage, TimelineRecord, TimelineRecordListPage, TimelineRouteRecord,
+    AllocationRequestFingerprint, AllocationResponseRecord, ControlPlaneStore, GeneratorBatchOp,
+    GeneratorLeaseAuthority, GeneratorRecord, RequestRecord, RequestRecordAuthority,
+    RequestRecordState, RouteUpdateSignal, RouteUpdateSource, TimelineAuthority, TimelineBatchOp,
+    TimelineFilterRecord, TimelineFilterRecordListPage, TimelineRecord, TimelineRecordListPage,
+    TimelineRouteRecord, CURRENT_METADATA_SCHEMA_VERSION,
 };
 
 #[async_trait]

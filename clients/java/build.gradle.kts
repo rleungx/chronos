@@ -1,19 +1,23 @@
 plugins {
     id("java")
-    id("com.google.protobuf") version "0.9.4"
+    id("com.google.protobuf") version "0.10.0"
 }
 
 repositories {
     mavenCentral()
 }
 
+val grpcVersion = "1.76.0"
+val protobufVersion = "4.34.1"
+
 dependencies {
-    implementation("com.google.protobuf:protobuf-java:4.28.3")
-    implementation("io.grpc:grpc-okhttp:1.68.1")
-    implementation("io.grpc:grpc-protobuf:1.68.1")
-    implementation("io.grpc:grpc-stub:1.68.1")
+    implementation("io.grpc:grpc-netty-shaded:$grpcVersion")
+    implementation("com.google.protobuf:protobuf-java:$protobufVersion")
+    implementation("io.grpc:grpc-okhttp:$grpcVersion")
+    implementation("io.grpc:grpc-protobuf:$grpcVersion")
+    implementation("io.grpc:grpc-stub:$grpcVersion")
     compileOnly("org.apache.tomcat:annotations-api:6.0.53")
-    testImplementation("io.grpc:grpc-inprocess:1.68.1")
+    testImplementation("io.grpc:grpc-inprocess:$grpcVersion")
     testImplementation("org.junit.jupiter:junit-jupiter:5.11.3")
     testRuntimeOnly("org.junit.platform:junit-platform-launcher:1.11.3")
 }
@@ -52,11 +56,11 @@ val syncRootProto by tasks.registering(Copy::class) {
 
 protobuf {
     protoc {
-        artifact = "com.google.protobuf:protoc:4.28.3:osx-aarch_64@exe"
+        artifact = "com.google.protobuf:protoc:$protobufVersion"
     }
     plugins {
         create("grpc") {
-            artifact = "io.grpc:protoc-gen-grpc-java:1.68.1:osx-aarch_64@exe"
+            artifact = "io.grpc:protoc-gen-grpc-java:$grpcVersion"
         }
     }
     generateProtoTasks {
@@ -76,6 +80,7 @@ tasks.register<JavaExec>("runExample") {
 
 tasks.test {
     useJUnitPlatform()
+    jvmArgs("--sun-misc-unsafe-memory-access=allow")
 }
 
 tasks.named("generateProto") {

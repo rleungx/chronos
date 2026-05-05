@@ -107,6 +107,23 @@ impl TsoService {
             });
         }
 
+        {
+            let weak_service = Arc::downgrade(&service);
+            let cleanup_shutdown_rx = service.background.shutdown_listener();
+            service.background.spawn_tracked(async move {
+                Self::background_request_record_cleanup_loop(weak_service, cleanup_shutdown_rx)
+                    .await;
+            });
+        }
+
+        if service.config.auto_failover_enabled {
+            let weak_service = Arc::downgrade(&service);
+            let auto_failover_shutdown_rx = service.background.shutdown_listener();
+            service.background.spawn_tracked(async move {
+                Self::background_auto_failover_loop(weak_service, auto_failover_shutdown_rx).await;
+            });
+        }
+
         let mut metadata_route_updates = service.metadata.subscribe_route_updates();
         let route_notifier = service.timeline_runtime.notifier();
         let route_reset_notifier = service.timeline_runtime.reset_notifier();

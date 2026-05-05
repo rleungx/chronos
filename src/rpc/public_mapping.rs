@@ -108,6 +108,12 @@ pub(super) fn map_tso_error(err: TsoError) -> Status {
         TsoError::TsoOverflow => status_with_error_detail(Code::OutOfRange, err),
         TsoError::MetadataAlreadyExists => status_with_error_detail(Code::AlreadyExists, err),
         TsoError::CasFailed => status_with_error_detail(Code::Aborted, err),
+        TsoError::ClientRequestConflict { .. } => {
+            status_with_error_detail(Code::InvalidArgument, err)
+        }
+        TsoError::ClientRequestInProgress { .. } => {
+            status_with_error_detail(Code::Unavailable, err)
+        }
         TsoError::ServiceShuttingDown => status_with_error_detail(Code::Unavailable, err),
         TsoError::RequestCancelled => status_with_error_detail(Code::DeadlineExceeded, err),
         TsoError::InstanceIdentityInUse { .. } => {
@@ -138,7 +144,8 @@ fn error_detail_code(err: &TsoError) -> ErrorCode {
         | TsoError::RecoveryCatchupBudgetExceeded { .. }
         | TsoError::GeneratorOwnershipMisconfigured { .. }
         | TsoError::GeneratorIdOutOfRange { .. }
-        | TsoError::TsoOverflow => ErrorCode::InvalidArgument,
+        | TsoError::TsoOverflow
+        | TsoError::ClientRequestConflict { .. } => ErrorCode::InvalidArgument,
         TsoError::FutureBorrowExceeded { .. }
         | TsoError::IssuedUpperBoundExceeded { .. }
         | TsoError::GeneratorPoolExhausted => ErrorCode::RateLimited,
@@ -150,6 +157,7 @@ fn error_detail_code(err: &TsoError) -> ErrorCode {
         | TsoError::FailoverMissingRecoveryFloor { .. }
         | TsoError::TimelineIngressSaturated { .. }
         | TsoError::TimelineRuntimeCacheSaturated { .. }
+        | TsoError::ClientRequestInProgress { .. }
         | TsoError::ServiceShuttingDown
         | TsoError::RequestCancelled => ErrorCode::TemporarilyUnavailable,
         TsoError::AllocationContention { .. } => ErrorCode::RateLimited,

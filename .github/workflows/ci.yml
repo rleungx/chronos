@@ -7,6 +7,12 @@ on:
   schedule:
     - cron: '0 5 * * *'
 
+permissions:
+  contents: read
+
+env:
+  CHRONOS_ARTIFACT_RETENTION_DAYS: 14
+
 jobs:
   layer-0-3-verify:
     runs-on: ubuntu-latest
@@ -26,7 +32,7 @@ jobs:
           sudo apt-get install -y protobuf-compiler
       - name: Run Layer 0 static
         run: make test-layer-0
-      - name: Run Layer 1 fast smoke
+      - name: Run Layer 1 smoke
         run: make test-layer-1
       - name: Run Layer 2 binary startup and transport seam
         run: make test-layer-2
@@ -38,14 +44,62 @@ jobs:
         run: make container-check
       - name: Validate observability rules
         run: make observability-check
+      - name: Validate Kubernetes manifests
+        run: make kubernetes-manifest-check
       - name: Validate dependency policy
         run: make dependency-check
 
-  layer-4-real-etcd:
+  client-go:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    if: github.event_name != 'schedule'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: clients/go/go.mod
+      - name: Verify Go client
+        run: make client-check-go
+
+  client-java:
+    runs-on: ubuntu-latest
+    if: github.event_name != 'schedule'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '9.4.0'
+      - name: Verify Java client
+        run: make client-check-java
+
+  client-cpp:
+    runs-on: ubuntu-latest
+    if: github.event_name != 'schedule'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install C++ client dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake libgrpc++-dev libprotobuf-dev protobuf-compiler protobuf-compiler-grpc
+      - name: Verify C++ client
+        run: make client-check-cpp
+
+  container-vulnerability-scan:
+    runs-on: ubuntu-latest
+    if: github.event_name != 'schedule'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Scan container image vulnerabilities
+        run: make CONTAINER_CHECK_IMAGE=chronos:vulnerability-scan container-vulnerability-scan
+
+  layer-4-clustered-etcd:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     env:
-      ETCD_ENDPOINTS: 127.0.0.1:2379
       CHRONOS_BUILD_COMMIT: ${{ github.sha }}
       RUST_BACKTRACE: 1
     steps:
@@ -57,28 +111,23 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler
-      - name: Start etcd
-        run: make etcd-up
-      - name: Wait for etcd health
+      - name: Start clustered etcd
+        run: make etcd-cluster-up
+      - name: Wait for clustered etcd health
         run: |
           for attempt in $(seq 1 60); do
-            if make etcd-health; then
+            if make etcd-cluster-health; then
               exit 0
             fi
             sleep 1
           done
-          echo "etcd did not become healthy within 60 attempts" >&2
+          echo "clustered etcd did not become healthy within 60 attempts" >&2
           exit 1
-      - name: Run Layer 4 real-etcd validation
-        run: make test-layer-4
-      - name: Dump etcd diagnostics
-        if: failure()
-        run: |
-          docker compose -f hack/etcd/docker-compose.yml ps
-          docker compose -f hack/etcd/docker-compose.yml logs --no-color etcd
-      - name: Stop etcd
+      - name: Run clustered Layer 4 validation
+        run: make test-layer-4-clustered
+      - name: Stop clustered etcd
         if: always()
-        run: make etcd-reset
+        run: make etcd-cluster-reset
 
   soak-real-etcd:
     runs-on: ubuntu-latest
@@ -120,7 +169,10 @@ jobs:
           name: chronos-soak-artifacts
           path: artifacts/soak/
           if-no-files-found: error
-          retention-days: 14
+          retention-days: ${{ env.CHRONOS_ARTIFACT_RETENTION_DAYS }}
+      - name: Verify soak evidence
+        if: always()
+        run: bash hack/verify-evidence.sh artifacts soak
       - name: Reset etcd after soak job
         if: always()
         run: make etcd-reset
@@ -165,7 +217,10 @@ jobs:
           name: chronos-chaos-artifacts
           path: artifacts/chaos/
           if-no-files-found: error
-          retention-days: 14
+          retention-days: ${{ env.CHRONOS_ARTIFACT_RETENTION_DAYS }}
+      - name: Verify chaos evidence
+        if: always()
+        run: bash hack/verify-evidence.sh artifacts chaos
       - name: Reset etcd after chaos job
         if: always()
         run: make etcd-reset
@@ -210,7 +265,10 @@ jobs:
           name: chronos-failover-artifacts
           path: artifacts/failover/
           if-no-files-found: error
-          retention-days: 14
+          retention-days: ${{ env.CHRONOS_ARTIFACT_RETENTION_DAYS }}
+      - name: Verify failover evidence
+        if: always()
+        run: bash hack/verify-evidence.sh artifacts failover
       - name: Reset etcd after failover job
         if: always()
         run: make etcd-reset
@@ -255,7 +313,42 @@ jobs:
           name: chronos-rebalance-artifacts
           path: artifacts/rebalance/
           if-no-files-found: error
-          retention-days: 14
+          retention-days: ${{ env.CHRONOS_ARTIFACT_RETENTION_DAYS }}
+      - name: Verify rebalance evidence
+        if: always()
+        run: bash hack/verify-evidence.sh artifacts rebalance
       - name: Reset etcd after rebalance job
         if: always()
         run: make etcd-reset
+
+  restore-dr-etcd:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    env:
+      CHRONOS_BUILD_COMMIT: ${{ github.sha }}
+      RUST_BACKTRACE: 1
+      CHRONOS_ARTIFACT_DIR: ${{ github.workspace }}/artifacts
+      CHRONOS_KEEP_ARTIFACTS_ON_SUCCESS: 1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.94.0
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+      - name: Run restore DR validation
+        run: make test-restore-dr
+      - name: Upload restore artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chronos-restore-artifacts
+          path: artifacts/restore/
+          if-no-files-found: error
+          retention-days: ${{ env.CHRONOS_ARTIFACT_RETENTION_DAYS }}
+      - name: Verify restore evidence
+        if: always()
+        run: bash hack/verify-evidence.sh artifacts restore

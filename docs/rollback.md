@@ -7,7 +7,7 @@ degraded. For normal release preparation, start with `docs/release.md`.
 
 Rollback immediately when any of the following occurs:
 
-1. `make release-check` fails for the build under consideration.
+1. `make release-gate` fails for the build under consideration.
 2. Any benchmark gate fails:
    - `make test-soak`
    - `make test-chaos`
@@ -19,7 +19,7 @@ Rollback immediately when any of the following occurs:
    make observability-check
    ```
 
-4. Production readiness or identity-lease alerts start firing unexpectedly after rollout.
+4. Production readiness, identity-lease, or route-watch resync alerts start firing unexpectedly after rollout.
 
 ## Rollback steps
 

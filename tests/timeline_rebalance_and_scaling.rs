@@ -1656,8 +1656,8 @@ async fn failover_recovery_floor_uses_recovery_catchup_budget_when_future_borrow
     config_b.max_future_borrow_ms = base.max_future_borrow_ms;
     config_b.recovery_catchup_budget_ms = base.recovery_catchup_budget_ms;
 
-    let fast_clock = Arc::new(ManualClock::new(30_000));
-    let service_a = TsoService::new(config_a, fast_clock.clone(), metadata.clone()).unwrap();
+    let source_clock = Arc::new(ManualClock::new(30_000));
+    let service_a = TsoService::new(config_a, source_clock.clone(), metadata.clone()).unwrap();
 
     let route_a = service_a
         .ensure_timeline("failover.recovery.catchup.timeline")
@@ -1669,7 +1669,7 @@ async fn failover_recovery_floor_uses_recovery_catchup_budget_when_future_borrow
         .unwrap();
     let before_last = before.ranges.last().unwrap().end_tso;
 
-    fast_clock.advance(1_000);
+    source_clock.advance(1_000);
     let target_generator_id = (route_a.generator_id + 1) % shared_generators;
     let transferred = service_a
         .control_plane()
@@ -1716,8 +1716,8 @@ async fn failover_rejects_transfer_beyond_recovery_catchup_budget() {
     let mut config_b = with_worker(base.clone(), "worker-b");
     config_b.max_future_borrow_ms = base.max_future_borrow_ms;
     config_b.recovery_catchup_budget_ms = base.recovery_catchup_budget_ms;
-    let fast_clock = Arc::new(ManualClock::new(31_000));
-    let service_a = TsoService::new(config_a, fast_clock.clone(), metadata.clone()).unwrap();
+    let source_clock = Arc::new(ManualClock::new(31_000));
+    let service_a = TsoService::new(config_a, source_clock.clone(), metadata.clone()).unwrap();
 
     let route_a = service_a
         .ensure_timeline("failover.recovery.catchup.limit")
@@ -1728,7 +1728,7 @@ async fn failover_rejects_transfer_beyond_recovery_catchup_budget() {
         .await
         .unwrap();
 
-    fast_clock.advance(1_000);
+    source_clock.advance(1_000);
     let forced_upper_bound = encode_tso(32_000, route_a.generator_id, SEQUENCE_CAPACITY - 1)
         .expect("forced recovery floor should encode");
     overwrite_generator_record(&metadata, route_a.generator_id, |record| {

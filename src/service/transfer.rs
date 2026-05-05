@@ -352,10 +352,14 @@ impl TsoService {
 
         let (record, final_revision) =
             if self.is_local_endpoint(&completion.transfer.owner_endpoint) {
-                self.ensure_generator_lease(completion.new_generator_id)
-                    .await?;
-                self.activate_local_timeline_record(timeline_key, record, new_revision)
-                    .await?
+                if record.state == TimelineLifecycleState::Active {
+                    (record, new_revision)
+                } else {
+                    self.ensure_generator_lease(completion.new_generator_id)
+                        .await?;
+                    self.activate_local_timeline_record(timeline_key, record, new_revision)
+                        .await?
+                }
             } else {
                 (record, new_revision)
             };
@@ -384,6 +388,110 @@ impl TsoService {
         );
 
         Ok((route, record.state))
+    }
+
+    async fn apply_fenced_local_transfer_plan(
+        &self,
+        timeline_key: &str,
+        mut record: TimelineRecord,
+        transfer: TransferPlan,
+        prepared: TransferPreparation,
+        mut timeline_state: tokio::sync::MutexGuard<'_, crate::runtime::TimelineState>,
+    ) -> Result<(TimelineRoute, u32, TimelineLifecycleState), TsoError> {
+        let safe_floor = timeline_state
+            .last_issued_tso
+            .max(timeline_state.recovery_floor_tso)
+            .max(record.last_graceful_issued);
+        if let Some(safe_floor) = safe_floor {
+            record.last_graceful_issued = Some(
+                record
+                    .last_graceful_issued
+                    .map(|current| current.max(safe_floor))
+                    .unwrap_or(safe_floor),
+            );
+        }
+        let safe_floor = record.last_graceful_issued;
+        let target = self
+            .select_transfer_target(
+                timeline_key,
+                &prepared.previous_route,
+                &transfer,
+                safe_floor,
+            )
+            .await?;
+        if let Err(error) = self.ensure_generator_lease(target.new_generator_id).await {
+            self.release_claimed_dedicated_if_needed(
+                timeline_key,
+                &prepared.previous_route,
+                target.claimed_dedicated,
+            );
+            return Err(error);
+        }
+
+        record.route.generator_id = target.new_generator_id;
+        record.route.resource_tier = target.target_resource_tier;
+        record.route.epoch += 1;
+        record.route.route_version += 1;
+        record.route.owner_worker_endpoint = transfer.owner_endpoint.clone();
+        record.state = TimelineLifecycleState::Active;
+        record.recovery_floor_tso = safe_floor;
+        record.issued_upper_bound = None;
+        record.lease_expire_at_ms = None;
+        record.updated_at_ms = prepared.now;
+
+        let new_rev = match self
+            .metadata
+            .compare_exchange_timeline(timeline_key, timeline_state.revision, &record)
+            .await
+        {
+            Ok(rev) => rev,
+            Err(error) => {
+                self.release_claimed_dedicated_if_needed(
+                    timeline_key,
+                    &prepared.previous_route,
+                    target.claimed_dedicated,
+                );
+                if matches!(error, TsoError::CasFailed) {
+                    log_transfer_failed(
+                        timeline_key,
+                        &transfer.owner_endpoint,
+                        Some(target.new_generator_id),
+                        transfer.reason,
+                        &error,
+                    );
+                }
+                return Err(error);
+            }
+        };
+
+        if should_release_previous_dedicated_generator_after_route_change(
+            prepared.previous_route.resource_tier,
+            prepared.previous_route.generator_id,
+            target.target_resource_tier,
+            target.new_generator_id,
+        ) {
+            self.release_dedicated(prepared.previous_route.generator_id, timeline_key);
+        }
+
+        timeline_state.route = record.route.clone();
+        timeline_state.state = record.state;
+        timeline_state.last_issued_tso = timeline_state.last_issued_tso.max(safe_floor);
+        timeline_state.recovery_floor_tso = timeline_state.recovery_floor_tso.max(safe_floor);
+        timeline_state.last_graceful_issued = record.last_graceful_issued;
+        timeline_state.timeline_quota_tokens = None;
+        timeline_state.timeline_quota_last_refill_ms = None;
+        timeline_state.revision = new_rev;
+
+        let route = record.route.clone();
+        log_transfer_completed(
+            timeline_key,
+            transfer.reason,
+            &prepared.previous_route,
+            &route,
+            record.state,
+        );
+
+        Ok((route, prepared.old_generator_id, record.state))
     }
 
     pub async fn transfer_timeline_for_rpc(
@@ -451,6 +559,27 @@ impl TsoService {
         let prepared = self
             .prepare_transfer_application(timeline_key, &mut record, &transfer)
             .await?;
+        if transfer.reason != TransferReason::Failover
+            && self.is_local_endpoint(&prepared.previous_route.owner_worker_endpoint)
+            && self.is_local_endpoint(&transfer.owner_endpoint)
+        {
+            if let Some(timeline_handle) = self.timeline_runtime.timeline_handle(timeline_key) {
+                let timeline_state = timeline_handle.lock().await;
+                if timeline_state.route == prepared.previous_route
+                    && timeline_state.revision == revision
+                {
+                    return self
+                        .apply_fenced_local_transfer_plan(
+                            timeline_key,
+                            record,
+                            transfer,
+                            prepared,
+                            timeline_state,
+                        )
+                        .await;
+                }
+            }
+        }
         let target = self
             .select_transfer_target(
                 timeline_key,
@@ -459,13 +588,29 @@ impl TsoService {
                 prepared.safe_floor,
             )
             .await?;
+        let can_activate_in_initial_cas = self.is_local_endpoint(&transfer.owner_endpoint)
+            && transfer.reason != TransferReason::Failover;
+        if can_activate_in_initial_cas {
+            if let Err(error) = self.ensure_generator_lease(target.new_generator_id).await {
+                self.release_claimed_dedicated_if_needed(
+                    timeline_key,
+                    &prepared.previous_route,
+                    target.claimed_dedicated,
+                );
+                return Err(error);
+            }
+        }
 
         record.route.generator_id = target.new_generator_id;
         record.route.resource_tier = target.target_resource_tier;
         record.route.epoch += 1;
         record.route.route_version += 1;
         record.route.owner_worker_endpoint = transfer.owner_endpoint.clone();
-        record.state = TimelineLifecycleState::Recovering;
+        record.state = if can_activate_in_initial_cas {
+            TimelineLifecycleState::Active
+        } else {
+            TimelineLifecycleState::Recovering
+        };
         record.recovery_floor_tso = prepared.safe_floor;
         record.issued_upper_bound = None;
         record.lease_expire_at_ms = None;
@@ -565,8 +710,11 @@ impl TsoService {
 mod tests {
     use std::sync::Arc;
 
-    use crate::metadata::{GeneratorLeaseAuthority, MemoryMetadataStore};
-    use crate::{ManualClock, ResourceTier, TransferReason, TsoConfig, TsoError, TsoService};
+    use crate::metadata::{GeneratorLeaseAuthority, MemoryMetadataStore, TimelineAuthority};
+    use crate::{
+        AllocateTimestampsRequest, ManualClock, ResourceTier, TimelineLifecycleState,
+        TransferReason, TsoConfig, TsoError, TsoService,
+    };
 
     fn required_test_config(config: TsoConfig) -> TsoConfig {
         crate::test_tls::required_grpc_tls_test_config(config, 100)
@@ -576,6 +724,118 @@ mod tests {
         config.worker_id = worker_id.to_owned();
         config.advertise_endpoint = format!("{worker_id}:50051");
         required_test_config(config)
+    }
+
+    #[tokio::test]
+    async fn local_rebalance_transfer_commits_active_route_in_one_timeline_cas() {
+        let clock = Arc::new(ManualClock::new(31_000));
+        let metadata = Arc::new(MemoryMetadataStore::new());
+        let service = TsoService::new(
+            with_worker(
+                TsoConfig {
+                    shared_generators: 4,
+                    shared_jump_ahead_threshold_ms: u64::MAX,
+                    recovery_catchup_budget_ms: u64::MAX,
+                    ..TsoConfig::default()
+                },
+                "worker-a",
+            ),
+            clock,
+            metadata.clone(),
+        )
+        .unwrap();
+
+        let route = service
+            .ensure_timeline("transfer-local-active-cas")
+            .await
+            .unwrap();
+        let (_, before_revision) = metadata
+            .load_timeline(&route.timeline_key)
+            .await
+            .unwrap()
+            .expect("timeline should exist before transfer");
+        let target_generator_id = (route.generator_id + 1) % 4;
+
+        let (transferred, _, state) = service
+            .transfer_timeline_for_rpc(
+                &route.timeline_key,
+                "worker-a:50051".to_string(),
+                Some(target_generator_id),
+                TransferReason::Rebalance,
+            )
+            .await
+            .unwrap();
+
+        let (persisted, after_revision) = metadata
+            .load_timeline(&route.timeline_key)
+            .await
+            .unwrap()
+            .expect("timeline should exist after transfer");
+        assert_eq!(state, TimelineLifecycleState::Active);
+        assert_eq!(persisted.state, TimelineLifecycleState::Active);
+        assert_eq!(transferred.route_version, route.route_version + 1);
+        assert_eq!(after_revision, before_revision + 1);
+    }
+
+    #[tokio::test]
+    async fn local_rebalance_transfer_uses_fenced_timeline_floor() {
+        let clock = Arc::new(ManualClock::new(31_000));
+        let metadata = Arc::new(MemoryMetadataStore::new());
+        let service = TsoService::new(
+            with_worker(
+                TsoConfig {
+                    shared_generators: 4,
+                    shared_jump_ahead_threshold_ms: u64::MAX,
+                    recovery_catchup_budget_ms: u64::MAX,
+                    ..TsoConfig::default()
+                },
+                "worker-a",
+            ),
+            clock,
+            metadata.clone(),
+        )
+        .unwrap();
+
+        let route = service
+            .ensure_timeline("transfer-local-exact-floor")
+            .await
+            .unwrap();
+        let allocated = service
+            .allocate_timestamps(AllocateTimestampsRequest {
+                timeline_key: route.timeline_key.clone(),
+                count: 1,
+                expected_epoch: route.epoch,
+                expected_route_version: route.route_version,
+                client_request_id: "transfer-local-exact-floor".into(),
+            })
+            .await
+            .unwrap();
+        let allocated_tso = allocated.ranges.last().unwrap().end_tso;
+        let generator_upper_bound = metadata
+            .load_generator(route.generator_id)
+            .await
+            .unwrap()
+            .and_then(|(record, _)| record.issued_upper_bound)
+            .expect("generator lease should have issued upper bound");
+        assert!(generator_upper_bound > allocated_tso);
+
+        service
+            .transfer_timeline_for_rpc(
+                &route.timeline_key,
+                "worker-a:50051".to_string(),
+                Some((route.generator_id + 1) % 4),
+                TransferReason::Rebalance,
+            )
+            .await
+            .unwrap();
+
+        let (persisted, _) = metadata
+            .load_timeline(&route.timeline_key)
+            .await
+            .unwrap()
+            .expect("timeline should exist after transfer");
+        assert_eq!(persisted.state, TimelineLifecycleState::Active);
+        assert_eq!(persisted.recovery_floor_tso, Some(allocated_tso));
     }
 
     #[tokio::test]

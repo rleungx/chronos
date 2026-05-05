@@ -36,6 +36,9 @@ struct BenchConfig {
     failover_timeout_secs: u64,
     allocate_request_timeout_ms: u64,
     route_refresh_timeout_ms: u64,
+    auto_failover_enabled: bool,
+    auto_failover_interval_ms: u64,
+    auto_failover_batch_size: usize,
     owner_a: SpawnConfig,
     owner_b: SpawnConfig,
 }
@@ -125,6 +128,11 @@ fn load_config() -> BenchConfig {
     );
     let route_refresh_timeout_ms =
         env_or("CHRONOS_FAILOVER_BENCH_ROUTE_REFRESH_TIMEOUT_MS", 500u64);
+    let auto_failover_enabled = env_or("CHRONOS_FAILOVER_BENCH_AUTO_FAILOVER_ENABLED", false);
+    let auto_failover_interval_ms =
+        env_or("CHRONOS_FAILOVER_BENCH_AUTO_FAILOVER_INTERVAL_MS", 100u64);
+    let auto_failover_batch_size =
+        env_or("CHRONOS_FAILOVER_BENCH_AUTO_FAILOVER_BATCH_SIZE", 16usize);
     let timeline_namespace = env_or_string(
         "CHRONOS_FAILOVER_BENCH_NAMESPACE",
         &format!(
@@ -157,6 +165,9 @@ fn load_config() -> BenchConfig {
         failover_timeout_secs,
         allocate_request_timeout_ms,
         route_refresh_timeout_ms,
+        auto_failover_enabled,
+        auto_failover_interval_ms,
+        auto_failover_batch_size,
         owner_a: SpawnConfig {
             instance_id: "bench-instance-a".to_string(),
             worker_id: "worker-a".to_string(),
@@ -228,6 +239,18 @@ fn spawn_chronos_process(config: &BenchConfig, spawn: &SpawnConfig) -> AppResult
         .env("CHRONOS_INSTANCE_ID", &spawn.instance_id)
         .env("CHRONOS_BIND_ADDR", spawn.bind_addr.to_string())
         .env("CHRONOS_ADVERTISE_ENDPOINT", &spawn.advertise_endpoint)
+        .env(
+            "CHRONOS_AUTO_FAILOVER_ENABLED",
+            config.auto_failover_enabled.to_string(),
+        )
+        .env(
+            "CHRONOS_AUTO_FAILOVER_INTERVAL_MS",
+            config.auto_failover_interval_ms.to_string(),
+        )
+        .env(
+            "CHRONOS_AUTO_FAILOVER_BATCH_SIZE",
+            config.auto_failover_batch_size.to_string(),
+        )
         .env(
             "CHRONOS_METRICS_BIND_ADDR",
             spawn.metrics_bind_addr.to_string(),
@@ -320,6 +343,43 @@ async fn wait_for_ready(endpoint: SocketAddr, child: &mut Child) -> AppResult<()
             }
 
             sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await?
+}
+
+async fn wait_for_auto_failover_route(
+    standby_endpoint: SocketAddr,
+    timeline_key: &str,
+    target_owner_endpoint: &str,
+    poll_interval_ms: u64,
+    timeout_secs: u64,
+    failover_started: Instant,
+) -> Result<(TimelineRoute, FailoverBenchStats), Box<dyn Error + Send + Sync>> {
+    let mut stats = FailoverBenchStats::default();
+    timeout(Duration::from_secs(timeout_secs), async {
+        loop {
+            stats.failover_attempts_total += 1;
+            match get_timeline_route(standby_endpoint, timeline_key).await {
+                Ok(route) if route.owner_worker_endpoint == target_owner_endpoint => {
+                    stats.failover_success_total += 1;
+                    stats
+                        .failover_latencies_us
+                        .push(failover_started.elapsed().as_micros() as u64);
+                    eprintln!(
+                        "phase=auto_failover_observed timeline_key={} route_version={} epoch={}",
+                        route.timeline_key, route.route_version, route.epoch
+                    );
+                    return Ok((route, stats));
+                }
+                Ok(_) => {
+                    stats.failover_blocked_total += 1;
+                }
+                Err(_) => {
+                    stats.failover_other_failures_total += 1;
+                }
+            }
+            sleep(Duration::from_millis(poll_interval_ms)).await;
         }
     })
     .await?
@@ -649,6 +709,33 @@ async fn main() -> AppResult<()> {
             terminate_child(&mut *driver_leader_child.lock().await);
             eprintln!("phase=leader_killed endpoint={}", leader_endpoint);
 
+            if driver_config.auto_failover_enabled {
+                let (refreshed, observed_stats) = wait_for_auto_failover_route(
+                    standby_endpoint,
+                    &timeline_key_for_failover,
+                    &owner_endpoint_str,
+                    failover_poll_interval_ms,
+                    failover_timeout_secs,
+                    driver_kill_instant
+                        .lock()
+                        .await
+                        .expect("kill instant must be set before auto failover polling"),
+                )
+                .await?;
+                *route.lock().await = refreshed;
+                wait_for_post_failover_allocation_success(
+                    &driver_config,
+                    &route.lock().await.clone(),
+                    driver_allocate_batch,
+                    driver_request_timeout_ms,
+                    failover_timeout_secs,
+                    driver_kill_instant.clone(),
+                    driver_first_success_after_kill.clone(),
+                )
+                .await?;
+                return Ok::<FailoverBenchStats, Box<dyn Error + Send + Sync>>(observed_stats);
+            }
+
             timeout(Duration::from_secs(failover_timeout_secs), async {
                 loop {
                     let transfer_start = Instant::now();
@@ -738,6 +825,15 @@ async fn main() -> AppResult<()> {
             config.route_refresh_timeout_ms
         );
         println!("safety_gap_ms={}", config.safety_gap_ms);
+        println!("auto_failover_enabled={}", config.auto_failover_enabled);
+        println!(
+            "auto_failover_interval_ms={}",
+            config.auto_failover_interval_ms
+        );
+        println!(
+            "auto_failover_batch_size={}",
+            config.auto_failover_batch_size
+        );
         println!("allocate_requests_total={}", stats.allocate_requests_total);
         println!("allocate_success_total={}", stats.allocate_success_total);
         println!("allocate_failed_total={}", stats.allocate_failed_total);
@@ -871,6 +967,9 @@ mod tests {
             failover_timeout_secs: 1,
             allocate_request_timeout_ms: 100,
             route_refresh_timeout_ms: 100,
+            auto_failover_enabled: false,
+            auto_failover_interval_ms: 100,
+            auto_failover_batch_size: 16,
             owner_a: SpawnConfig {
                 instance_id: "a".to_string(),
                 worker_id: "worker-a".to_string(),

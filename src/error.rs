@@ -125,6 +125,20 @@ pub enum TsoError {
     MetadataAlreadyExists,
     #[error("CAS failed")]
     CasFailed,
+    #[error(
+        "client request id conflict: timeline {timeline_key} request {client_request_id} does not match the original request"
+    )]
+    ClientRequestConflict {
+        timeline_key: String,
+        client_request_id: String,
+    },
+    #[error(
+        "client request already in progress: timeline {timeline_key} request {client_request_id}"
+    )]
+    ClientRequestInProgress {
+        timeline_key: String,
+        client_request_id: String,
+    },
     #[error("service is shutting down")]
     ServiceShuttingDown,
     #[error("request cancelled")]

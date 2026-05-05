@@ -7,9 +7,13 @@ use super::test_support::{
 use super::*;
 use chronos::metrics;
 use chronos::proto::v1::{
+    timeline_control_service_client::TimelineControlServiceClient,
     timeline_control_service_server::TimelineControlServiceServer,
+    timeline_route_service_client::TimelineRouteServiceClient,
     timeline_route_service_server::TimelineRouteServiceServer,
+    timeline_status_service_client::TimelineStatusServiceClient,
     timeline_status_service_server::TimelineStatusServiceServer,
+    timestamp_service_client::TimestampServiceClient,
     timestamp_service_server::TimestampServiceServer,
 };
 use chronos::rpc::{
@@ -18,6 +22,7 @@ use chronos::rpc::{
 };
 use chronos::{ManualClock, SystemClock, TsoError};
 use futures::FutureExt;
+use http_body_util::Empty;
 use std::env;
 use std::net::SocketAddr;
 #[cfg(unix)]
@@ -31,21 +36,25 @@ use tokio::sync::watch;
 
 use chronos::metadata::{EtcdMetadataStore, MemoryMetadataStore};
 use chronos::proto::v1::{
-    timestamp_service_client::TimestampServiceClient,
-    AllocateTimestampsRequest as ProtoAllocateTimestampsRequest, WorkerReadinessReason,
+    AllocateTimestampsRequest as ProtoAllocateTimestampsRequest,
+    EnsureTimelineRequest as ProtoEnsureTimelineRequest, WorkerReadinessReason,
     WorkerReadinessState,
 };
 use chronos::{TsoConfig, TsoSecurityMode, TsoService};
-use hyper::client::conn;
-use hyper::{Body, Request as HyperRequest, StatusCode};
+use hyper::body::Bytes;
+use hyper::client::conn::http1;
+use hyper::{Request as HyperRequest, StatusCode};
+use hyper_util::rt::TokioIo;
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, ExtendedKeyUsagePurpose, IsCa, KeyPair,
 };
 use rustls::pki_types::ServerName;
 use rustls::server::WebPkiClientVerifier;
 use rustls::{ClientConfig, ServerConfig};
+use sha2::{Digest, Sha256};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
+use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
 
 fn parsed_test_etcd_endpoints() -> Vec<String> {
     test_etcd_endpoints()
@@ -77,6 +86,10 @@ fn explicit_required_config() -> TsoConfig {
         grpc_tls_cert_file: Some(fixture.server_cert_path.clone()),
         grpc_tls_key_file: Some(fixture.server_key_path.clone()),
         grpc_client_ca_file: Some(fixture.ca_cert_path.clone()),
+        grpc_control_cert_allowlist: vec![test_cert_fingerprint(&fixture.client_cert_path)],
+        grpc_route_cert_allowlist: vec![test_cert_fingerprint(&fixture.client_cert_path)],
+        grpc_timestamp_cert_allowlist: vec![test_cert_fingerprint(&fixture.client_cert_path)],
+        grpc_status_cert_allowlist: vec![test_cert_fingerprint(&fixture.client_cert_path)],
         grpc_request_timeout_ms: Some(100),
         grpc_max_request_bytes: Some(1024),
         grpc_max_concurrent_requests: Some(16),
@@ -145,6 +158,8 @@ struct MetricsTlsFixture {
     server_key_path: String,
     client_cert_path: String,
     client_key_path: String,
+    unauthorized_client_cert_path: String,
+    unauthorized_client_key_path: String,
 }
 
 fn unique_temp_dir(label: &str) -> PathBuf {
@@ -185,21 +200,48 @@ fn build_metrics_tls_fixture() -> MetricsTlsFixture {
         .push(ExtendedKeyUsagePurpose::ClientAuth);
     let client_cert = client_params.signed_by(&client_key, &ca).unwrap();
 
+    let unauthorized_client_key = KeyPair::generate().unwrap();
+    let mut unauthorized_client_params =
+        CertificateParams::new(vec!["chronos-unauthorized-client".into()]).unwrap();
+    unauthorized_client_params
+        .extended_key_usages
+        .push(ExtendedKeyUsagePurpose::ClientAuth);
+    let unauthorized_client_cert = unauthorized_client_params
+        .signed_by(&unauthorized_client_key, &ca)
+        .unwrap();
+
     let ca_cert_path = dir.join("ca.pem");
     let server_cert_path = dir.join("server.pem");
     let server_key_path = dir.join("server-key.pem");
     let client_cert_path = dir.join("client.pem");
     let client_key_path = dir.join("client-key.pem");
+    let unauthorized_client_cert_path = dir.join("unauthorized-client.pem");
+    let unauthorized_client_key_path = dir.join("unauthorized-client-key.pem");
 
     std::fs::write(&ca_cert_path, ca.pem()).unwrap();
     std::fs::write(&server_cert_path, server_cert.pem()).unwrap();
     std::fs::write(&server_key_path, server_key.serialize_pem()).unwrap();
     std::fs::write(&client_cert_path, client_cert.pem()).unwrap();
     std::fs::write(&client_key_path, client_key.serialize_pem()).unwrap();
+    std::fs::write(
+        &unauthorized_client_cert_path,
+        unauthorized_client_cert.pem(),
+    )
+    .unwrap();
+    std::fs::write(
+        &unauthorized_client_key_path,
+        unauthorized_client_key.serialize_pem(),
+    )
+    .unwrap();
     #[cfg(unix)]
     {
         std::fs::set_permissions(&server_key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
         std::fs::set_permissions(&client_key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::set_permissions(
+            &unauthorized_client_key_path,
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
     }
 
     MetricsTlsFixture {
@@ -209,6 +251,8 @@ fn build_metrics_tls_fixture() -> MetricsTlsFixture {
         server_key_path: server_key_path.to_string_lossy().into_owned(),
         client_cert_path: client_cert_path.to_string_lossy().into_owned(),
         client_key_path: client_key_path.to_string_lossy().into_owned(),
+        unauthorized_client_cert_path: unauthorized_client_cert_path.to_string_lossy().into_owned(),
+        unauthorized_client_key_path: unauthorized_client_key_path.to_string_lossy().into_owned(),
     }
 }
 
@@ -243,6 +287,97 @@ fn build_metrics_tls_connector(
         builder.with_no_client_auth()
     };
     TlsConnector::from(Arc::new(client_config))
+}
+
+fn test_cert_fingerprint(cert_path: &str) -> String {
+    let cert_pem = std::fs::read(cert_path).unwrap();
+    let certs = parse_pem_certificates(&cert_pem, "test client cert fingerprint").unwrap();
+    let digest = Sha256::digest(certs.first().unwrap().as_ref());
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+async fn connect_control_client(
+    endpoint: SocketAddr,
+    fixture: &MetricsTlsFixture,
+    cert_path: &str,
+    key_path: &str,
+) -> TimelineControlServiceClient<tonic::transport::Channel> {
+    let cert_pem = std::fs::read(cert_path).unwrap();
+    let key_pem = std::fs::read(key_path).unwrap();
+    let ca_pem = std::fs::read(&fixture.ca_cert_path).unwrap();
+    let tls = ClientTlsConfig::new()
+        .ca_certificate(Certificate::from_pem(ca_pem))
+        .identity(Identity::from_pem(cert_pem, key_pem))
+        .domain_name("localhost");
+    let endpoint = Endpoint::from_shared(format!("https://{endpoint}"))
+        .unwrap()
+        .tls_config(tls)
+        .unwrap();
+    TimelineControlServiceClient::connect(endpoint)
+        .await
+        .unwrap()
+}
+
+async fn connect_route_client(
+    endpoint: SocketAddr,
+    fixture: &MetricsTlsFixture,
+    cert_path: &str,
+    key_path: &str,
+) -> TimelineRouteServiceClient<tonic::transport::Channel> {
+    let cert_pem = std::fs::read(cert_path).unwrap();
+    let key_pem = std::fs::read(key_path).unwrap();
+    let ca_pem = std::fs::read(&fixture.ca_cert_path).unwrap();
+    let tls = ClientTlsConfig::new()
+        .ca_certificate(Certificate::from_pem(ca_pem))
+        .identity(Identity::from_pem(cert_pem, key_pem))
+        .domain_name("localhost");
+    let endpoint = Endpoint::from_shared(format!("https://{endpoint}"))
+        .unwrap()
+        .tls_config(tls)
+        .unwrap();
+    TimelineRouteServiceClient::connect(endpoint).await.unwrap()
+}
+
+async fn connect_timestamp_client(
+    endpoint: SocketAddr,
+    fixture: &MetricsTlsFixture,
+    cert_path: &str,
+    key_path: &str,
+) -> TimestampServiceClient<tonic::transport::Channel> {
+    let cert_pem = std::fs::read(cert_path).unwrap();
+    let key_pem = std::fs::read(key_path).unwrap();
+    let ca_pem = std::fs::read(&fixture.ca_cert_path).unwrap();
+    let tls = ClientTlsConfig::new()
+        .ca_certificate(Certificate::from_pem(ca_pem))
+        .identity(Identity::from_pem(cert_pem, key_pem))
+        .domain_name("localhost");
+    let endpoint = Endpoint::from_shared(format!("https://{endpoint}"))
+        .unwrap()
+        .tls_config(tls)
+        .unwrap();
+    TimestampServiceClient::connect(endpoint).await.unwrap()
+}
+
+async fn connect_status_client(
+    endpoint: SocketAddr,
+    fixture: &MetricsTlsFixture,
+    cert_path: &str,
+    key_path: &str,
+) -> TimelineStatusServiceClient<tonic::transport::Channel> {
+    let cert_pem = std::fs::read(cert_path).unwrap();
+    let key_pem = std::fs::read(key_path).unwrap();
+    let ca_pem = std::fs::read(&fixture.ca_cert_path).unwrap();
+    let tls = ClientTlsConfig::new()
+        .ca_certificate(Certificate::from_pem(ca_pem))
+        .identity(Identity::from_pem(cert_pem, key_pem))
+        .domain_name("localhost");
+    let endpoint = Endpoint::from_shared(format!("https://{endpoint}"))
+        .unwrap()
+        .tls_config(tls)
+        .unwrap();
+    TimelineStatusServiceClient::connect(endpoint)
+        .await
+        .unwrap()
 }
 
 fn build_test_mtls_acceptor(fixture: &MetricsTlsFixture) -> TlsAcceptor {
@@ -593,6 +728,29 @@ fn startup_preflight_rejects_required_remote_exposed_without_grpc_tls_bundle() {
 }
 
 #[test]
+fn startup_preflight_requires_control_and_status_allowlists_when_grpc_mtls_is_configured() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    clear_tso_env();
+    let fixture = shared_test_tls_fixture();
+    let config = TsoConfig {
+        security_mode: Some(TsoSecurityMode::DevInsecure),
+        bind_addr: "127.0.0.1:50052".into(),
+        advertise_endpoint: "127.0.0.1:50052".into(),
+        grpc_tls_cert_file: Some(fixture.server_cert_path.clone()),
+        grpc_tls_key_file: Some(fixture.server_key_path.clone()),
+        grpc_client_ca_file: Some(fixture.ca_cert_path.clone()),
+        grpc_request_timeout_ms: Some(100),
+        grpc_max_request_bytes: Some(1024),
+        grpc_max_concurrent_requests: Some(16),
+        ..TsoConfig::default()
+    };
+
+    let error = validate_startup_preflight(&memory_startup_config(config)).unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("CHRONOS_GRPC_CONTROL_CERT_ALLOWLIST"));
+}
+
+#[test]
 fn build_grpc_server_rejects_unreadable_tls_files() {
     let error = build_grpc_server(&TsoConfig {
         grpc_tls_cert_file: Some("/definitely/missing/server.crt".into()),
@@ -649,6 +807,7 @@ async fn build_tso_service_uses_typed_etcd_endpoints_for_bootstrap() {
             vec!["https://localhost:2379".into()],
             "/chronos-test-typed-bootstrap",
         )),
+        super::config::StartupLoggingConfig::default(),
     );
 
     let error = match build_tso_service(&startup, Arc::new(SystemClock)).await {
@@ -684,7 +843,7 @@ fn load_metrics_tls_acceptor_rejects_unreadable_tls_files() {
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn serve_metrics_accepts_https_with_client_certificate() {
-    let _guard = STARTUP_READY_LOCK.lock().unwrap();
+    let _guard = startup_ready_guard();
     let fixture = build_metrics_tls_fixture();
     let config = metrics_tls_config(&fixture);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -707,7 +866,7 @@ async fn serve_metrics_accepts_https_with_client_certificate() {
     let stream = TcpStream::connect(addr).await.unwrap();
     let server_name = ServerName::try_from("localhost").unwrap().to_owned();
     let tls_stream = connector.connect(server_name, stream).await.unwrap();
-    let (mut sender, connection) = conn::handshake(tls_stream).await.unwrap();
+    let (mut sender, connection) = http1::handshake(TokioIo::new(tls_stream)).await.unwrap();
     tokio::spawn(async move {
         let _ = connection.await;
     });
@@ -716,7 +875,7 @@ async fn serve_metrics_accepts_https_with_client_certificate() {
         .send_request(
             HyperRequest::builder()
                 .uri("/readyz")
-                .body(Body::empty())
+                .body(Empty::<Bytes>::new())
                 .unwrap(),
         )
         .await
@@ -731,7 +890,7 @@ async fn serve_metrics_accepts_https_with_client_certificate() {
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn serve_metrics_rejects_https_without_client_certificate() {
-    let _guard = STARTUP_READY_LOCK.lock().unwrap();
+    let _guard = startup_ready_guard();
     let fixture = build_metrics_tls_fixture();
     let config = metrics_tls_config(&fixture);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -754,13 +913,13 @@ async fn serve_metrics_rejects_https_without_client_certificate() {
     let stream = TcpStream::connect(addr).await.unwrap();
     let server_name = ServerName::try_from("localhost").unwrap().to_owned();
     let tls_stream = connector.connect(server_name, stream).await.unwrap();
-    let (mut sender, connection) = conn::handshake(tls_stream).await.unwrap();
+    let (mut sender, connection) = http1::handshake(TokioIo::new(tls_stream)).await.unwrap();
     let connection_handle = tokio::spawn(connection);
     let error = sender
         .send_request(
             HyperRequest::builder()
                 .uri("/readyz")
-                .body(Body::empty())
+                .body(Empty::<Bytes>::new())
                 .unwrap(),
         )
         .await
@@ -774,8 +933,9 @@ async fn serve_metrics_rejects_https_without_client_certificate() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn etcd_metadata_runtime_uses_configured_mtls_and_timeout() {
-    install_test_crypto_provider();
+    let _guard = startup_ready_guard();
     let fixture = build_metrics_tls_fixture();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -902,6 +1062,211 @@ async fn grpc_runtime_rejects_requests_above_max_request_bytes() {
     service.shutdown().await;
 }
 
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn grpc_runtime_authorizes_all_services_by_peer_certificate() {
+    let _guard = startup_ready_guard();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+
+    let fixture = shared_test_tls_fixture();
+    let mut config = explicit_required_config();
+    config.bind_addr = addr.to_string();
+    config.advertise_endpoint = addr.to_string();
+    config.grpc_control_cert_allowlist = vec![test_cert_fingerprint(&fixture.client_cert_path)];
+    config.grpc_route_cert_allowlist = vec![test_cert_fingerprint(&fixture.client_cert_path)];
+    config.grpc_timestamp_cert_allowlist = vec![test_cert_fingerprint(&fixture.client_cert_path)];
+    config.grpc_status_cert_allowlist = vec![test_cert_fingerprint(&fixture.client_cert_path)];
+
+    let metadata = Arc::new(MemoryMetadataStore::new());
+    let service = TsoService::new(config.clone(), Arc::new(SystemClock), metadata).unwrap();
+    let route_service = TimelineRouteServiceServer::new(
+        TsoRouteService::with_allowlist(service.control_plane(), &config.grpc_route_cert_allowlist)
+            .unwrap(),
+    )
+    .max_decoding_message_size(config.grpc_max_request_bytes.unwrap());
+    let timestamp_service = TimestampServiceServer::new(
+        TsoTimestampService::with_allowlist(
+            service.data_plane(),
+            &config.grpc_timestamp_cert_allowlist,
+        )
+        .unwrap(),
+    )
+    .max_decoding_message_size(config.grpc_max_request_bytes.unwrap());
+    let control_service = TimelineControlServiceServer::new(
+        TsoControlService::with_health_status_and_allowlist(
+            service.control_plane(),
+            test_health_status_handle(),
+            &config.grpc_control_cert_allowlist,
+        )
+        .unwrap(),
+    )
+    .max_decoding_message_size(config.grpc_max_request_bytes.unwrap());
+    let timeline_status_service = TimelineStatusServiceServer::new(
+        TsoTimelineStatusService::with_allowlist(
+            service.control_plane(),
+            &config.grpc_status_cert_allowlist,
+        )
+        .unwrap(),
+    )
+    .max_decoding_message_size(config.grpc_max_request_bytes.unwrap());
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let server = build_grpc_server(&config)
+        .unwrap()
+        .add_service(route_service)
+        .add_service(timestamp_service)
+        .add_service(control_service)
+        .add_service(timeline_status_service)
+        .serve_with_shutdown(addr, wait_for_shutdown_signal(shutdown_rx));
+    let server_handle = tokio::spawn(server);
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut authorized_control = connect_control_client(
+        addr,
+        fixture,
+        &fixture.client_cert_path,
+        &fixture.client_key_path,
+    )
+    .await;
+    let health = authorized_control.health(()).await.unwrap().into_inner();
+    assert_eq!(health.worker_id, "worker-a");
+
+    let mut denied_control = connect_control_client(
+        addr,
+        fixture,
+        &fixture.unauthorized_client_cert_path,
+        &fixture.unauthorized_client_key_path,
+    )
+    .await;
+    let error = denied_control.health(()).await.unwrap_err();
+    assert_eq!(error.code(), tonic::Code::PermissionDenied);
+
+    let mut authorized_route = connect_route_client(
+        addr,
+        fixture,
+        &fixture.client_cert_path,
+        &fixture.client_key_path,
+    )
+    .await;
+    let route = authorized_route
+        .ensure_timeline(ProtoEnsureTimelineRequest {
+            timeline_key: "grpc.auth.timeline".to_string(),
+            desired_resource_tier: chronos::proto::v1::ResourceTier::Shared as i32,
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .route
+        .expect("authorized route service should create a route");
+
+    let mut denied_route = connect_route_client(
+        addr,
+        fixture,
+        &fixture.unauthorized_client_cert_path,
+        &fixture.unauthorized_client_key_path,
+    )
+    .await;
+    let error = denied_route
+        .ensure_timeline(ProtoEnsureTimelineRequest {
+            timeline_key: "grpc.auth.denied.timeline".to_string(),
+            desired_resource_tier: chronos::proto::v1::ResourceTier::Shared as i32,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::PermissionDenied);
+
+    let mut authorized_timestamp = connect_timestamp_client(
+        addr,
+        fixture,
+        &fixture.client_cert_path,
+        &fixture.client_key_path,
+    )
+    .await;
+    let allocation = authorized_timestamp
+        .allocate_timestamps(ProtoAllocateTimestampsRequest {
+            timeline_key: route.timeline_key.clone(),
+            count: 1,
+            expected_epoch: route.epoch,
+            expected_route_version: route.route_version,
+            client_request_id: "grpc-auth-allocate".to_string(),
+            request_timeout_ms: 0,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(allocation.timeline_key, route.timeline_key);
+
+    let mut denied_timestamp = connect_timestamp_client(
+        addr,
+        fixture,
+        &fixture.unauthorized_client_cert_path,
+        &fixture.unauthorized_client_key_path,
+    )
+    .await;
+    let error = denied_timestamp
+        .allocate_timestamps(ProtoAllocateTimestampsRequest {
+            timeline_key: route.timeline_key.clone(),
+            count: 1,
+            expected_epoch: route.epoch,
+            expected_route_version: route.route_version,
+            client_request_id: "grpc-auth-denied-allocate".to_string(),
+            request_timeout_ms: 0,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::PermissionDenied);
+
+    let mut authorized_status = connect_status_client(
+        addr,
+        fixture,
+        &fixture.client_cert_path,
+        &fixture.client_key_path,
+    )
+    .await;
+    let statuses = authorized_status
+        .list_timeline_statuses(chronos::proto::v1::ListTimelineStatusesRequest {
+            states: Vec::new(),
+            owner_worker_endpoint: None,
+            page_size: 0,
+            page_token: String::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(statuses.statuses.iter().any(|status| {
+        status
+            .route
+            .as_ref()
+            .map(|status_route| status_route.timeline_key == route.timeline_key)
+            .unwrap_or(false)
+    }));
+
+    let mut denied_status = connect_status_client(
+        addr,
+        fixture,
+        &fixture.unauthorized_client_cert_path,
+        &fixture.unauthorized_client_key_path,
+    )
+    .await;
+    let error = denied_status
+        .list_timeline_statuses(chronos::proto::v1::ListTimelineStatusesRequest {
+            states: Vec::new(),
+            owner_worker_endpoint: None,
+            page_size: 0,
+            page_token: String::new(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::PermissionDenied);
+
+    shutdown_tx.send(true).unwrap();
+    server_handle.await.unwrap().unwrap();
+    service.shutdown().await;
+}
+
 #[test]
 fn load_tso_config_reads_security_mode_and_surface_inputs() {
     let _guard = ENV_LOCK.lock().unwrap();
@@ -909,20 +1274,109 @@ fn load_tso_config_reads_security_mode_and_surface_inputs() {
     unsafe {
         env::set_var("CHRONOS_SECURITY_MODE", "dev-insecure");
         env::set_var("CHRONOS_BIND_ADDR", "127.0.0.1:50051");
+        env::set_var("CHRONOS_HEALTH_BIND_ADDR", "127.0.0.1:9897");
         env::set_var("CHRONOS_METRICS_BIND_ADDR", "127.0.0.1:9898");
         env::set_var("CHRONOS_METADATA", "etcd");
         env::set_var("CHRONOS_ETCD_ENDPOINTS", "127.0.0.1:2379,127.0.0.1:2380");
+        env::set_var("CHRONOS_AUTO_FAILOVER_ENABLED", "true");
+        env::set_var("CHRONOS_AUTO_FAILOVER_INTERVAL_MS", "2500");
+        env::set_var("CHRONOS_AUTO_FAILOVER_BATCH_SIZE", "7");
+        env::set_var(
+            "CHRONOS_GRPC_CONTROL_CERT_ALLOWLIST",
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        );
+        env::set_var(
+            "CHRONOS_GRPC_ROUTE_CERT_ALLOWLIST",
+            "1111111111111111111111111111111111111111111111111111111111111111",
+        );
+        env::set_var(
+            "CHRONOS_GRPC_TIMESTAMP_CERT_ALLOWLIST",
+            "2222222222222222222222222222222222222222222222222222222222222222",
+        );
+        env::set_var(
+            "CHRONOS_GRPC_STATUS_CERT_ALLOWLIST",
+            "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
+        );
     }
 
     let config = load_tso_config().unwrap();
     assert_eq!(config.security_mode, Some(TsoSecurityMode::DevInsecure));
     assert_eq!(config.bind_addr, "127.0.0.1:50051");
+    assert_eq!(config.health_bind_addr.as_deref(), Some("127.0.0.1:9897"));
     assert_eq!(config.metrics_bind_addr, "127.0.0.1:9898");
     assert_eq!(config.metadata_kind, "etcd");
     assert_eq!(
         config.etcd_endpoints,
         vec!["127.0.0.1:2379", "127.0.0.1:2380"]
     );
+    assert_eq!(
+        config.grpc_control_cert_allowlist,
+        vec!["0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"]
+    );
+    assert_eq!(
+        config.grpc_route_cert_allowlist,
+        vec!["1111111111111111111111111111111111111111111111111111111111111111"]
+    );
+    assert_eq!(
+        config.grpc_timestamp_cert_allowlist,
+        vec!["2222222222222222222222222222222222222222222222222222222222222222"]
+    );
+    assert_eq!(
+        config.grpc_status_cert_allowlist,
+        vec!["fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"]
+    );
+    assert!(config.auto_failover_enabled);
+    assert_eq!(config.auto_failover_interval_ms, 2500);
+    assert_eq!(config.auto_failover_batch_size, 7);
+}
+
+#[test]
+fn load_startup_config_reads_logging_controls() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    clear_tso_env();
+    unsafe {
+        env::set_var("CHRONOS_LOG_FORMAT", "text");
+        env::set_var("CHRONOS_LOG_FILTER", "debug,chronos=trace");
+    }
+
+    let startup = load_startup_config().unwrap();
+    assert_eq!(
+        startup.logging.format,
+        super::config::StartupLogFormat::Text
+    );
+    assert_eq!(startup.logging.filter, "debug,chronos=trace");
+}
+
+#[test]
+fn load_startup_config_rejects_invalid_log_format() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    clear_tso_env();
+    unsafe { env::set_var("CHRONOS_LOG_FORMAT", "yaml") };
+
+    let error = load_startup_config().unwrap_err();
+    assert!(error.to_string().contains("CHRONOS_LOG_FORMAT"));
+}
+
+#[test]
+fn load_startup_config_rejects_blank_log_filter() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    clear_tso_env();
+    unsafe { env::set_var("CHRONOS_LOG_FILTER", "   ") };
+
+    let error = load_startup_config().unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("CHRONOS_LOG_FILTER must not be blank"));
+}
+
+#[test]
+fn load_startup_config_rejects_invalid_log_filter_syntax() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    clear_tso_env();
+    unsafe { env::set_var("CHRONOS_LOG_FILTER", "chronos=[") };
+
+    let error = load_startup_config().unwrap_err();
+    assert!(error.to_string().contains("CHRONOS_LOG_FILTER is invalid"));
 }
 
 #[test]
@@ -1092,7 +1546,7 @@ async fn readyz_reports_service_unavailable_until_ready() {
     let response = metrics_handler(
         HyperRequest::builder()
             .uri("/readyz")
-            .body(Body::empty())
+            .body(Empty::<Bytes>::new())
             .unwrap(),
         Arc::new(AtomicBool::new(false)),
     )
@@ -1102,9 +1556,23 @@ async fn readyz_reports_service_unavailable_until_ready() {
 }
 
 #[tokio::test]
+async fn health_handler_does_not_expose_metrics() {
+    let response = health_handler(
+        HyperRequest::builder()
+            .uri("/metrics")
+            .body(Empty::<Bytes>::new())
+            .unwrap(),
+        Arc::new(AtomicBool::new(true)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn readyz_only_turns_green_after_all_critical_listeners_are_bound() {
-    let _guard = STARTUP_READY_LOCK.lock().unwrap();
+    let _guard = startup_ready_guard();
     let ready = Arc::new(AtomicBool::new(false));
     let mut serving_gate = StartupServingGate::default();
 
@@ -1112,7 +1580,7 @@ async fn readyz_only_turns_green_after_all_critical_listeners_are_bound() {
     let response = metrics_handler(
         HyperRequest::builder()
             .uri("/readyz")
-            .body(Body::empty())
+            .body(Empty::<Bytes>::new())
             .unwrap(),
         ready.clone(),
     )
@@ -1127,7 +1595,7 @@ async fn readyz_only_turns_green_after_all_critical_listeners_are_bound() {
     let response = metrics_handler(
         HyperRequest::builder()
             .uri("/readyz")
-            .body(Body::empty())
+            .body(Empty::<Bytes>::new())
             .unwrap(),
         ready.clone(),
     )
@@ -1142,7 +1610,7 @@ async fn readyz_only_turns_green_after_all_critical_listeners_are_bound() {
     let response = metrics_handler(
         HyperRequest::builder()
             .uri("/readyz")
-            .body(Body::empty())
+            .body(Empty::<Bytes>::new())
             .unwrap(),
         ready.clone(),
     )
@@ -1448,7 +1916,7 @@ fn request_shutdown_preserves_identity_lease_loss_precedence() {
 
 #[test]
 fn ownership_drift_sink_flips_readyz_and_health_reason() {
-    let _guard = STARTUP_READY_LOCK.lock().unwrap();
+    let _guard = startup_ready_guard();
     let ready = Arc::new(AtomicBool::new(true));
     let startup_complete = Arc::new(AtomicBool::new(true));
     set_startup_ready(&ready, true);
@@ -1491,7 +1959,7 @@ fn ownership_drift_sink_flips_readyz_and_health_reason() {
 
 #[test]
 fn ownership_drift_clear_waits_for_startup_completion_before_restoring_ready() {
-    let _guard = STARTUP_READY_LOCK.lock().unwrap();
+    let _guard = startup_ready_guard();
     let ready = Arc::new(AtomicBool::new(false));
     let startup_complete = Arc::new(AtomicBool::new(false));
     set_startup_ready(&ready, false);
@@ -1545,7 +2013,7 @@ fn ownership_drift_clear_waits_for_startup_completion_before_restoring_ready() {
 
 #[test]
 fn ownership_drift_clear_does_not_restore_ready_after_shutdown_or_identity_loss() {
-    let _guard = STARTUP_READY_LOCK.lock().unwrap();
+    let _guard = startup_ready_guard();
     let ready = Arc::new(AtomicBool::new(true));
     let startup_complete = Arc::new(AtomicBool::new(true));
     set_startup_ready(&ready, true);
@@ -1798,17 +2266,38 @@ async fn etcd_identity_lease_loss_flips_readiness_and_triggers_shutdown() {
         unique_prefix,
         config.effective_instance_id()
     );
-    let lease_id = client
+    let lease_response = client
         .get(lease_key, None)
         .await
-        .expect("identity lease record lookup should succeed")
+        .expect("identity lease record lookup should succeed");
+    let lease_kv = lease_response
         .kvs()
         .first()
-        .expect("identity lease record should exist")
-        .lease();
+        .expect("identity lease record should exist");
+    let lease_id = lease_kv.lease();
     assert_ne!(
         lease_id, 0,
         "identity lease record should carry a non-zero lease id"
+    );
+    let lease_record: serde_json::Value = serde_json::from_slice(lease_kv.value())
+        .expect("identity lease record should deserialize as json");
+    assert_eq!(
+        lease_record
+            .get("instance_id")
+            .and_then(|value| value.as_str()),
+        Some(config.effective_instance_id())
+    );
+    assert_eq!(
+        lease_record
+            .get("worker_id")
+            .and_then(|value| value.as_str()),
+        Some(config.worker_id.as_str())
+    );
+    assert_eq!(
+        lease_record
+            .get("advertise_endpoint")
+            .and_then(|value| value.as_str()),
+        Some(config.advertise_endpoint.as_str())
     );
     client
         .lease_revoke(lease_id)
@@ -1863,6 +2352,7 @@ fn startup_preflight_validates_etcd_endpoints_from_typed_metadata() {
             vec!["127.0.0.1:2379".into()],
             "/chronos",
         )),
+        super::config::StartupLoggingConfig::default(),
     );
 
     validate_startup_preflight(&startup).unwrap();
@@ -1876,6 +2366,7 @@ fn loaded_startup_config_does_not_backfill_config_metadata_kind_from_typed_metad
             vec!["127.0.0.1:2379".into()],
             "/chronos",
         )),
+        super::config::StartupLoggingConfig::default(),
     );
 
     assert_eq!(startup.config.metadata_kind, "memory");

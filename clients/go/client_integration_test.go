@@ -127,6 +127,7 @@ func TestClientOptionsFlowIntoRequests(t *testing.T) {
 		context.Background(),
 		addr,
 		"orders.primary",
+		WithInsecureTransport(),
 		WithDesiredResourceTier(tsov1.ResourceTier_RESOURCE_TIER_WARM),
 		WithRequestTimeoutMs(1500),
 	)
@@ -152,7 +153,7 @@ func TestClientOptionsFlowIntoRequests(t *testing.T) {
 func TestClientNewAndAllocateTimestamps(t *testing.T) {
 	server, addr := startFakeChronosServer(t, false)
 
-	client, err := New(context.Background(), addr, "orders.primary")
+	client, err := NewWithOptions(context.Background(), addr, "orders.primary", WithInsecureTransport())
 	if err != nil {
 		t.Fatalf("New returned error: %v", err)
 	}
@@ -186,7 +187,7 @@ func TestClientNewAndAllocateTimestamps(t *testing.T) {
 func TestClientRefreshesStaleRouteAndRetries(t *testing.T) {
 	server, addr := startFakeChronosServer(t, true)
 
-	client, err := New(context.Background(), addr, "orders.primary")
+	client, err := NewWithOptions(context.Background(), addr, "orders.primary", WithInsecureTransport())
 	if err != nil {
 		t.Fatalf("New returned error: %v", err)
 	}
@@ -208,8 +209,8 @@ func TestClientRefreshesStaleRouteAndRetries(t *testing.T) {
 	if server.allocateCalls != 2 {
 		t.Fatalf("expected one failed allocate and one retry, got %d calls", server.allocateCalls)
 	}
-	if len(server.returnedRequest) != 2 || server.returnedRequest[0] == server.returnedRequest[1] {
-		t.Fatalf("expected unique request ids across retry, got %v", server.returnedRequest)
+	if len(server.returnedRequest) != 2 || server.returnedRequest[0] != server.returnedRequest[1] {
+		t.Fatalf("expected retry to reuse logical request id, got %v", server.returnedRequest)
 	}
 }
 
@@ -221,7 +222,7 @@ func TestClientAllocatesAgainstRouteOwnerEndpoint(t *testing.T) {
 	route.route.OwnerWorkerEndpoint = ownerAddr
 	routeAddr := startRouteOnlyServer(t, route)
 
-	client, err := New(context.Background(), routeAddr, "orders.primary")
+	client, err := NewWithOptions(context.Background(), routeAddr, "orders.primary", WithInsecureTransport())
 	if err != nil {
 		t.Fatalf("New returned error: %v", err)
 	}
@@ -320,8 +321,14 @@ func startTimestampOnlyServer(t *testing.T, server *fakeChronosServer) string {
 }
 
 func cloneRoute(route *tsov1.TimelineRoute) *tsov1.TimelineRoute {
-	copy := *route
-	return &copy
+	return &tsov1.TimelineRoute{
+		TimelineKey:         route.TimelineKey,
+		GeneratorId:         route.GeneratorId,
+		OwnerWorkerEndpoint: route.OwnerWorkerEndpoint,
+		Epoch:               route.Epoch,
+		RouteVersion:        route.RouteVersion,
+		ResourceTier:        route.ResourceTier,
+	}
 }
 
 func routeMismatchError() error {

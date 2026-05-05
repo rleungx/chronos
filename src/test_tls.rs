@@ -26,6 +26,10 @@ pub fn readable_test_tls_paths() -> (&'static str, &'static str, &'static str) {
     (cert.as_str(), key.as_str(), ca.as_str())
 }
 
+pub fn placeholder_client_cert_fingerprint() -> &'static str {
+    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+}
+
 pub fn required_grpc_tls_test_config(config: TsoConfig, timeout_ms: u64) -> TsoConfig {
     let (cert_path, key_path, ca_path) = readable_test_tls_paths();
     TsoConfig {
@@ -33,6 +37,10 @@ pub fn required_grpc_tls_test_config(config: TsoConfig, timeout_ms: u64) -> TsoC
         grpc_tls_cert_file: Some(cert_path.to_string()),
         grpc_tls_key_file: Some(key_path.to_string()),
         grpc_client_ca_file: Some(ca_path.to_string()),
+        grpc_control_cert_allowlist: vec![placeholder_client_cert_fingerprint().to_string()],
+        grpc_route_cert_allowlist: vec![placeholder_client_cert_fingerprint().to_string()],
+        grpc_timestamp_cert_allowlist: vec![placeholder_client_cert_fingerprint().to_string()],
+        grpc_status_cert_allowlist: vec![placeholder_client_cert_fingerprint().to_string()],
         grpc_request_timeout_ms: Some(timeout_ms),
         grpc_max_request_bytes: Some(1024),
         grpc_max_concurrent_requests: Some(16),

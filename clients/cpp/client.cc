@@ -1,5 +1,7 @@
 #include "client.h"
 
+#include <grpc/grpc_security_constants.h>
+
 using chronos::tso::v1::AllocateTimestampsRequest;
 using chronos::tso::v1::AllocateTimestampsResponse;
 using chronos::tso::v1::EnsureTimelineRequest;
@@ -12,9 +14,18 @@ using chronos::tso::v1::TimelineRouteService;
 using chronos::tso::v1::TimestampService;
 
 Client::Client(const std::string& addr, const std::string& timeline_key)
-    : route_channel_(grpc::CreateChannel(addr, grpc::InsecureChannelCredentials())),
-      route_stub_(TimelineRouteService::NewStub(route_channel_)),
-      timeline_key_(timeline_key) {
+    : Client(addr, timeline_key, TransportConfig{}) {}
+
+Client::Client(
+    const std::string& addr,
+    const std::string& timeline_key,
+    TransportConfig transport_config)
+    : route_channel_(nullptr),
+      route_stub_(nullptr),
+      timeline_key_(timeline_key),
+      transport_config_(std::move(transport_config)) {
+  route_channel_ = CreateChannel(addr);
+  route_stub_ = TimelineRouteService::NewStub(route_channel_);
   EnsureRoute();
 }
 
@@ -26,7 +37,8 @@ std::vector<chronos::tso::v1::TimestampRange> Client::AllocateTimestamps(uint32_
     tso_stub = tso_stub_;
   }
   AllocateTimestampsResponse response;
-  auto status = AllocateOnce(*tso_stub, route, &response, count);
+  const auto client_request_id = NextClientRequestId(route.timeline_key());
+  auto status = AllocateOnce(*tso_stub, route, &response, count, client_request_id);
   if (status.ok()) {
     return {response.ranges().begin(), response.ranges().end()};
   }
@@ -38,7 +50,7 @@ std::vector<chronos::tso::v1::TimestampRange> Client::AllocateTimestamps(uint32_
     route = RefreshRouteLocked();
     tso_stub = tso_stub_;
   }
-  status = AllocateOnce(*tso_stub, route, &response, count);
+  status = AllocateOnce(*tso_stub, route, &response, count, client_request_id);
   if (!status.ok()) {
     throw std::runtime_error(status.error_message());
   }
@@ -77,7 +89,7 @@ TimelineRoute Client::RefreshRouteLocked() {
     throw std::runtime_error(status.error_message());
   }
   auto route = response.route();
-  tso_channel_ = grpc::CreateChannel(route.owner_worker_endpoint(), grpc::InsecureChannelCredentials());
+  tso_channel_ = CreateChannel(route.owner_worker_endpoint());
   tso_stub_ = std::shared_ptr<TimestampService::Stub>(TimestampService::NewStub(tso_channel_).release());
   cache_[timeline_key_] = route;
   return route;
@@ -87,15 +99,20 @@ grpc::Status Client::AllocateOnce(
     TimestampService::Stub& tso_stub,
     const TimelineRoute& route,
     AllocateTimestampsResponse* response,
-    uint32_t count) {
+    uint32_t count,
+    const std::string& client_request_id) {
   grpc::ClientContext ctx;
   AllocateTimestampsRequest request;
   request.set_timeline_key(route.timeline_key());
   request.set_count(count);
   request.set_expected_epoch(route.epoch());
   request.set_expected_route_version(route.route_version());
-  request.set_client_request_id(route.timeline_key() + "-" + std::to_string(request_id_++));
+  request.set_client_request_id(client_request_id);
   return tso_stub.AllocateTimestamps(&ctx, request, response);
+}
+
+std::string Client::NextClientRequestId(const std::string& timeline_key) {
+  return timeline_key + "-" + std::to_string(request_id_++);
 }
 
 bool Client::IsStaleRouteError(const grpc::Status& status) {
@@ -109,4 +126,32 @@ bool Client::IsStaleRouteError(const grpc::Status& status) {
   return detail.code() == ErrorCode::ERROR_CODE_NOT_TIMELINE_OWNER ||
          detail.code() == ErrorCode::ERROR_CODE_ROUTE_VERSION_MISMATCH ||
          detail.code() == ErrorCode::ERROR_CODE_EPOCH_MISMATCH;
+}
+
+std::shared_ptr<grpc::ChannelCredentials> Client::CreateChannelCredentials() const {
+  if (transport_config_.insecure) {
+    return grpc::InsecureChannelCredentials();
+  }
+
+  const bool has_private_key = !transport_config_.pem_private_key.empty();
+  const bool has_cert_chain = !transport_config_.pem_cert_chain.empty();
+  if (has_private_key != has_cert_chain) {
+    throw std::invalid_argument(
+        "Chronos TLS client certificate and private key must be configured together");
+  }
+
+  grpc::SslCredentialsOptions options;
+  options.pem_root_certs = transport_config_.pem_root_certs;
+  options.pem_private_key = transport_config_.pem_private_key;
+  options.pem_cert_chain = transport_config_.pem_cert_chain;
+  return grpc::SslCredentials(options);
+}
+
+std::shared_ptr<grpc::Channel> Client::CreateChannel(const std::string& endpoint) const {
+  grpc::ChannelArguments arguments;
+  if (!transport_config_.ssl_target_name_override.empty()) {
+    arguments.SetString(
+        GRPC_SSL_TARGET_NAME_OVERRIDE_ARG, transport_config_.ssl_target_name_override);
+  }
+  return grpc::CreateCustomChannel(endpoint, CreateChannelCredentials(), arguments);
 }

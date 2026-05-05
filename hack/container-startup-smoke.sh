@@ -6,12 +6,14 @@ READY_TIMEOUT_SECS="${CHRONOS_CONTAINER_SMOKE_READY_TIMEOUT_SECS:-15}"
 POLL_INTERVAL_SECS="${CHRONOS_CONTAINER_SMOKE_POLL_INTERVAL_SECS:-1}"
 CONTAINER_NAME="chronos-container-smoke-$$"
 TMPDIR="$(mktemp -d)"
+TLS_VOLUME="chronos-container-smoke-tls-$$"
 MODE="${CHRONOS_CONTAINER_SMOKE_MODE:-memory}"
 PREFIX="/chronos-container-smoke-$$"
 STARTED_ETCD=0
 
 cleanup() {
   docker rm -f "${CONTAINER_NAME}" >/dev/null 2>&1 || true
+  docker volume rm -f "${TLS_VOLUME}" >/dev/null 2>&1 || true
   if [[ "${MODE}" == "etcd" ]]; then
     docker exec chronos-etcd /usr/local/bin/etcdctl --endpoints=http://127.0.0.1:2379 del --prefix "${PREFIX}" >/dev/null 2>&1 || true
     if [[ "${STARTED_ETCD}" == "1" ]]; then
@@ -73,10 +75,21 @@ openssl x509 -req -days 1 \
   -extfile "${TMPDIR}/openssl.cnf" \
   -extensions client_ext >/dev/null 2>&1
 
+docker volume create "${TLS_VOLUME}" >/dev/null
+docker run --rm \
+  --user 0 \
+  --entrypoint /bin/sh \
+  -v "${TMPDIR}:/input:ro" \
+  -v "${TLS_VOLUME}:/tls" \
+  "${IMAGE}" \
+  -ec 'cp -R /input/. /tls/ && chown -R 10001:10001 /tls && chmod 0644 /tls/* && chmod 0600 /tls/server.key /tls/ca.key && chmod 0644 /tls/client.key'
+
+CLIENT_CERT_FINGERPRINT="$(openssl x509 -in "${TMPDIR}/client.pem" -noout -fingerprint -sha256 | cut -d= -f2 | tr -d ':')"
+
 docker_run_args=(
   -d
   --name "${CONTAINER_NAME}"
-  -v "${TMPDIR}:/tls:ro"
+  -v "${TLS_VOLUME}:/tls:ro"
   -e CHRONOS_SECURITY_MODE=required
   -e CHRONOS_BIND_ADDR=0.0.0.0:50051
   -e CHRONOS_ADVERTISE_ENDPOINT=10.0.0.10:50051
@@ -84,6 +97,10 @@ docker_run_args=(
   -e CHRONOS_GRPC_TLS_CERT_FILE=/tls/server.pem
   -e CHRONOS_GRPC_TLS_KEY_FILE=/tls/server.key
   -e CHRONOS_GRPC_CLIENT_CA_FILE=/tls/ca.pem
+  -e CHRONOS_GRPC_CONTROL_CERT_ALLOWLIST="${CLIENT_CERT_FINGERPRINT}"
+  -e CHRONOS_GRPC_ROUTE_CERT_ALLOWLIST="${CLIENT_CERT_FINGERPRINT}"
+  -e CHRONOS_GRPC_TIMESTAMP_CERT_ALLOWLIST="${CLIENT_CERT_FINGERPRINT}"
+  -e CHRONOS_GRPC_STATUS_CERT_ALLOWLIST="${CLIENT_CERT_FINGERPRINT}"
   -e CHRONOS_METRICS_TLS_CERT_FILE=/tls/server.pem
   -e CHRONOS_METRICS_TLS_KEY_FILE=/tls/server.key
   -e CHRONOS_METRICS_CLIENT_CA_FILE=/tls/ca.pem
@@ -123,6 +140,9 @@ docker run "${docker_run_args[@]}" "${IMAGE}" >/dev/null
 sleep 1
 if ! docker ps --format '{{.Names}}' | grep -qx "${CONTAINER_NAME}"; then
   echo "container exited before readiness probe" >&2
+  docker inspect \
+    --format 'exit_code={{.State.ExitCode}} oom_killed={{.State.OOMKilled}} error={{.State.Error}}' \
+    "${CONTAINER_NAME}" >&2 || true
   docker logs "${CONTAINER_NAME}" >&2 || true
   exit 1
 fi
@@ -140,7 +160,7 @@ else
   GRPC_TARGET="127.0.0.1:50051"
   READY_URL="https://127.0.0.1:9898/readyz"
   METRICS_URL="https://127.0.0.1:9898/metrics"
-  CURL_BASE=(docker run --rm --network "container:${CONTAINER_NAME}" -v "${TMPDIR}:/tls:ro" curlimages/curl:8.14.1 --silent --show-error --max-time 2 --cacert /tls/ca.pem --cert /tls/client.pem --key /tls/client.key)
+  CURL_BASE=(docker run --rm --network "container:${CONTAINER_NAME}" -v "${TLS_VOLUME}:/tls:ro" curlimages/curl:8.14.1 --silent --show-error --max-time 2 --cacert /tls/ca.pem --cert /tls/client.pem --key /tls/client.key)
 fi
 
 grpc_reachable() {

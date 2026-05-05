@@ -7,7 +7,11 @@ use crate::plane::RequestCancellation;
 use std::time::Instant;
 use tokio::sync::Mutex;
 
-use crate::metadata::TimelineRecord;
+use crate::metadata::{
+    AllocationRequestFingerprint, AllocationResponseRecord, RequestRecord, RequestRecordState,
+    TimelineRecord,
+};
+use crate::recovery::record_recovery_event;
 use crate::timeline_state::build_timeline_state;
 use crate::{
     metrics, AllocateTimestampsRequest, AllocateTimestampsResponse, ResourceTier,
@@ -15,6 +19,17 @@ use crate::{
 };
 
 use super::TsoService;
+
+struct PendingIdempotentAllocation {
+    revision: u64,
+    fingerprint: AllocationRequestFingerprint,
+}
+
+enum IdempotentAllocationPreparation {
+    Disabled,
+    Replay(AllocateTimestampsResponse),
+    Pending(PendingIdempotentAllocation),
+}
 
 impl TsoService {
     fn validate_batch_for_route(&self, count: u32, route: &TimelineRoute) -> Result<(), TsoError> {
@@ -252,6 +267,23 @@ impl TsoService {
             });
         }
 
+        let idempotency = self.prepare_idempotent_allocation(&request).await?;
+        if let IdempotentAllocationPreparation::Replay(response) = idempotency {
+            return Ok(response);
+        }
+
+        let response = self
+            .allocate_timestamps_after_validation(request.clone(), cancellation)
+            .await;
+        self.finish_idempotent_allocation(&request, idempotency, response)
+            .await
+    }
+
+    async fn allocate_timestamps_after_validation(
+        &self,
+        request: AllocateTimestampsRequest,
+        cancellation: Option<RequestCancellation>,
+    ) -> Result<AllocateTimestampsResponse, TsoError> {
         loop {
             self.reject_new_work_if_shutting_down()?;
             Self::check_request_cancellation(cancellation.as_ref())?;
@@ -368,16 +400,311 @@ impl TsoService {
             }
         }
     }
+
+    fn idempotency_enabled(request: &AllocateTimestampsRequest) -> bool {
+        !request.client_request_id.trim().is_empty()
+    }
+
+    fn allocation_request_fingerprint(
+        request: &AllocateTimestampsRequest,
+    ) -> AllocationRequestFingerprint {
+        AllocationRequestFingerprint {
+            count: request.count,
+        }
+    }
+
+    fn pending_request_record(
+        fingerprint: AllocationRequestFingerprint,
+        updated_at_ms: u64,
+    ) -> RequestRecord {
+        RequestRecord {
+            schema_version: 1,
+            fingerprint,
+            state: RequestRecordState::Pending,
+            response: None,
+            updated_at_ms,
+        }
+    }
+
+    fn completed_request_record(
+        fingerprint: AllocationRequestFingerprint,
+        response: &AllocateTimestampsResponse,
+        updated_at_ms: u64,
+    ) -> RequestRecord {
+        RequestRecord {
+            schema_version: 1,
+            fingerprint,
+            state: RequestRecordState::Completed,
+            response: Some(AllocationResponseRecord {
+                generator_id: response.generator_id,
+                epoch: response.epoch,
+                route_version: response.route_version,
+                ranges: response.ranges.clone(),
+            }),
+            updated_at_ms,
+        }
+    }
+
+    fn record_idempotency_outcome(outcome: &'static str) {
+        metrics::TSO_REQUEST_IDEMPOTENCY_TOTAL
+            .with_label_values(&[outcome])
+            .inc();
+    }
+
+    fn pending_record_is_stale(&self, record: &RequestRecord, now_ms: u64) -> bool {
+        record.state == RequestRecordState::Pending
+            && now_ms.saturating_sub(record.updated_at_ms)
+                >= self.config.request_record_pending_timeout_ms
+    }
+
+    fn validate_idempotent_record_fingerprint(
+        request: &AllocateTimestampsRequest,
+        record: &RequestRecord,
+    ) -> Result<(), TsoError> {
+        if record.fingerprint == Self::allocation_request_fingerprint(request) {
+            return Ok(());
+        }
+
+        Self::record_idempotency_outcome("conflict");
+        Err(TsoError::ClientRequestConflict {
+            timeline_key: request.timeline_key.clone(),
+            client_request_id: request.client_request_id.clone(),
+        })
+    }
+
+    async fn prepare_idempotent_allocation(
+        &self,
+        request: &AllocateTimestampsRequest,
+    ) -> Result<IdempotentAllocationPreparation, TsoError> {
+        if !Self::idempotency_enabled(request) {
+            Self::record_idempotency_outcome("disabled");
+            return Ok(IdempotentAllocationPreparation::Disabled);
+        }
+        let Some(request_records) = self.metadata.request_records() else {
+            Self::record_idempotency_outcome("unsupported");
+            return Ok(IdempotentAllocationPreparation::Disabled);
+        };
+
+        let fingerprint = Self::allocation_request_fingerprint(request);
+        loop {
+            let now_ms = self.clock.now_ms();
+            let pending_record = Self::pending_request_record(fingerprint.clone(), now_ms);
+            match request_records
+                .create_request_record(
+                    &request.timeline_key,
+                    &request.client_request_id,
+                    &pending_record,
+                )
+                .await
+            {
+                Ok(revision) => {
+                    Self::record_idempotency_outcome("pending_created");
+                    return Ok(IdempotentAllocationPreparation::Pending(
+                        PendingIdempotentAllocation {
+                            revision,
+                            fingerprint,
+                        },
+                    ));
+                }
+                Err(TsoError::MetadataAlreadyExists) => {}
+                Err(error) => {
+                    Self::record_idempotency_outcome("prepare_error");
+                    return Err(error);
+                }
+            }
+
+            let Some((record, revision)) = request_records
+                .load_request_record(&request.timeline_key, &request.client_request_id)
+                .await?
+            else {
+                continue;
+            };
+            Self::validate_idempotent_record_fingerprint(request, &record)?;
+
+            if let Some(response) = record.completed_response(&request.timeline_key)? {
+                Self::record_idempotency_outcome("replay");
+                return Ok(IdempotentAllocationPreparation::Replay(response));
+            }
+
+            if self.pending_record_is_stale(&record, now_ms) {
+                match request_records
+                    .compare_delete_request_record(
+                        &request.timeline_key,
+                        &request.client_request_id,
+                        revision,
+                    )
+                    .await
+                {
+                    Ok(()) => {
+                        Self::record_idempotency_outcome("stale_pending_deleted");
+                        continue;
+                    }
+                    Err(TsoError::CasFailed) | Err(TsoError::TimelineNotFound { .. }) => {
+                        continue;
+                    }
+                    Err(error) => {
+                        Self::record_idempotency_outcome("stale_pending_delete_error");
+                        return Err(error);
+                    }
+                }
+            }
+
+            Self::record_idempotency_outcome("pending_in_progress");
+            return Err(TsoError::ClientRequestInProgress {
+                timeline_key: request.timeline_key.clone(),
+                client_request_id: request.client_request_id.clone(),
+            });
+        }
+    }
+
+    async fn finish_idempotent_allocation(
+        &self,
+        request: &AllocateTimestampsRequest,
+        preparation: IdempotentAllocationPreparation,
+        allocation_result: Result<AllocateTimestampsResponse, TsoError>,
+    ) -> Result<AllocateTimestampsResponse, TsoError> {
+        let IdempotentAllocationPreparation::Pending(pending) = preparation else {
+            return allocation_result;
+        };
+        let Some(request_records) = self.metadata.request_records() else {
+            return allocation_result;
+        };
+
+        let response = match allocation_result {
+            Ok(response) => response,
+            Err(error) => {
+                if request_records
+                    .compare_delete_request_record(
+                        &request.timeline_key,
+                        &request.client_request_id,
+                        pending.revision,
+                    )
+                    .await
+                    .is_err()
+                {
+                    record_recovery_event(
+                        "service",
+                        "request_record_pending_cleanup",
+                        "metadata_error",
+                    );
+                    Self::record_idempotency_outcome("pending_cleanup_error");
+                } else {
+                    Self::record_idempotency_outcome("pending_cleaned");
+                }
+                return Err(error);
+            }
+        };
+
+        let completed_record = Self::completed_request_record(
+            pending.fingerprint.clone(),
+            &response,
+            self.clock.now_ms(),
+        );
+
+        match request_records
+            .compare_exchange_request_record(
+                &request.timeline_key,
+                &request.client_request_id,
+                pending.revision,
+                &completed_record,
+            )
+            .await
+        {
+            Ok(_) => {
+                Self::record_idempotency_outcome("completed");
+                Ok(response)
+            }
+            Err(TsoError::CasFailed) | Err(TsoError::TimelineNotFound { .. }) => {
+                self.recover_idempotent_completion_after_cas_failure(
+                    request,
+                    completed_record,
+                    response,
+                )
+                .await
+            }
+            Err(error) => {
+                Self::record_idempotency_outcome("complete_error");
+                record_recovery_event("service", "request_record_complete", "metadata_error");
+                Err(error)
+            }
+        }
+    }
+
+    async fn recover_idempotent_completion_after_cas_failure(
+        &self,
+        request: &AllocateTimestampsRequest,
+        completed_record: RequestRecord,
+        response: AllocateTimestampsResponse,
+    ) -> Result<AllocateTimestampsResponse, TsoError> {
+        let Some(request_records) = self.metadata.request_records() else {
+            return Ok(response);
+        };
+
+        match request_records
+            .load_request_record(&request.timeline_key, &request.client_request_id)
+            .await?
+        {
+            Some((record, revision)) => {
+                Self::validate_idempotent_record_fingerprint(request, &record)?;
+                if let Some(existing_response) = record.completed_response(&request.timeline_key)? {
+                    Self::record_idempotency_outcome("complete_race_replay");
+                    return Ok(existing_response);
+                }
+                match request_records
+                    .compare_exchange_request_record(
+                        &request.timeline_key,
+                        &request.client_request_id,
+                        revision,
+                        &completed_record,
+                    )
+                    .await
+                {
+                    Ok(_) => {
+                        Self::record_idempotency_outcome("complete_race_repaired");
+                        Ok(response)
+                    }
+                    Err(TsoError::CasFailed) => {
+                        Self::record_idempotency_outcome("complete_race_lost");
+                        Err(TsoError::ClientRequestInProgress {
+                            timeline_key: request.timeline_key.clone(),
+                            client_request_id: request.client_request_id.clone(),
+                        })
+                    }
+                    Err(error) => {
+                        Self::record_idempotency_outcome("complete_repair_error");
+                        Err(error)
+                    }
+                }
+            }
+            None => match request_records
+                .create_request_record(
+                    &request.timeline_key,
+                    &request.client_request_id,
+                    &completed_record,
+                )
+                .await
+            {
+                Ok(_) => {
+                    Self::record_idempotency_outcome("complete_missing_recreated");
+                    Ok(response)
+                }
+                Err(TsoError::MetadataAlreadyExists) => Err(TsoError::ClientRequestInProgress {
+                    timeline_key: request.timeline_key.clone(),
+                    client_request_id: request.client_request_id.clone(),
+                }),
+                Err(error) => {
+                    Self::record_idempotency_outcome("complete_recreate_error");
+                    Err(error)
+                }
+            },
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
-    use std::sync::OnceLock;
-
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
 
     use async_trait::async_trait;
     use tokio::sync::{broadcast, mpsc, oneshot};
@@ -385,13 +712,14 @@ mod tests {
 
     use super::serve::{AllocationPath, CachedServeGuardOptions};
     use crate::metadata::{
-        ControlPlaneStore, GeneratorBatchOp, GeneratorLeaseAuthority, GeneratorRecord,
-        MemoryMetadataStore, RouteUpdateSource, TimelineAuthority, TimelineBatchOp, TimelineRecord,
+        AllocationRequestFingerprint, ControlPlaneStore, GeneratorBatchOp, GeneratorLeaseAuthority,
+        GeneratorRecord, MemoryMetadataStore, RequestRecord, RequestRecordAuthority,
+        RequestRecordState, RouteUpdateSource, TimelineAuthority, TimelineBatchOp, TimelineRecord,
     };
     use crate::plane::RequestCancellation;
     use crate::{
         AllocateTimestampsRequest, Clock, ManualClock, ResourceTier, TimelineLifecycleState,
-        TsoConfig, TsoError, TsoSecurityMode, TsoService, MAX_GENERATORS,
+        TsoConfig, TsoError, TsoService, MAX_GENERATORS,
     };
 
     #[derive(Clone)]
@@ -764,46 +1092,449 @@ mod tests {
     #[async_trait]
     impl ControlPlaneStore for SilentRouteUpdateStore {}
 
-    fn required_test_config(config: TsoConfig) -> TsoConfig {
-        let (cert_path, key_path, ca_path) = readable_test_tls_paths();
-        TsoConfig {
-            security_mode: Some(TsoSecurityMode::Required),
-            grpc_tls_cert_file: Some(cert_path.to_string()),
-            grpc_tls_key_file: Some(key_path.to_string()),
-            grpc_client_ca_file: Some(ca_path.to_string()),
-            grpc_request_timeout_ms: Some(100),
-            grpc_max_request_bytes: Some(1024),
-            grpc_max_concurrent_requests: Some(16),
-            ..config
+    #[derive(Clone)]
+    struct RequestRecordCasFailureStore {
+        inner: Arc<MemoryMetadataStore>,
+        fail_next_request_cas: Arc<AtomicBool>,
+        complete_next_request_cas_then_report_cas_failed: Arc<AtomicBool>,
+    }
+
+    impl RequestRecordCasFailureStore {
+        fn new(inner: Arc<MemoryMetadataStore>) -> Self {
+            Self {
+                inner,
+                fail_next_request_cas: Arc::new(AtomicBool::new(false)),
+                complete_next_request_cas_then_report_cas_failed: Arc::new(AtomicBool::new(false)),
+            }
+        }
+
+        fn fail_next_request_cas(&self) {
+            self.fail_next_request_cas.store(true, Ordering::Release);
+        }
+
+        fn complete_next_request_cas_then_report_cas_failed(&self) {
+            self.complete_next_request_cas_then_report_cas_failed
+                .store(true, Ordering::Release);
         }
     }
 
-    fn readable_test_tls_paths() -> (&'static str, &'static str, &'static str) {
-        static PATHS: OnceLock<(String, String, String)> = OnceLock::new();
-        let (cert, key, ca) = PATHS.get_or_init(|| {
-            let dir = std::env::temp_dir().join("chronos-service-allocation-test-tls");
-            std::fs::create_dir_all(&dir).unwrap();
-            let cert = dir.join("server.crt");
-            let key = dir.join("server.key");
-            let ca = dir.join("ca.pem");
-            std::fs::write(&cert, b"allocation-test-cert").unwrap();
-            std::fs::write(&key, b"allocation-test-key").unwrap();
-            std::fs::write(&ca, b"allocation-test-ca").unwrap();
-            #[cfg(unix)]
-            std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
-            (
-                cert.to_string_lossy().into_owned(),
-                key.to_string_lossy().into_owned(),
-                ca.to_string_lossy().into_owned(),
-            )
-        });
-        (cert.as_str(), key.as_str(), ca.as_str())
+    #[async_trait]
+    impl TimelineAuthority for RequestRecordCasFailureStore {
+        async fn load_timeline(
+            &self,
+            timeline_key: &str,
+        ) -> Result<Option<(TimelineRecord, u64)>, TsoError> {
+            self.inner.load_timeline(timeline_key).await
+        }
+
+        async fn list_timelines(&self) -> Result<Vec<TimelineRecord>, TsoError> {
+            self.inner.list_timelines().await
+        }
+
+        async fn create_timeline(
+            &self,
+            timeline_key: &str,
+            record: &TimelineRecord,
+        ) -> Result<u64, TsoError> {
+            self.inner.create_timeline(timeline_key, record).await
+        }
+
+        async fn compare_exchange_timeline(
+            &self,
+            timeline_key: &str,
+            expected_revision: u64,
+            record: &TimelineRecord,
+        ) -> Result<u64, TsoError> {
+            self.inner
+                .compare_exchange_timeline(timeline_key, expected_revision, record)
+                .await
+        }
+
+        async fn compare_exchange_timelines(
+            &self,
+            operations: &[TimelineBatchOp],
+        ) -> Result<Vec<u64>, TsoError> {
+            self.inner.compare_exchange_timelines(operations).await
+        }
+    }
+
+    #[async_trait]
+    impl GeneratorLeaseAuthority for RequestRecordCasFailureStore {
+        async fn load_generator(
+            &self,
+            generator_id: u32,
+        ) -> Result<Option<(GeneratorRecord, u64)>, TsoError> {
+            self.inner.load_generator(generator_id).await
+        }
+
+        async fn create_generator(
+            &self,
+            generator_id: u32,
+            record: &GeneratorRecord,
+        ) -> Result<u64, TsoError> {
+            self.inner.create_generator(generator_id, record).await
+        }
+
+        async fn compare_exchange_generator(
+            &self,
+            generator_id: u32,
+            expected_revision: u64,
+            record: &GeneratorRecord,
+        ) -> Result<u64, TsoError> {
+            self.inner
+                .compare_exchange_generator(generator_id, expected_revision, record)
+                .await
+        }
+
+        async fn compare_exchange_generators(
+            &self,
+            operations: &[GeneratorBatchOp],
+        ) -> Result<Vec<u64>, TsoError> {
+            self.inner.compare_exchange_generators(operations).await
+        }
+    }
+
+    #[async_trait]
+    impl RequestRecordAuthority for RequestRecordCasFailureStore {
+        async fn load_request_record(
+            &self,
+            timeline_key: &str,
+            client_request_id: &str,
+        ) -> Result<Option<(RequestRecord, u64)>, TsoError> {
+            self.inner
+                .load_request_record(timeline_key, client_request_id)
+                .await
+        }
+
+        async fn create_request_record(
+            &self,
+            timeline_key: &str,
+            client_request_id: &str,
+            record: &RequestRecord,
+        ) -> Result<u64, TsoError> {
+            self.inner
+                .create_request_record(timeline_key, client_request_id, record)
+                .await
+        }
+
+        async fn compare_exchange_request_record(
+            &self,
+            timeline_key: &str,
+            client_request_id: &str,
+            expected_revision: u64,
+            record: &RequestRecord,
+        ) -> Result<u64, TsoError> {
+            if self.fail_next_request_cas.swap(false, Ordering::AcqRel) {
+                return Err(TsoError::Internal(
+                    "injected request record CAS failure".to_string(),
+                ));
+            }
+            if self
+                .complete_next_request_cas_then_report_cas_failed
+                .swap(false, Ordering::AcqRel)
+            {
+                self.inner
+                    .compare_exchange_request_record(
+                        timeline_key,
+                        client_request_id,
+                        expected_revision,
+                        record,
+                    )
+                    .await?;
+                return Err(TsoError::CasFailed);
+            }
+            self.inner
+                .compare_exchange_request_record(
+                    timeline_key,
+                    client_request_id,
+                    expected_revision,
+                    record,
+                )
+                .await
+        }
+
+        async fn compare_delete_request_record(
+            &self,
+            timeline_key: &str,
+            client_request_id: &str,
+            expected_revision: u64,
+        ) -> Result<(), TsoError> {
+            self.inner
+                .compare_delete_request_record(timeline_key, client_request_id, expected_revision)
+                .await
+        }
+
+        async fn prune_completed_request_records(
+            &self,
+            older_than_ms: u64,
+            limit: usize,
+        ) -> Result<usize, TsoError> {
+            self.inner
+                .prune_completed_request_records(older_than_ms, limit)
+                .await
+        }
+    }
+
+    impl RouteUpdateSource for RequestRecordCasFailureStore {
+        fn subscribe_route_updates(
+            &self,
+        ) -> broadcast::Receiver<crate::metadata::RouteUpdateSignal> {
+            self.inner.subscribe_route_updates()
+        }
+    }
+
+    #[async_trait]
+    impl ControlPlaneStore for RequestRecordCasFailureStore {
+        fn request_records(&self) -> Option<&dyn RequestRecordAuthority> {
+            Some(self)
+        }
+    }
+
+    fn required_test_config(config: TsoConfig) -> TsoConfig {
+        crate::test_tls::required_grpc_tls_test_config(config, 100)
     }
 
     fn with_worker(mut config: TsoConfig, worker_id: &str) -> TsoConfig {
         config.worker_id = worker_id.to_owned();
         config.advertise_endpoint = format!("{worker_id}:50051");
         required_test_config(config)
+    }
+
+    #[tokio::test]
+    async fn repeated_client_request_id_returns_recorded_allocation_response() {
+        let clock = Arc::new(ManualClock::new(21_000));
+        let metadata = Arc::new(MemoryMetadataStore::new());
+        let service =
+            TsoService::new(required_test_config(TsoConfig::default()), clock, metadata).unwrap();
+        let route = service
+            .ensure_timeline("allocation.idempotent")
+            .await
+            .unwrap();
+        let request = AllocateTimestampsRequest {
+            timeline_key: route.timeline_key.clone(),
+            count: 2,
+            expected_epoch: route.epoch,
+            expected_route_version: route.route_version,
+            client_request_id: "same-logical-request".to_string(),
+        };
+
+        let first = service.allocate_timestamps(request.clone()).await.unwrap();
+        let second = service.allocate_timestamps(request).await.unwrap();
+
+        assert_eq!(second, first);
+    }
+
+    #[tokio::test]
+    async fn repeated_client_request_id_with_different_fingerprint_is_rejected() {
+        let clock = Arc::new(ManualClock::new(21_500));
+        let metadata = Arc::new(MemoryMetadataStore::new());
+        let service =
+            TsoService::new(required_test_config(TsoConfig::default()), clock, metadata).unwrap();
+        let route = service
+            .ensure_timeline("allocation.idempotent.conflict")
+            .await
+            .unwrap();
+
+        service
+            .allocate_timestamps(AllocateTimestampsRequest {
+                timeline_key: route.timeline_key.clone(),
+                count: 1,
+                expected_epoch: route.epoch,
+                expected_route_version: route.route_version,
+                client_request_id: "conflicting-logical-request".to_string(),
+            })
+            .await
+            .unwrap();
+        let conflict = service
+            .allocate_timestamps(AllocateTimestampsRequest {
+                timeline_key: route.timeline_key.clone(),
+                count: 2,
+                expected_epoch: route.epoch,
+                expected_route_version: route.route_version,
+                client_request_id: "conflicting-logical-request".to_string(),
+            })
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            conflict,
+            TsoError::ClientRequestConflict { timeline_key, .. }
+                if timeline_key == route.timeline_key
+        ));
+    }
+
+    #[tokio::test]
+    async fn pending_client_request_id_is_rejected_until_timeout() {
+        let clock = Arc::new(ManualClock::new(21_800));
+        let metadata = Arc::new(MemoryMetadataStore::new());
+        let service = TsoService::new(
+            required_test_config(TsoConfig {
+                request_record_pending_timeout_ms: 100,
+                request_record_retention_ms: 1_000,
+                ..TsoConfig::default()
+            }),
+            clock.clone(),
+            metadata.clone(),
+        )
+        .unwrap();
+        let route = service
+            .ensure_timeline("allocation.idempotent.pending")
+            .await
+            .unwrap();
+        metadata
+            .create_request_record(
+                &route.timeline_key,
+                "pending-logical-request",
+                &RequestRecord {
+                    schema_version: 1,
+                    fingerprint: AllocationRequestFingerprint { count: 1 },
+                    state: RequestRecordState::Pending,
+                    response: None,
+                    updated_at_ms: clock.now_ms(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let pending = service
+            .allocate_timestamps(AllocateTimestampsRequest {
+                timeline_key: route.timeline_key.clone(),
+                count: 1,
+                expected_epoch: route.epoch,
+                expected_route_version: route.route_version,
+                client_request_id: "pending-logical-request".to_string(),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            pending,
+            TsoError::ClientRequestInProgress { timeline_key, .. }
+                if timeline_key == route.timeline_key
+        ));
+
+        clock.advance(101);
+        let recovered = service
+            .allocate_timestamps(AllocateTimestampsRequest {
+                timeline_key: route.timeline_key.clone(),
+                count: 1,
+                expected_epoch: route.epoch,
+                expected_route_version: route.route_version,
+                client_request_id: "pending-logical-request".to_string(),
+            })
+            .await
+            .unwrap();
+        let replayed = service
+            .allocate_timestamps(AllocateTimestampsRequest {
+                timeline_key: route.timeline_key.clone(),
+                count: 1,
+                expected_epoch: route.epoch,
+                expected_route_version: route.route_version,
+                client_request_id: "pending-logical-request".to_string(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(replayed, recovered);
+    }
+
+    #[tokio::test]
+    async fn idempotent_allocation_fails_closed_when_completion_record_cannot_be_persisted() {
+        let clock = Arc::new(ManualClock::new(21_900));
+        let inner = Arc::new(MemoryMetadataStore::new());
+        let metadata = Arc::new(RequestRecordCasFailureStore::new(inner.clone()));
+        let service = TsoService::new(
+            required_test_config(TsoConfig {
+                request_record_pending_timeout_ms: 1_000,
+                request_record_retention_ms: 5_000,
+                ..TsoConfig::default()
+            }),
+            clock,
+            metadata.clone(),
+        )
+        .unwrap();
+        let route = service
+            .ensure_timeline("allocation.idempotent.completion-cas-failure")
+            .await
+            .unwrap();
+        let request = AllocateTimestampsRequest {
+            timeline_key: route.timeline_key.clone(),
+            count: 1,
+            expected_epoch: route.epoch,
+            expected_route_version: route.route_version,
+            client_request_id: "completion-cas-failure".to_string(),
+        };
+
+        metadata.fail_next_request_cas();
+        let error = service
+            .allocate_timestamps(request.clone())
+            .await
+            .expect_err("allocation must not return a response that was not recorded");
+        assert!(matches!(
+            error,
+            TsoError::Internal(message)
+                if message.contains("injected request record CAS failure")
+        ));
+
+        let (record, _) = inner
+            .load_request_record(&route.timeline_key, &request.client_request_id)
+            .await
+            .unwrap()
+            .expect("failed completion should leave the request pending");
+        assert_eq!(record.state, RequestRecordState::Pending);
+        assert!(record.response.is_none());
+
+        let retry_error = service
+            .allocate_timestamps(request)
+            .await
+            .expect_err("pending request should fail closed until the pending timeout");
+        assert!(matches!(
+            retry_error,
+            TsoError::ClientRequestInProgress { timeline_key, .. }
+                if timeline_key == route.timeline_key
+        ));
+    }
+
+    #[tokio::test]
+    async fn idempotent_completion_replays_recorded_response_after_cas_race() {
+        let clock = Arc::new(ManualClock::new(21_950));
+        let inner = Arc::new(MemoryMetadataStore::new());
+        let metadata = Arc::new(RequestRecordCasFailureStore::new(inner.clone()));
+        let service = TsoService::new(
+            required_test_config(TsoConfig::default()),
+            clock,
+            metadata.clone(),
+        )
+        .unwrap();
+        let route = service
+            .ensure_timeline("allocation.idempotent.completion-cas-race")
+            .await
+            .unwrap();
+        let request = AllocateTimestampsRequest {
+            timeline_key: route.timeline_key.clone(),
+            count: 2,
+            expected_epoch: route.epoch,
+            expected_route_version: route.route_version,
+            client_request_id: "completion-cas-race".to_string(),
+        };
+
+        metadata.complete_next_request_cas_then_report_cas_failed();
+        let response = service.allocate_timestamps(request.clone()).await.unwrap();
+        let replayed = service.allocate_timestamps(request.clone()).await.unwrap();
+
+        assert_eq!(replayed, response);
+        let (record, _) = inner
+            .load_request_record(&route.timeline_key, &request.client_request_id)
+            .await
+            .unwrap()
+            .expect("CAS race should leave a completed request record");
+        assert_eq!(record.state, RequestRecordState::Completed);
+        assert_eq!(
+            record
+                .completed_response(&route.timeline_key)
+                .unwrap()
+                .as_ref(),
+            Some(&response)
+        );
     }
 
     #[tokio::test]

@@ -1,9 +1,12 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use tokio::sync::broadcast;
 
-use crate::{TimelineLifecycleState, TimelineRoute, TsoError};
+use crate::{
+    AllocateTimestampsResponse, TimelineLifecycleState, TimelineRoute, TimestampRange, TsoError,
+};
 
 pub const CURRENT_METADATA_SCHEMA_VERSION: u32 = 1;
 
@@ -62,6 +65,37 @@ pub struct GeneratorRecord {
     pub lease_expire_at_ms: Option<u64>,
     pub last_issued_tso: Option<u64>,
     pub issued_upper_bound: Option<u64>,
+    #[serde(default)]
+    pub updated_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RequestRecordState {
+    Pending,
+    Completed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AllocationRequestFingerprint {
+    pub count: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AllocationResponseRecord {
+    pub generator_id: u32,
+    pub epoch: u64,
+    pub route_version: u64,
+    pub ranges: Vec<TimestampRange>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequestRecord {
+    #[serde(default = "default_metadata_schema_version")]
+    pub schema_version: u32,
+    pub fingerprint: AllocationRequestFingerprint,
+    pub state: RequestRecordState,
+    #[serde(default)]
+    pub response: Option<AllocationResponseRecord>,
     #[serde(default)]
     pub updated_at_ms: u64,
 }
@@ -134,6 +168,47 @@ impl GeneratorRecord {
     }
 }
 
+impl RequestRecord {
+    pub fn validate_schema_version(&self) -> Result<(), TsoError> {
+        if self.schema_version == CURRENT_METADATA_SCHEMA_VERSION {
+            Ok(())
+        } else {
+            Err(TsoError::Internal(format!(
+                "unsupported request metadata schema_version {}",
+                self.schema_version
+            )))
+        }
+    }
+
+    pub fn stamped_for_persistence(&self) -> Self {
+        let mut record = self.clone();
+        record.schema_version = CURRENT_METADATA_SCHEMA_VERSION;
+        record
+    }
+
+    pub fn completed_response(
+        &self,
+        timeline_key: &str,
+    ) -> Result<Option<AllocateTimestampsResponse>, TsoError> {
+        match (&self.state, &self.response) {
+            (RequestRecordState::Pending, _) => Ok(None),
+            (RequestRecordState::Completed, Some(response)) => {
+                Ok(Some(AllocateTimestampsResponse {
+                    timeline_key: timeline_key.to_string(),
+                    generator_id: response.generator_id,
+                    epoch: response.epoch,
+                    route_version: response.route_version,
+                    ranges: response.ranges.clone(),
+                }))
+            }
+            (RequestRecordState::Completed, None) => Err(TsoError::Internal(format!(
+                "completed request record missing response for timeline {}",
+                timeline_key
+            ))),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TimelineBatchOp {
     pub timeline_key: String,
@@ -196,6 +271,30 @@ pub(super) fn collect_timeline_route_update(
     if let Some(route_update) = timeline_route_update(previous_record, next_record) {
         route_updates.push(route_update);
     }
+}
+
+fn owner_endpoint_matches(left: &str, right: &str) -> bool {
+    let left = left.trim();
+    let right = right.trim();
+    if left == right || left.eq_ignore_ascii_case(right) {
+        return true;
+    }
+
+    match (left.parse::<SocketAddr>(), right.parse::<SocketAddr>()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
+fn timeline_matches_status_filter(
+    record: &TimelineRecord,
+    states: &[TimelineLifecycleState],
+    owner_worker_endpoint: Option<&str>,
+) -> bool {
+    (states.is_empty() || states.contains(&record.state))
+        && owner_worker_endpoint
+            .map(|endpoint| owner_endpoint_matches(&record.route.owner_worker_endpoint, endpoint))
+            .unwrap_or(true)
 }
 
 #[async_trait]
@@ -274,6 +373,57 @@ pub trait TimelineAuthority: Send + Sync {
                 })
                 .collect(),
             next_start_after_timeline_key: page.next_start_after_timeline_key,
+        })
+    }
+    async fn list_timelines_by_status_filter_page(
+        &self,
+        states: &[TimelineLifecycleState],
+        owner_worker_endpoint: Option<&str>,
+        start_after_timeline_key: Option<&str>,
+        limit: usize,
+    ) -> Result<TimelineRecordListPage, TsoError> {
+        if states.is_empty() && owner_worker_endpoint.is_none() {
+            return self
+                .list_timelines_page(start_after_timeline_key, limit)
+                .await;
+        }
+        if limit == 0 {
+            return Ok(TimelineRecordListPage {
+                records: Vec::new(),
+                next_start_after_timeline_key: None,
+            });
+        }
+
+        let mut scan_cursor = start_after_timeline_key.map(str::to_owned);
+        let mut matched = Vec::with_capacity(limit + 1);
+        while matched.len() <= limit {
+            let page = self
+                .list_timelines_page(scan_cursor.as_deref(), limit)
+                .await?;
+            if page.records.is_empty() {
+                break;
+            }
+            scan_cursor = page.next_start_after_timeline_key.clone();
+            for record in page.records {
+                if timeline_matches_status_filter(&record, states, owner_worker_endpoint) {
+                    matched.push(record);
+                    if matched.len() > limit {
+                        break;
+                    }
+                }
+            }
+            if scan_cursor.is_none() {
+                break;
+            }
+        }
+
+        let next_start_after_timeline_key =
+            (matched.len() > limit).then(|| matched[limit - 1].route.timeline_key.clone());
+        matched.truncate(limit);
+
+        Ok(TimelineRecordListPage {
+            records: matched,
+            next_start_after_timeline_key,
         })
     }
     async fn create_timeline(
@@ -357,6 +507,43 @@ pub trait GeneratorLeaseAuthority: Send + Sync {
     }
 }
 
+#[async_trait]
+pub trait RequestRecordAuthority: Send + Sync {
+    async fn load_request_record(
+        &self,
+        timeline_key: &str,
+        client_request_id: &str,
+    ) -> Result<Option<(RequestRecord, u64)>, TsoError>;
+    async fn create_request_record(
+        &self,
+        timeline_key: &str,
+        client_request_id: &str,
+        record: &RequestRecord,
+    ) -> Result<u64, TsoError>;
+    async fn compare_exchange_request_record(
+        &self,
+        timeline_key: &str,
+        client_request_id: &str,
+        expected_revision: u64,
+        record: &RequestRecord,
+    ) -> Result<u64, TsoError>;
+    async fn compare_delete_request_record(
+        &self,
+        timeline_key: &str,
+        client_request_id: &str,
+        expected_revision: u64,
+    ) -> Result<(), TsoError>;
+    async fn prune_completed_request_records(
+        &self,
+        older_than_ms: u64,
+        limit: usize,
+    ) -> Result<usize, TsoError> {
+        let _ = older_than_ms;
+        let _ = limit;
+        Ok(0)
+    }
+}
+
 /// Subscribes to timeline route-change signals from the metadata backend.
 ///
 /// These updates are eventually consistent convergence signals, not a synchronous write
@@ -376,6 +563,10 @@ pub trait RouteUpdateSource: Send + Sync {
 pub trait ControlPlaneStore:
     TimelineAuthority + GeneratorLeaseAuthority + RouteUpdateSource + Send + Sync
 {
+    fn request_records(&self) -> Option<&dyn RequestRecordAuthority> {
+        None
+    }
+
     async fn shutdown(&self) {}
 }
 

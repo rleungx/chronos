@@ -2,6 +2,7 @@ package chronos.client;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 import com.chronos.tso.v1.AllocateTimestampsRequest;
 import com.chronos.tso.v1.AllocateTimestampsResponse;
@@ -27,6 +28,7 @@ import io.grpc.stub.StreamObserver;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 
 final class ClientTest {
@@ -35,6 +37,8 @@ final class ClientTest {
     var staleOnFirstAllocate = new AtomicBoolean(true);
     var routeVersion = new AtomicInteger(11);
     var allocateCalls = new AtomicInteger();
+    var firstRequestId = new AtomicReference<String>();
+    var retryRequestId = new AtomicReference<String>();
     var ownerServerName = InProcessServerBuilder.generateName();
     var routeServerName = InProcessServerBuilder.generateName();
 
@@ -47,7 +51,12 @@ final class ClientTest {
                   public void allocateTimestamps(
                       AllocateTimestampsRequest request,
                       StreamObserver<AllocateTimestampsResponse> responseObserver) {
-                    allocateCalls.incrementAndGet();
+                    int call = allocateCalls.incrementAndGet();
+                    if (call == 1) {
+                      firstRequestId.set(request.getClientRequestId());
+                    } else {
+                      retryRequestId.set(request.getClientRequestId());
+                    }
                     if (staleOnFirstAllocate.getAndSet(false)) {
                       routeVersion.incrementAndGet();
                       var status =
@@ -137,11 +146,23 @@ final class ClientTest {
       assertEquals(1, ranges.size());
       assertEquals(100, ranges.get(0).getStartTso());
       assertEquals(2, allocateCalls.get());
+      assertEquals(firstRequestId.get(), retryRequestId.get());
       assertFalse(staleOnFirstAllocate.get());
     } finally {
       routeChannel.shutdownNow();
       ownerServer.shutdownNow();
       routeServer.shutdownNow();
     }
+  }
+
+  @Test
+  void transportConfigRequiresClientCertAndKeyTogether() {
+    assertThrows(
+        IllegalArgumentException.class,
+        () ->
+            new Client(
+                "dns:///chronos.internal:50051",
+                "orders.primary",
+                Client.TransportConfig.secure().withTrustedCaPem("ca".getBytes()).withClientIdentityPem("cert".getBytes(), null)));
   }
 }

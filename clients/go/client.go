@@ -2,11 +2,14 @@ package chronos
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"sync"
 	"sync/atomic"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 
@@ -18,12 +21,22 @@ type Option func(*config)
 type config struct {
 	desiredResourceTier tsov1.ResourceTier
 	requestTimeoutMs    uint32
+	transport           transportConfig
+}
+
+type transportConfig struct {
+	insecure   bool
+	serverName string
+	caPEM      []byte
+	certPEM    []byte
+	keyPEM     []byte
 }
 
 func defaultConfig() config {
 	return config{
 		desiredResourceTier: tsov1.ResourceTier_RESOURCE_TIER_SHARED,
 		requestTimeoutMs:    0,
+		transport:           transportConfig{},
 	}
 }
 
@@ -36,6 +49,31 @@ func WithDesiredResourceTier(tier tsov1.ResourceTier) Option {
 func WithRequestTimeoutMs(timeoutMs uint32) Option {
 	return func(cfg *config) {
 		cfg.requestTimeoutMs = timeoutMs
+	}
+}
+
+func WithInsecureTransport() Option {
+	return func(cfg *config) {
+		cfg.transport.insecure = true
+	}
+}
+
+func WithTLSRootCA(caPEM []byte) Option {
+	return func(cfg *config) {
+		cfg.transport.caPEM = append([]byte(nil), caPEM...)
+	}
+}
+
+func WithTLSClientCertificate(certPEM []byte, keyPEM []byte) Option {
+	return func(cfg *config) {
+		cfg.transport.certPEM = append([]byte(nil), certPEM...)
+		cfg.transport.keyPEM = append([]byte(nil), keyPEM...)
+	}
+}
+
+func WithTLSServerName(serverName string) Option {
+	return func(cfg *config) {
+		cfg.transport.serverName = serverName
 	}
 }
 
@@ -63,10 +101,15 @@ func NewWithOptions(ctx context.Context, addr string, timelineKey string, opts .
 		opt(&cfg)
 	}
 
+	transportCreds, err := transportCredentials(cfg.transport)
+	if err != nil {
+		return nil, err
+	}
+
 	conn, err := grpc.DialContext(
 		ctx,
 		addr,
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithTransportCredentials(transportCreds),
 		grpc.WithBlock(),
 	)
 	if err != nil {
@@ -107,7 +150,8 @@ func (c *Client) AllocateTimestamps(ctx context.Context, count uint32) ([]*tsov1
 		return nil, err
 	}
 
-	ranges, err := c.allocateOnce(ctx, route, count)
+	clientRequestID := c.nextClientRequestID(route.TimelineKey)
+	ranges, err := c.allocateOnce(ctx, route, count, clientRequestID)
 	if err == nil {
 		return ranges, nil
 	}
@@ -119,7 +163,7 @@ func (c *Client) AllocateTimestamps(ctx context.Context, count uint32) ([]*tsov1
 	if err != nil {
 		return nil, err
 	}
-	return c.allocateOnce(ctx, route, count)
+	return c.allocateOnce(ctx, route, count, clientRequestID)
 }
 
 func (c *Client) ensureRoute(ctx context.Context) (*tsov1.TimelineRoute, error) {
@@ -166,10 +210,15 @@ func (c *Client) ensureOwnerClient(ctx context.Context, ownerAddr string) error 
 	}
 	c.mu.Unlock()
 
+	transportCreds, err := transportCredentials(c.config.transport)
+	if err != nil {
+		return err
+	}
+
 	conn, err := grpc.DialContext(
 		ctx,
 		ownerAddr,
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithTransportCredentials(transportCreds),
 		grpc.WithBlock(),
 	)
 	if err != nil {
@@ -187,7 +236,7 @@ func (c *Client) ensureOwnerClient(ctx context.Context, ownerAddr string) error 
 	return nil
 }
 
-func (c *Client) allocateOnce(ctx context.Context, route *tsov1.TimelineRoute, count uint32) ([]*tsov1.TimestampRange, error) {
+func (c *Client) allocateOnce(ctx context.Context, route *tsov1.TimelineRoute, count uint32, clientRequestID string) ([]*tsov1.TimestampRange, error) {
 	c.mu.RLock()
 	tsoClient := c.tsoClient
 	c.mu.RUnlock()
@@ -197,7 +246,7 @@ func (c *Client) allocateOnce(ctx context.Context, route *tsov1.TimelineRoute, c
 		Count:                count,
 		ExpectedEpoch:        route.Epoch,
 		ExpectedRouteVersion: route.RouteVersion,
-		ClientRequestId:      fmt.Sprintf("%s-%d", route.TimelineKey, c.requestID.Add(1)),
+		ClientRequestId:      clientRequestID,
 		RequestTimeoutMs:     c.config.requestTimeoutMs,
 	})
 	if err != nil {
@@ -205,6 +254,10 @@ func (c *Client) allocateOnce(ctx context.Context, route *tsov1.TimelineRoute, c
 	}
 
 	return resp.Ranges, nil
+}
+
+func (c *Client) nextClientRequestID(timelineKey string) string {
+	return fmt.Sprintf("%s-%d", timelineKey, c.requestID.Add(1))
 }
 
 func isStaleRouteError(err error) bool {
@@ -228,4 +281,36 @@ func isStaleRouteError(err error) bool {
 	}
 
 	return false
+}
+
+func transportCredentials(cfg transportConfig) (credentials.TransportCredentials, error) {
+	if cfg.insecure {
+		return insecure.NewCredentials(), nil
+	}
+
+	hasCert := len(cfg.certPEM) > 0
+	hasKey := len(cfg.keyPEM) > 0
+	if hasCert != hasKey {
+		return nil, fmt.Errorf("chronos client TLS client certificate and key must be configured together")
+	}
+
+	tlsConfig := &tls.Config{
+		MinVersion: tls.VersionTLS12,
+		ServerName: cfg.serverName,
+	}
+	if len(cfg.caPEM) > 0 {
+		roots := x509.NewCertPool()
+		if !roots.AppendCertsFromPEM(cfg.caPEM) {
+			return nil, fmt.Errorf("chronos client TLS root CA PEM is invalid")
+		}
+		tlsConfig.RootCAs = roots
+	}
+	if hasCert {
+		certificate, err := tls.X509KeyPair(cfg.certPEM, cfg.keyPEM)
+		if err != nil {
+			return nil, fmt.Errorf("chronos client TLS client identity is invalid: %w", err)
+		}
+		tlsConfig.Certificates = []tls.Certificate{certificate}
+	}
+	return credentials.NewTLS(tlsConfig), nil
 }

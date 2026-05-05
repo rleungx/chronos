@@ -1,5 +1,7 @@
 use tonic::{Request, Response, Status};
 
+use crate::authz::PeerCertAuthorizer;
+use crate::config::TsoConfigValidationError;
 use crate::proto::v1::ResourceTier as ProtoResourceTier;
 use crate::proto::v1::{
     timeline_route_service_server::TimelineRouteService,
@@ -17,11 +19,30 @@ use super::{status_mapping, translation};
 
 pub struct TsoRouteService {
     control_plane: TsoControlPlane,
+    authorizer: PeerCertAuthorizer,
 }
 
 impl TsoRouteService {
     pub fn new(control_plane: TsoControlPlane) -> Self {
-        Self { control_plane }
+        Self {
+            control_plane,
+            authorizer: PeerCertAuthorizer::disabled("TimelineRouteService"),
+        }
+    }
+
+    pub fn with_allowlist(
+        control_plane: TsoControlPlane,
+        allowlist: &[String],
+    ) -> Result<Self, TsoConfigValidationError> {
+        Ok(Self {
+            control_plane,
+            authorizer: PeerCertAuthorizer::from_allowlist("TimelineRouteService", allowlist)
+                .map_err(TsoConfigValidationError::Security)?,
+        })
+    }
+
+    fn authorize<T>(&self, request: &Request<T>) -> Result<(), Status> {
+        self.authorizer.authorize(request)
     }
 }
 
@@ -42,6 +63,7 @@ impl TimelineRouteService for TsoRouteService {
         &self,
         request: Request<GetTimelineRouteRequest>,
     ) -> Result<Response<GetTimelineRouteResponse>, Status> {
+        self.authorize(&request)?;
         let req = request.into_inner();
         match self
             .control_plane
@@ -59,6 +81,7 @@ impl TimelineRouteService for TsoRouteService {
         &self,
         request: Request<EnsureTimelineRequest>,
     ) -> Result<Response<EnsureTimelineResponse>, Status> {
+        self.authorize(&request)?;
         let req = request.into_inner();
         let tier =
             decode_resource_tier(req.desired_resource_tier).map_err(translation::map_tso_error)?;
@@ -78,13 +101,30 @@ impl TimelineRouteService for TsoRouteService {
 
 pub struct TsoTimestampService {
     allocator: TimelineScopedAllocator,
+    authorizer: PeerCertAuthorizer,
 }
 
 impl TsoTimestampService {
     pub fn new(data_plane: TsoDataPlane) -> Self {
         Self {
             allocator: TimelineScopedAllocator::new(data_plane),
+            authorizer: PeerCertAuthorizer::disabled("TimestampService"),
         }
+    }
+
+    pub fn with_allowlist(
+        data_plane: TsoDataPlane,
+        allowlist: &[String],
+    ) -> Result<Self, TsoConfigValidationError> {
+        Ok(Self {
+            allocator: TimelineScopedAllocator::new(data_plane),
+            authorizer: PeerCertAuthorizer::from_allowlist("TimestampService", allowlist)
+                .map_err(TsoConfigValidationError::Security)?,
+        })
+    }
+
+    fn authorize<T>(&self, request: &Request<T>) -> Result<(), Status> {
+        self.authorizer.authorize(request)
     }
 }
 
@@ -94,6 +134,7 @@ impl TimestampService for TsoTimestampService {
         &self,
         request: Request<AllocateTimestampsRequest>,
     ) -> Result<Response<AllocateTimestampsResponse>, Status> {
+        self.authorize(&request)?;
         Ok(Response::new(
             allocate_timestamps_response(&self.allocator, request.into_inner()).await?,
         ))
@@ -140,6 +181,8 @@ fn proto_timestamp_ranges(ranges: Vec<TimestampRange>) -> Vec<crate::proto::v1::
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use tonic::Code;
 
     #[test]
     fn decode_resource_tier_rejects_invalid_values() {
@@ -173,5 +216,58 @@ mod tests {
         assert_eq!(ranges[0].end_tso, 19);
         assert_eq!(ranges[1].start_tso, 20);
         assert_eq!(ranges[1].end_tso, 29);
+    }
+
+    #[tokio::test]
+    async fn route_service_allowlist_requires_peer_certificate() {
+        let service = crate::TsoService::new(
+            crate::test_tls::required_grpc_tls_test_config(crate::TsoConfig::default(), 100),
+            Arc::new(crate::ManualClock::new(1)),
+            Arc::new(crate::metadata::MemoryMetadataStore::new()),
+        )
+        .unwrap();
+        let route_service = TsoRouteService::with_allowlist(
+            service.control_plane(),
+            &[crate::test_tls::placeholder_client_cert_fingerprint().into()],
+        )
+        .unwrap();
+
+        let error = route_service
+            .get_timeline_route(Request::new(GetTimelineRouteRequest {
+                timeline_key: "auth.route".into(),
+            }))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code(), Code::Unauthenticated);
+    }
+
+    #[tokio::test]
+    async fn timestamp_service_allowlist_requires_peer_certificate() {
+        let service = crate::TsoService::new(
+            crate::test_tls::required_grpc_tls_test_config(crate::TsoConfig::default(), 100),
+            Arc::new(crate::ManualClock::new(1)),
+            Arc::new(crate::metadata::MemoryMetadataStore::new()),
+        )
+        .unwrap();
+        let timestamp_service = TsoTimestampService::with_allowlist(
+            service.data_plane(),
+            &[crate::test_tls::placeholder_client_cert_fingerprint().into()],
+        )
+        .unwrap();
+
+        let error = timestamp_service
+            .allocate_timestamps(Request::new(AllocateTimestampsRequest {
+                timeline_key: "auth.timestamp".into(),
+                count: 1,
+                expected_epoch: 1,
+                expected_route_version: 1,
+                client_request_id: "auth".into(),
+                request_timeout_ms: 0,
+            }))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code(), Code::Unauthenticated);
     }
 }

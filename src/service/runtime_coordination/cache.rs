@@ -16,6 +16,12 @@ use super::super::TsoService;
 
 const ROUTE_WATCH_LAG_CLEAR_COOLDOWN: Duration = Duration::from_millis(200);
 
+fn record_route_watch_resync(event: &'static str) {
+    metrics::TSO_WATCH_RESYNC_TOTAL
+        .with_label_values(&[event])
+        .inc();
+}
+
 fn should_clear_timeline_cache_for_route_update(
     cached_route: &TimelineRoute,
     updated_route: &TimelineRoute,
@@ -193,6 +199,7 @@ impl TsoService {
                         continue;
                     }
                     last_lag_clear_at = Some(now);
+                    record_route_watch_resync("broadcast_lagged");
                     warn!(
                         component = "route_watch",
                         event = "watch_restarted",
@@ -492,6 +499,9 @@ mod tests {
 
     #[tokio::test]
     async fn upstream_route_reset_clears_runtime_cache_and_notifies_watch_layer() {
+        let before = crate::metrics::TSO_WATCH_RESYNC_TOTAL
+            .with_label_values(&["broadcast_lagged"])
+            .get();
         let clock = Arc::new(ManualClock::new(25_000));
         let inner = Arc::new(MemoryMetadataStore::new());
         let metadata = Arc::new(ResettableRouteStore::new(inner));
@@ -523,5 +533,27 @@ mod tests {
             .timeline_runtime
             .timeline_handle(&route.timeline_key)
             .is_none());
+        assert_eq!(
+            crate::metrics::TSO_WATCH_RESYNC_TOTAL
+                .with_label_values(&["broadcast_lagged"])
+                .get(),
+            before
+        );
+    }
+
+    #[test]
+    fn record_route_watch_resync_increments_metric() {
+        let before = crate::metrics::TSO_WATCH_RESYNC_TOTAL
+            .with_label_values(&["broadcast_lagged"])
+            .get();
+
+        super::record_route_watch_resync("broadcast_lagged");
+
+        assert!(
+            crate::metrics::TSO_WATCH_RESYNC_TOTAL
+                .with_label_values(&["broadcast_lagged"])
+                .get()
+                > before
+        );
     }
 }

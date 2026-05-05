@@ -51,7 +51,7 @@ pub struct TimelineRoute {
     pub owner_worker_endpoint: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TimestampRange {
     pub start_tso: u64,
     pub end_tso: u64,
@@ -66,7 +66,7 @@ pub struct AllocateTimestampsRequest {
     pub client_request_id: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AllocateTimestampsResponse {
     pub timeline_key: String,
     pub generator_id: u32,

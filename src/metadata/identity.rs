@@ -23,6 +23,10 @@ impl InstanceIdentityLease {
         self.lost_rx.clone()
     }
 
+    pub fn lease_id(&self) -> i64 {
+        self.lease_id
+    }
+
     pub async fn shutdown(&mut self) {
         self.shutdown_with_timeout(IDENTITY_LEASE_REVOKE_TIMEOUT)
             .await;

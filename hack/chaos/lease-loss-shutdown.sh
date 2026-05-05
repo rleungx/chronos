@@ -14,11 +14,13 @@ ADVERTISE_ENDPOINT="${CHRONOS_CHAOS_ADVERTISE_ENDPOINT:-}"
 METRICS_ENDPOINT="${CHRONOS_CHAOS_METRICS_ENDPOINT:-127.0.0.1:9898}"
 WAIT_ATTEMPTS="${CHRONOS_CHAOS_WAIT_ATTEMPTS:-60}"
 WAIT_INTERVAL_SECS="${CHRONOS_CHAOS_WAIT_INTERVAL_SECS:-1}"
+IDENTITY_RELEASE_WAIT_ATTEMPTS="${CHRONOS_CHAOS_IDENTITY_RELEASE_WAIT_ATTEMPTS:-80}"
+IDENTITY_RELEASE_POLL_INTERVAL_SECS="${CHRONOS_CHAOS_IDENTITY_RELEASE_POLL_INTERVAL_SECS:-0.25}"
 UNIQUE_SUFFIX="$(date +%s)-$$"
 ETCD_PREFIX="${CHRONOS_CHAOS_ETCD_PREFIX:-/chronos-chaos-${UNIQUE_SUFFIX}}"
 WORKER_ID="${CHRONOS_CHAOS_WORKER_ID:-worker-chaos}"
 INSTANCE_ID="${CHRONOS_CHAOS_INSTANCE_ID:-${SERVICE_ENDPOINT}}"
-BENCH_DURATION_SECS="${CHRONOS_CHAOS_BENCH_DURATION_SECS:-3}"
+BENCH_DURATION_SECS="${CHRONOS_CHAOS_BENCH_DURATION_SECS:-2}"
 SAFETY_GAP_MS="${CHRONOS_CHAOS_SAFETY_GAP_MS:-1}"
 RECOVERY_REQ_PER_SEC_MIN="${CHRONOS_CHAOS_RECOVERY_REQ_PER_SEC_MIN:-10}"
 RECOVERY_LATENCY_P95_US_MAX="${CHRONOS_CHAOS_RECOVERY_LATENCY_P95_US_MAX:-500000}"
@@ -52,7 +54,7 @@ fi
 
 CHRONOS_PID=""
 RESULT="failure"
-RELEASE_BIN_DIR="${REPO_ROOT}/target/release"
+RELEASE_BIN_DIR="${CHRONOS_RELEASE_BIN_DIR:-${REPO_ROOT}/target/release}"
 ADVERTISE_ENDPOINT="$(derive_local_advertise_endpoint "${SERVICE_ENDPOINT}" "chronos-chaos" "${ADVERTISE_ENDPOINT}")"
 
 write_summary() {
@@ -67,6 +69,8 @@ etcd_endpoints=${ETCD_ENDPOINTS}
 service_endpoint=${SERVICE_ENDPOINT}
 metrics_endpoint=${METRICS_ENDPOINT}
 bench_duration_secs=${BENCH_DURATION_SECS}
+identity_release_wait_attempts=${IDENTITY_RELEASE_WAIT_ATTEMPTS}
+identity_release_poll_interval_secs=${IDENTITY_RELEASE_POLL_INTERVAL_SECS}
 etcd_prefix=${ETCD_PREFIX}
 worker_id=${WORKER_ID}
 instance_id=${INSTANCE_ID}
@@ -127,7 +131,8 @@ wait_for_degrade_or_exit() {
 wait_for_identity_release() {
   local key="${ETCD_PREFIX}/identity/instances/${INSTANCE_ID}"
   local last_error=""
-  for _attempt in $(seq 1 "${WAIT_ATTEMPTS}"); do
+  local attempt
+  for attempt in $(seq 1 "${IDENTITY_RELEASE_WAIT_ATTEMPTS}"); do
     local output
     if output="$(docker exec -e ETCDCTL_API=3 chronos-etcd etcdctl --endpoints="http://${ETCD_ENDPOINTS}" get "${key}" --keys-only 2>&1)"; then
       if [[ -z "${output}" ]]; then
@@ -138,11 +143,11 @@ wait_for_identity_release() {
       last_error="${output}"
     fi
 
-    if [[ -n "${last_error}" ]]; then
+    if [[ -n "${last_error}" && $((attempt % 4)) -eq 0 ]]; then
       echo "[chaos] waiting for identity release: ${last_error}" >&2
     fi
 
-    sleep "${WAIT_INTERVAL_SECS}"
+    sleep "${IDENTITY_RELEASE_POLL_INTERVAL_SECS}"
   done
   if [[ -n "${last_error}" ]]; then
     echo "identity lease key did not expire in time: ${key}; last observation: ${last_error}" >&2
@@ -176,8 +181,8 @@ echo "[chaos] starting etcd"
 make etcd-up >/dev/null
 wait_for_etcd "${WAIT_ATTEMPTS}" "${WAIT_INTERVAL_SECS}"
 
-echo "[chaos] building release binaries"
-cargo build --locked --release --bin chronos --bin chronos-bench >/dev/null
+echo "[chaos] preparing release binaries"
+ensure_release_binaries "${RELEASE_BIN_DIR}" chronos chronos-bench
 
 echo "[chaos] starting chronos"
 start_chronos
@@ -211,8 +216,8 @@ env \
   CHRONOS_BENCH_WARMUP_SECS=1 \
   "${RELEASE_BIN_DIR}/chronos-bench" | tee "${RECOVERY_BENCH_LOG}"
 
-curl -fsS "http://${METRICS_ENDPOINT}/readyz" | grep -qx 'ready'
-curl -fsS "http://${METRICS_ENDPOINT}/metrics" | grep -q '^tso_startup_ready'
+assert_http_body_equals "http://${METRICS_ENDPOINT}/readyz" "ready"
+assert_http_metric_present "http://${METRICS_ENDPOINT}/metrics" '^tso_startup_ready'
 assert_metric_at_least "req_per_sec" "${RECOVERY_BENCH_LOG}" "${RECOVERY_REQ_PER_SEC_MIN}"
 assert_metric_at_most "latency_p95_us" "${RECOVERY_BENCH_LOG}" "${RECOVERY_LATENCY_P95_US_MAX}"
 

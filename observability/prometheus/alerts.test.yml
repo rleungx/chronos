@@ -16,7 +16,7 @@ tests:
         values: '0 0 0 0 0 0 1 1 1 1 1 1'
       - series: 'tso_transfer_outcomes_total{job="chronos",action="failover",reason="failover",outcome="failed"}'
         values: '0 0 0 0 0 0 1 1 1 1 1 1'
-      - series: 'tso_watch_keepalive_dropped_total{job="chronos"}'
+      - series: 'tso_watch_resync_total{job="chronos",event="watch_stream_error"}'
         values: '0 0 0 0 0 0 1 1 1 1 1 1'
       - series: 'tso_shutdown_total{job="chronos",reason="identity_lease_lost"}'
         values: '0 0 0 0 0 0 1 1 1 1 1 1'
@@ -74,15 +74,14 @@ tests:
               summary: Chronos transfer or failover actions failed
               description: Transfer or failover actions were blocked or failed in the last 10 minutes.
       - eval_time: 11m
-        alertname: ChronosWatchKeepaliveDropped
+        alertname: ChronosWatchResyncs
         exp_alerts:
           - exp_labels:
-              alertname: ChronosWatchKeepaliveDropped
-              job: chronos
+              alertname: ChronosWatchResyncs
               severity: warning
             exp_annotations:
-              summary: Chronos dropped watch keepalive events
-              description: Watch keepalive events were dropped due to backpressure in the last 10 minutes.
+              summary: Chronos route watch restarted or resynced
+              description: Route watch resync or reset events were recorded in the last 10 minutes.
       - eval_time: 11m
         alertname: ChronosShutdownEvents
         exp_alerts:

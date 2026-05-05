@@ -36,6 +36,6 @@ pub(crate) use runtime::{
 pub(crate) use transport::{build_grpc_server, wait_for_shutdown_signal};
 #[cfg(test)]
 pub(crate) use transport::{
-    load_metrics_tls_acceptor, load_root_cert_store, metrics_handler, parse_pem_certificates,
-    parse_pem_private_key, serve_metrics_listener,
+    health_handler, load_metrics_tls_acceptor, load_root_cert_store, metrics_handler,
+    parse_pem_certificates, parse_pem_private_key, serve_metrics_listener,
 };

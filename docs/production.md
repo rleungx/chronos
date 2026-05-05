@@ -42,26 +42,23 @@ validation harnesses. This guide turns those mechanics into an operator workflow
 
 - `/healthz` indicates process liveness.
 - `/readyz` indicates whether Chronos is currently safe to serve.
+- In etcd mode, readiness is only reached after Chronos has validated metadata reads/watch subscription and verified that the acquired instance identity lease record was actually written with the expected identity payload.
 - `tso_startup_ready == 0` means the instance should not receive traffic.
 - `tso_worker_readiness_transitions_total` and `tso_shutdown_total` provide the reason path for
   readiness and shutdown changes.
 
 ## Required validation before release
 
-Run these in order:
+Run the full release gate in order:
 
 ```bash
-cargo clippy --locked --all-targets -- -D warnings
-make dependency-check
-make test-layer-0
-make test-layer-2
-make test-layer-3
-make test-layer-4
-make test-soak
-make test-chaos
-make test-failover-bench
-make test-rebalance-bench
+make release-gate
 ```
+
+`make release-check` covers clippy, layer-0/2/3 validation, observability checks, dependency
+policy, release-shape validation, container delivery checks, and release builds. `make
+release-gate` adds layer-4 plus the long-running etcd-backed soak, chaos, failover, and rebalance
+validation bundle.
 
 ## Interpreting retained artifacts
 
@@ -115,3 +112,11 @@ make dependency-check
 ```
 
 This enforces advisory, license, source, and wildcard dependency policy before release promotion.
+
+## What this repo proves vs what still needs environment evidence
+
+This repo proves the single-repo release gate, startup contracts, alert rule validity, and
+single-node/local etcd validation harnesses.
+
+You still need environment evidence for clustered etcd quorum behavior, backup/restore drills,
+staged rollout safety, and production alert threshold tuning.

@@ -33,6 +33,63 @@ wait_for_http() {
   return 1
 }
 
+ensure_release_binaries() {
+  local bin_dir=$1
+  shift
+  if [[ "${CHRONOS_SKIP_RELEASE_BUILD:-0}" == "1" ]]; then
+    local bin
+    for bin in "$@"; do
+      if [[ ! -x "${bin_dir}/${bin}" ]]; then
+        echo "missing release binary ${bin_dir}/${bin}; unset CHRONOS_SKIP_RELEASE_BUILD or run make release-package first" >&2
+        return 1
+      fi
+    done
+    return 0
+  fi
+
+  local cargo_args=(cargo build --locked --release)
+  local bin
+  for bin in "$@"; do
+    cargo_args+=(--bin "${bin}")
+  done
+  "${cargo_args[@]}" >/dev/null
+}
+
+assert_http_body_equals() {
+  local url=$1
+  local expected=$2
+  local body
+  body="$(curl -fsS "${url}")" || {
+    echo "failed to fetch ${url}" >&2
+    return 1
+  }
+  if [[ "${body}" != "${expected}" ]]; then
+    echo "unexpected response from ${url}: expected '${expected}', got '${body}'" >&2
+    return 1
+  fi
+}
+
+assert_http_metric_present() {
+  local url=$1
+  local pattern=$2
+  local snapshot
+  snapshot="$(mktemp "${TMPDIR:-/tmp}/chronos-metrics.XXXXXX")" || {
+    echo "failed to create temporary metrics snapshot" >&2
+    return 1
+  }
+  if ! curl -fsS "${url}" >"${snapshot}"; then
+    rm -f "${snapshot}"
+    echo "failed to fetch metrics from ${url}" >&2
+    return 1
+  fi
+  if ! grep -q "${pattern}" "${snapshot}"; then
+    rm -f "${snapshot}"
+    echo "missing metric pattern ${pattern} from ${url}" >&2
+    return 1
+  fi
+  rm -f "${snapshot}"
+}
+
 wait_for_etcd() {
   local wait_attempts=$1
   local wait_interval_secs=$2
@@ -43,6 +100,20 @@ wait_for_etcd() {
     sleep "${wait_interval_secs}"
   done
   echo "etcd did not become healthy after ${wait_attempts} attempts" >&2
+  return 1
+}
+
+wait_for_etcd_cluster() {
+  local wait_attempts=$1
+  local wait_interval_secs=$2
+  local endpoints=$3
+  for _attempt in $(seq 1 "${wait_attempts}"); do
+    if docker exec chronos-etcd-1 /usr/local/bin/etcdctl --endpoints="${endpoints}" endpoint health >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep "${wait_interval_secs}"
+  done
+  echo "clustered etcd did not become healthy after ${wait_attempts} attempts" >&2
   return 1
 }
 
@@ -145,6 +216,18 @@ assert_metric_at_most() {
   fi
   python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) <= float(sys.argv[2]) else 1)' "${value}" "${maximum}" || {
     echo "metric ${key} must be <= ${maximum}, got ${value}" >&2
+    return 1
+  }
+}
+
+assert_summary_success() {
+  local file=$1
+  [[ -f "${file}" ]] || {
+    echo "missing summary file ${file}" >&2
+    return 1
+  }
+  grep -q '^result=success$' "${file}" || {
+    echo "summary does not report success: ${file}" >&2
     return 1
   }
 }

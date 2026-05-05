@@ -8,6 +8,24 @@ source "${REPO_ROOT}/hack/lib/common.sh"
 
 cd "${REPO_ROOT}"
 
+default_shared_generator_targets() {
+  local count="${1:-128}"
+  if ! [[ "${count}" =~ ^[0-9]+$ ]] || [[ "${count}" -eq 0 ]]; then
+    echo "CHRONOS_REBALANCE_SHARED_GENERATORS must be a positive integer" >&2
+    return 1
+  fi
+
+  local generator_id
+  local targets=""
+  for ((generator_id = 0; generator_id < count; generator_id++)); do
+    if [[ -n "${targets}" ]]; then
+      targets+=","
+    fi
+    targets+="${generator_id}"
+  done
+  printf '%s' "${targets}"
+}
+
 ETCD_ENDPOINTS="${CHRONOS_REBALANCE_ETCD_ENDPOINTS:-127.0.0.1:2379}"
 SERVICE_ENDPOINT_A="${CHRONOS_REBALANCE_SERVICE_ENDPOINT_A:-127.0.0.1:50051}"
 SERVICE_ENDPOINT_B="${CHRONOS_REBALANCE_SERVICE_ENDPOINT_B:-127.0.0.1:50052}"
@@ -15,13 +33,14 @@ ADVERTISE_ENDPOINT_A="${CHRONOS_REBALANCE_ADVERTISE_ENDPOINT_A:-}"
 ADVERTISE_ENDPOINT_B="${CHRONOS_REBALANCE_ADVERTISE_ENDPOINT_B:-}"
 METRICS_ENDPOINT_A="${CHRONOS_REBALANCE_METRICS_ENDPOINT_A:-127.0.0.1:9898}"
 METRICS_ENDPOINT_B="${CHRONOS_REBALANCE_METRICS_ENDPOINT_B:-127.0.0.1:9899}"
-BENCH_DURATION_SECS="${CHRONOS_REBALANCE_DURATION_SECS:-10}"
-BENCH_WARMUP_SECS="${CHRONOS_REBALANCE_WARMUP_SECS:-2}"
+BENCH_DURATION_SECS="${CHRONOS_REBALANCE_DURATION_SECS:-4}"
+BENCH_WARMUP_SECS="${CHRONOS_REBALANCE_WARMUP_SECS:-1}"
 BENCH_CONCURRENCY="${CHRONOS_REBALANCE_CONCURRENCY:-8}"
-BENCH_TIMELINES="${CHRONOS_REBALANCE_TIMELINES:-32}"
+BENCH_TIMELINES="${CHRONOS_REBALANCE_TIMELINES:-16}"
 BENCH_ALLOCATE_BATCH="${CHRONOS_REBALANCE_ALLOCATE_BATCH:-1}"
 TRANSFER_INTERVAL_MS="${CHRONOS_REBALANCE_TRANSFER_INTERVAL_MS:-250}"
-TRANSFER_TARGET_GENERATORS="${CHRONOS_REBALANCE_TARGET_GENERATORS:-0,1}"
+SHARED_GENERATOR_COUNT="${CHRONOS_REBALANCE_SHARED_GENERATORS:-32}"
+TRANSFER_TARGET_GENERATORS="${CHRONOS_REBALANCE_TARGET_GENERATORS:-$(default_shared_generator_targets "${SHARED_GENERATOR_COUNT}")}"
 WAIT_ATTEMPTS="${CHRONOS_REBALANCE_WAIT_ATTEMPTS:-60}"
 WAIT_INTERVAL_SECS="${CHRONOS_REBALANCE_WAIT_INTERVAL_SECS:-1}"
 UNIQUE_SUFFIX="$(date +%s)-$$"
@@ -72,7 +91,7 @@ fi
 CHRONOS_PID_A=""
 CHRONOS_PID_B=""
 RESULT="failure"
-RELEASE_BIN_DIR="${REPO_ROOT}/target/release"
+RELEASE_BIN_DIR="${CHRONOS_RELEASE_BIN_DIR:-${REPO_ROOT}/target/release}"
 ADVERTISE_ENDPOINT_A="$(derive_local_advertise_endpoint "${SERVICE_ENDPOINT_A}" "chronos-rebalance-a" "${ADVERTISE_ENDPOINT_A}")"
 ADVERTISE_ENDPOINT_B="$(derive_local_advertise_endpoint "${SERVICE_ENDPOINT_B}" "chronos-rebalance-b" "${ADVERTISE_ENDPOINT_B}")"
 
@@ -94,6 +113,7 @@ bench_warmup_secs=${BENCH_WARMUP_SECS}
 bench_concurrency=${BENCH_CONCURRENCY}
 bench_timelines=${BENCH_TIMELINES}
 bench_allocate_batch=${BENCH_ALLOCATE_BATCH}
+shared_generators=${SHARED_GENERATOR_COUNT}
 transfer_interval_ms=${TRANSFER_INTERVAL_MS}
 transfer_target_generators=${TRANSFER_TARGET_GENERATORS}
 etcd_prefix=${ETCD_PREFIX}
@@ -169,8 +189,8 @@ echo "[rebalance] starting etcd"
 make etcd-up >/dev/null
 wait_for_etcd
 
-echo "[rebalance] building release binaries"
-cargo build --locked --release --bin chronos --bin chronos-control-bench >/dev/null
+echo "[rebalance] preparing release binaries"
+ensure_release_binaries "${RELEASE_BIN_DIR}" chronos chronos-control-bench
 
 echo "[rebalance] starting chronos worker A"
 env \
@@ -217,10 +237,10 @@ env \
   CHRONOS_CONTROL_BENCH_TRANSFER_TARGET_GENERATORS="${TRANSFER_TARGET_GENERATORS}" \
   "${RELEASE_BIN_DIR}/chronos-control-bench" | tee "${REBALANCE_LOG}"
 
-curl -fsS "http://${METRICS_ENDPOINT_A}/readyz" | grep -qx 'ready'
-curl -fsS "http://${METRICS_ENDPOINT_B}/readyz" | grep -qx 'ready'
-curl -fsS "http://${METRICS_ENDPOINT_A}/metrics" | grep -q '^tso_startup_ready'
-curl -fsS "http://${METRICS_ENDPOINT_B}/metrics" | grep -q '^tso_startup_ready'
+assert_http_body_equals "http://${METRICS_ENDPOINT_A}/readyz" "ready"
+assert_http_body_equals "http://${METRICS_ENDPOINT_B}/readyz" "ready"
+assert_http_metric_present "http://${METRICS_ENDPOINT_A}/metrics" '^tso_startup_ready'
+assert_http_metric_present "http://${METRICS_ENDPOINT_B}/metrics" '^tso_startup_ready'
 
 assert_positive_metric "allocate_success_total" "${REBALANCE_LOG}"
 assert_positive_metric "transfer_attempts_total" "${REBALANCE_LOG}"

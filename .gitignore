@@ -1,4 +1,5 @@
 target/
+.cache/
 clients/java/.gradle/
 clients/java/build/
 clients/java/.project

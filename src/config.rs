@@ -8,6 +8,7 @@ use std::os::unix::fs::PermissionsExt;
 
 use thiserror::Error;
 
+use crate::authz::validate_peer_cert_allowlist_entries;
 use crate::{ResourceTier, MAX_GENERATORS};
 
 pub const DEFAULT_WORKER_ID: &str = "default-worker";
@@ -25,6 +26,12 @@ pub const DEFAULT_MAX_BATCH_PER_REQUEST: u32 = 4_096;
 pub const PRODUCTION_MAX_BATCH_PER_REQUEST: u32 = 4_096;
 pub const PRODUCTION_MAX_TIMELINE_PROXY_LANES: usize = 4_096;
 pub const PRODUCTION_MAX_TIMELINE_RUNTIME_ENTRIES: usize = 4_096;
+pub const DEFAULT_REQUEST_RECORD_PENDING_TIMEOUT_MS: u64 = 300_000;
+pub const DEFAULT_REQUEST_RECORD_RETENTION_MS: u64 = 3_600_000;
+pub const DEFAULT_REQUEST_RECORD_CLEANUP_INTERVAL_MS: u64 = 60_000;
+pub const DEFAULT_REQUEST_RECORD_CLEANUP_BATCH_SIZE: usize = 512;
+pub const DEFAULT_AUTO_FAILOVER_INTERVAL_MS: u64 = 1_000;
+pub const DEFAULT_AUTO_FAILOVER_BATCH_SIZE: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TsoSecurityMode {
@@ -147,6 +154,7 @@ pub struct TsoConfig {
     pub instance_id: String,
     pub advertise_endpoint: String,
     pub bind_addr: String,
+    pub health_bind_addr: Option<String>,
     pub metrics_bind_addr: String,
     pub metadata_kind: String,
     pub etcd_endpoints: Vec<String>,
@@ -155,6 +163,10 @@ pub struct TsoConfig {
     pub grpc_tls_cert_file: Option<String>,
     pub grpc_tls_key_file: Option<String>,
     pub grpc_client_ca_file: Option<String>,
+    pub grpc_control_cert_allowlist: Vec<String>,
+    pub grpc_route_cert_allowlist: Vec<String>,
+    pub grpc_timestamp_cert_allowlist: Vec<String>,
+    pub grpc_status_cert_allowlist: Vec<String>,
     pub grpc_request_timeout_ms: Option<u64>,
     pub grpc_max_request_bytes: Option<usize>,
     pub grpc_max_concurrent_requests: Option<usize>,
@@ -173,6 +185,13 @@ pub struct TsoConfig {
     pub max_timeline_proxy_lanes: usize,
     pub max_timeline_runtime_entries: usize,
     pub max_concurrent_timeline_loads: usize,
+    pub request_record_pending_timeout_ms: u64,
+    pub request_record_retention_ms: u64,
+    pub request_record_cleanup_interval_ms: u64,
+    pub request_record_cleanup_batch_size: usize,
+    pub auto_failover_enabled: bool,
+    pub auto_failover_interval_ms: u64,
+    pub auto_failover_batch_size: usize,
 }
 
 impl Default for TsoConfig {
@@ -192,6 +211,7 @@ impl Default for TsoConfig {
             instance_id: String::new(),
             advertise_endpoint: DEFAULT_ADVERTISE_ENDPOINT.to_owned(),
             bind_addr: DEFAULT_BIND_ADDR.to_owned(),
+            health_bind_addr: None,
             metrics_bind_addr: DEFAULT_METRICS_BIND_ADDR.to_owned(),
             metadata_kind: DEFAULT_METADATA_KIND.to_owned(),
             etcd_endpoints: Vec::new(),
@@ -200,6 +220,10 @@ impl Default for TsoConfig {
             grpc_tls_cert_file: None,
             grpc_tls_key_file: None,
             grpc_client_ca_file: None,
+            grpc_control_cert_allowlist: Vec::new(),
+            grpc_route_cert_allowlist: Vec::new(),
+            grpc_timestamp_cert_allowlist: Vec::new(),
+            grpc_status_cert_allowlist: Vec::new(),
             grpc_request_timeout_ms: None,
             grpc_max_request_bytes: None,
             grpc_max_concurrent_requests: None,
@@ -218,6 +242,13 @@ impl Default for TsoConfig {
             max_timeline_proxy_lanes: DEFAULT_MAX_TIMELINE_PROXY_LANES,
             max_timeline_runtime_entries: DEFAULT_MAX_TIMELINE_RUNTIME_ENTRIES,
             max_concurrent_timeline_loads: DEFAULT_MAX_CONCURRENT_TIMELINE_LOADS,
+            request_record_pending_timeout_ms: DEFAULT_REQUEST_RECORD_PENDING_TIMEOUT_MS,
+            request_record_retention_ms: DEFAULT_REQUEST_RECORD_RETENTION_MS,
+            request_record_cleanup_interval_ms: DEFAULT_REQUEST_RECORD_CLEANUP_INTERVAL_MS,
+            request_record_cleanup_batch_size: DEFAULT_REQUEST_RECORD_CLEANUP_BATCH_SIZE,
+            auto_failover_enabled: false,
+            auto_failover_interval_ms: DEFAULT_AUTO_FAILOVER_INTERVAL_MS,
+            auto_failover_batch_size: DEFAULT_AUTO_FAILOVER_BATCH_SIZE,
         }
     }
 }
@@ -407,6 +438,7 @@ impl TsoConfig {
             return Err(TsoConfigValidationError::EmptyAdvertiseEndpoint);
         }
         self.advertise_endpoint_host()?;
+        self.validate_health_bind_addr()?;
 
         let total_tier_generators = self
             .shared_generators
@@ -460,6 +492,36 @@ impl TsoConfig {
         }
         if self.max_concurrent_timeline_loads == 0 {
             return Err(TsoConfigValidationError::ZeroMaxConcurrentTimelineLoads);
+        }
+        validate_positive_u64_value(
+            "CHRONOS_REQUEST_RECORD_PENDING_TIMEOUT_MS",
+            self.request_record_pending_timeout_ms,
+        )?;
+        validate_positive_u64_value(
+            "CHRONOS_REQUEST_RECORD_RETENTION_MS",
+            self.request_record_retention_ms,
+        )?;
+        validate_positive_u64_value(
+            "CHRONOS_REQUEST_RECORD_CLEANUP_INTERVAL_MS",
+            self.request_record_cleanup_interval_ms,
+        )?;
+        validate_positive_usize_value(
+            "CHRONOS_REQUEST_RECORD_CLEANUP_BATCH_SIZE",
+            self.request_record_cleanup_batch_size,
+        )?;
+        validate_positive_u64_value(
+            "CHRONOS_AUTO_FAILOVER_INTERVAL_MS",
+            self.auto_failover_interval_ms,
+        )?;
+        validate_positive_usize_value(
+            "CHRONOS_AUTO_FAILOVER_BATCH_SIZE",
+            self.auto_failover_batch_size,
+        )?;
+        if self.request_record_retention_ms < self.request_record_pending_timeout_ms {
+            return Err(TsoConfigValidationError::Security(
+                "CHRONOS_REQUEST_RECORD_RETENTION_MS must be greater than or equal to CHRONOS_REQUEST_RECORD_PENDING_TIMEOUT_MS"
+                    .into(),
+            ));
         }
 
         match self.default_resource_tier {
@@ -539,6 +601,22 @@ impl TsoConfig {
             "CHRONOS_GRPC_REQUEST_TIMEOUT_MS",
             self.grpc_request_timeout_ms,
         )?;
+        validate_sha256_fingerprint_allowlist(
+            "CHRONOS_GRPC_CONTROL_CERT_ALLOWLIST",
+            &self.grpc_control_cert_allowlist,
+        )?;
+        validate_sha256_fingerprint_allowlist(
+            "CHRONOS_GRPC_ROUTE_CERT_ALLOWLIST",
+            &self.grpc_route_cert_allowlist,
+        )?;
+        validate_sha256_fingerprint_allowlist(
+            "CHRONOS_GRPC_TIMESTAMP_CERT_ALLOWLIST",
+            &self.grpc_timestamp_cert_allowlist,
+        )?;
+        validate_sha256_fingerprint_allowlist(
+            "CHRONOS_GRPC_STATUS_CERT_ALLOWLIST",
+            &self.grpc_status_cert_allowlist,
+        )?;
         validate_positive_optional_usize(
             "CHRONOS_GRPC_MAX_REQUEST_BYTES",
             self.grpc_max_request_bytes,
@@ -548,6 +626,25 @@ impl TsoConfig {
             self.grpc_max_concurrent_requests,
         )?;
         validate_positive_optional_u64("CHRONOS_ETCD_TIMEOUT_MS", self.etcd_timeout_ms)?;
+
+        if self.grpc_tls_paths()?.is_some() {
+            require_non_empty_allowlist(
+                "CHRONOS_GRPC_CONTROL_CERT_ALLOWLIST",
+                &self.grpc_control_cert_allowlist,
+            )?;
+            require_non_empty_allowlist(
+                "CHRONOS_GRPC_ROUTE_CERT_ALLOWLIST",
+                &self.grpc_route_cert_allowlist,
+            )?;
+            require_non_empty_allowlist(
+                "CHRONOS_GRPC_TIMESTAMP_CERT_ALLOWLIST",
+                &self.grpc_timestamp_cert_allowlist,
+            )?;
+            require_non_empty_allowlist(
+                "CHRONOS_GRPC_STATUS_CERT_ALLOWLIST",
+                &self.grpc_status_cert_allowlist,
+            )?;
+        }
 
         if effective_security_mode != TsoSecurityMode::Required {
             return Ok(());
@@ -641,6 +738,26 @@ impl TsoConfig {
                 .map(|endpoint| endpoint.trim())
                 .any(|endpoint| !endpoint.is_empty() && !endpoint_is_local(endpoint))
     }
+
+    fn validate_health_bind_addr(&self) -> Result<(), TsoConfigValidationError> {
+        let Some(health_bind_addr) = self.health_bind_addr.as_deref() else {
+            return Ok(());
+        };
+        let health_addr = parse_socket_addr(health_bind_addr, "CHRONOS_HEALTH_BIND_ADDR")?;
+        let grpc_addr = parse_socket_addr(&self.bind_addr, "CHRONOS_BIND_ADDR")?;
+        let metrics_addr = parse_socket_addr(&self.metrics_bind_addr, "CHRONOS_METRICS_BIND_ADDR")?;
+        if health_addr == grpc_addr {
+            return Err(TsoConfigValidationError::Security(
+                "CHRONOS_HEALTH_BIND_ADDR must not reuse CHRONOS_BIND_ADDR".into(),
+            ));
+        }
+        if health_addr == metrics_addr {
+            return Err(TsoConfigValidationError::Security(
+                "CHRONOS_HEALTH_BIND_ADDR must not reuse CHRONOS_METRICS_BIND_ADDR".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 pub fn parse_advertise_endpoint_host(endpoint: &str) -> Result<&str, TsoConfigValidationError> {
@@ -672,12 +789,39 @@ pub fn parse_advertise_endpoint_host(endpoint: &str) -> Result<&str, TsoConfigVa
 }
 
 fn socket_addr_is_loopback(addr: &str, field_name: &str) -> Result<bool, TsoConfigValidationError> {
-    let addr = addr.trim().parse::<SocketAddr>().map_err(|error| {
+    let addr = parse_socket_addr(addr, field_name)?;
+    Ok(addr.ip().is_loopback())
+}
+
+fn parse_socket_addr(addr: &str, field_name: &str) -> Result<SocketAddr, TsoConfigValidationError> {
+    addr.trim().parse::<SocketAddr>().map_err(|error| {
         TsoConfigValidationError::Security(format!(
             "{field_name} must be a valid socket address: {error}"
         ))
-    })?;
-    Ok(addr.ip().is_loopback())
+    })
+}
+
+fn validate_sha256_fingerprint_allowlist(
+    env_key: &str,
+    allowlist: &[String],
+) -> Result<(), TsoConfigValidationError> {
+    validate_peer_cert_allowlist_entries(allowlist).map_err(|error| {
+        TsoConfigValidationError::Security(format!(
+            "{env_key} contains an invalid fingerprint: {error}"
+        ))
+    })
+}
+
+fn require_non_empty_allowlist(
+    env_key: &str,
+    allowlist: &[String],
+) -> Result<(), TsoConfigValidationError> {
+    if allowlist.is_empty() {
+        return Err(TsoConfigValidationError::Security(format!(
+            "{env_key} must contain at least one SHA-256 client certificate fingerprint when gRPC mTLS is enabled"
+        )));
+    }
+    Ok(())
 }
 
 fn endpoint_host_is_local(endpoint: &str) -> Result<bool, TsoConfigValidationError> {
@@ -879,6 +1023,30 @@ fn validate_positive_optional_usize(
     Ok(())
 }
 
+fn validate_positive_u64_value(
+    field_name: &str,
+    value: u64,
+) -> Result<(), TsoConfigValidationError> {
+    if value == 0 {
+        return Err(TsoConfigValidationError::Security(format!(
+            "{field_name} must be greater than 0"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_positive_usize_value(
+    field_name: &str,
+    value: usize,
+) -> Result<(), TsoConfigValidationError> {
+    if value == 0 {
+        return Err(TsoConfigValidationError::Security(format!(
+            "{field_name} must be greater than 0"
+        )));
+    }
+    Ok(())
+}
+
 fn require_positive_u64(
     field_name: &str,
     value: Option<u64>,
@@ -1010,6 +1178,28 @@ mod tests {
             config.validate_for_startup(),
             Err(TsoConfigValidationError::InvalidAdvertiseEndpointFormat)
         );
+    }
+
+    #[test]
+    fn validate_for_startup_rejects_invalid_health_bind_addr() {
+        let mut config = valid_config();
+        config.health_bind_addr = Some("not-a-socket".into());
+        assert!(matches!(
+            config.validate_for_startup(),
+            Err(TsoConfigValidationError::Security(message))
+                if message.contains("CHRONOS_HEALTH_BIND_ADDR")
+        ));
+    }
+
+    #[test]
+    fn validate_for_startup_rejects_health_bind_addr_port_conflict() {
+        let mut config = valid_config();
+        config.health_bind_addr = Some(config.metrics_bind_addr.clone());
+        assert!(matches!(
+            config.validate_for_startup(),
+            Err(TsoConfigValidationError::Security(message))
+                if message.contains("CHRONOS_HEALTH_BIND_ADDR")
+        ));
     }
 
     #[test]
@@ -1193,6 +1383,12 @@ mod tests {
             grpc_tls_cert_file: Some("/definitely/missing/server.crt".into()),
             grpc_tls_key_file: Some("/definitely/missing/server.key".into()),
             grpc_client_ca_file: Some("/definitely/missing/ca.pem".into()),
+            grpc_control_cert_allowlist: vec![
+                crate::test_tls::placeholder_client_cert_fingerprint().into(),
+            ],
+            grpc_status_cert_allowlist: vec![crate::test_tls::placeholder_client_cert_fingerprint(
+            )
+            .into()],
             grpc_request_timeout_ms: Some(100),
             grpc_max_request_bytes: Some(1024),
             grpc_max_concurrent_requests: Some(16),
@@ -1263,6 +1459,18 @@ mod tests {
             grpc_tls_cert_file: Some(cert_path.to_string_lossy().into_owned()),
             grpc_tls_key_file: Some(key_path.to_string_lossy().into_owned()),
             grpc_client_ca_file: Some(ca_path.to_string_lossy().into_owned()),
+            grpc_control_cert_allowlist: vec![
+                crate::test_tls::placeholder_client_cert_fingerprint().into(),
+            ],
+            grpc_route_cert_allowlist: vec![
+                crate::test_tls::placeholder_client_cert_fingerprint().into()
+            ],
+            grpc_timestamp_cert_allowlist: vec![
+                crate::test_tls::placeholder_client_cert_fingerprint().into(),
+            ],
+            grpc_status_cert_allowlist: vec![crate::test_tls::placeholder_client_cert_fingerprint(
+            )
+            .into()],
             grpc_request_timeout_ms: Some(100),
             grpc_max_request_bytes: Some(1024),
             grpc_max_concurrent_requests: Some(16),
@@ -1298,6 +1506,18 @@ mod tests {
             grpc_tls_cert_file: Some(cert_path.to_string_lossy().into_owned()),
             grpc_tls_key_file: Some(key_link_path.to_string_lossy().into_owned()),
             grpc_client_ca_file: Some(ca_path.to_string_lossy().into_owned()),
+            grpc_control_cert_allowlist: vec![
+                crate::test_tls::placeholder_client_cert_fingerprint().into(),
+            ],
+            grpc_route_cert_allowlist: vec![
+                crate::test_tls::placeholder_client_cert_fingerprint().into()
+            ],
+            grpc_timestamp_cert_allowlist: vec![
+                crate::test_tls::placeholder_client_cert_fingerprint().into(),
+            ],
+            grpc_status_cert_allowlist: vec![crate::test_tls::placeholder_client_cert_fingerprint(
+            )
+            .into()],
             grpc_request_timeout_ms: Some(100),
             grpc_max_request_bytes: Some(1024),
             grpc_max_concurrent_requests: Some(16),
@@ -1331,6 +1551,18 @@ mod tests {
             grpc_tls_cert_file: Some(cert_path.to_string_lossy().into_owned()),
             grpc_tls_key_file: Some(key_path.to_string_lossy().into_owned()),
             grpc_client_ca_file: Some(ca_path.to_string_lossy().into_owned()),
+            grpc_control_cert_allowlist: vec![
+                crate::test_tls::placeholder_client_cert_fingerprint().into(),
+            ],
+            grpc_route_cert_allowlist: vec![
+                crate::test_tls::placeholder_client_cert_fingerprint().into()
+            ],
+            grpc_timestamp_cert_allowlist: vec![
+                crate::test_tls::placeholder_client_cert_fingerprint().into(),
+            ],
+            grpc_status_cert_allowlist: vec![crate::test_tls::placeholder_client_cert_fingerprint(
+            )
+            .into()],
             grpc_request_timeout_ms: Some(100),
             grpc_max_request_bytes: Some(1024),
             grpc_max_concurrent_requests: Some(16),
@@ -1349,6 +1581,12 @@ mod tests {
             grpc_tls_cert_file: Some(cert_path.into()),
             grpc_tls_key_file: Some(key_path.into()),
             grpc_client_ca_file: Some(ca_path.into()),
+            grpc_control_cert_allowlist: vec![
+                crate::test_tls::placeholder_client_cert_fingerprint().into(),
+            ],
+            grpc_status_cert_allowlist: vec![crate::test_tls::placeholder_client_cert_fingerprint(
+            )
+            .into()],
             grpc_request_timeout_ms: Some(0),
             grpc_max_request_bytes: Some(1024),
             grpc_max_concurrent_requests: Some(16),
@@ -1440,6 +1678,65 @@ mod tests {
             ),
             Err(TsoConfigValidationError::Security(message))
                 if message.contains("CHRONOS_ETCD_PREFIX")
+        ));
+    }
+
+    #[test]
+    fn validate_for_startup_rejects_invalid_control_cert_allowlist_entry() {
+        let (cert_path, key_path, ca_path) = crate::test_tls::readable_test_tls_paths();
+        let config = TsoConfig {
+            bind_addr: "0.0.0.0:50052".into(),
+            advertise_endpoint: "10.0.0.10:50052".into(),
+            security_mode: Some(TsoSecurityMode::Required),
+            grpc_tls_cert_file: Some(cert_path.into()),
+            grpc_tls_key_file: Some(key_path.into()),
+            grpc_client_ca_file: Some(ca_path.into()),
+            grpc_control_cert_allowlist: vec!["not-a-sha256".into()],
+            grpc_status_cert_allowlist: vec![crate::test_tls::placeholder_client_cert_fingerprint(
+            )
+            .into()],
+            grpc_request_timeout_ms: Some(100),
+            grpc_max_request_bytes: Some(1024),
+            grpc_max_concurrent_requests: Some(16),
+            ..TsoConfig::default()
+        };
+
+        assert!(matches!(
+            config.validate_for_startup(),
+            Err(TsoConfigValidationError::Security(message))
+                if message.contains("CHRONOS_GRPC_CONTROL_CERT_ALLOWLIST")
+        ));
+    }
+
+    #[test]
+    fn validate_for_startup_requires_status_cert_allowlist_when_grpc_mtls_is_enabled() {
+        let (cert_path, key_path, ca_path) = crate::test_tls::readable_test_tls_paths();
+        let config = TsoConfig {
+            bind_addr: "0.0.0.0:50052".into(),
+            advertise_endpoint: "10.0.0.10:50052".into(),
+            security_mode: Some(TsoSecurityMode::Required),
+            grpc_tls_cert_file: Some(cert_path.into()),
+            grpc_tls_key_file: Some(key_path.into()),
+            grpc_client_ca_file: Some(ca_path.into()),
+            grpc_control_cert_allowlist: vec![
+                crate::test_tls::placeholder_client_cert_fingerprint().into(),
+            ],
+            grpc_route_cert_allowlist: vec![
+                crate::test_tls::placeholder_client_cert_fingerprint().into()
+            ],
+            grpc_timestamp_cert_allowlist: vec![
+                crate::test_tls::placeholder_client_cert_fingerprint().into(),
+            ],
+            grpc_request_timeout_ms: Some(100),
+            grpc_max_request_bytes: Some(1024),
+            grpc_max_concurrent_requests: Some(16),
+            ..TsoConfig::default()
+        };
+
+        assert!(matches!(
+            config.validate_for_startup(),
+            Err(TsoConfigValidationError::Security(message))
+                if message.contains("CHRONOS_GRPC_STATUS_CERT_ALLOWLIST")
         ));
     }
 

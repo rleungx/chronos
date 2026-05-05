@@ -1,5 +1,7 @@
 use tonic::{Request, Response, Status};
 
+use crate::authz::PeerCertAuthorizer;
+use crate::config::TsoConfigValidationError;
 use crate::proto::v1::{
     timeline_control_service_server::TimelineControlService,
     timeline_status_service_server::TimelineStatusService, GetTimelineStatusRequest,
@@ -15,6 +17,7 @@ use super::{
 pub struct TsoControlService {
     control_plane: TsoControlPlane,
     health_status: HealthStatusHandle,
+    authorizer: PeerCertAuthorizer,
 }
 
 impl TsoControlService {
@@ -23,6 +26,7 @@ impl TsoControlService {
         Self {
             control_plane,
             health_status: HealthStatusHandle::serving(&health_info),
+            authorizer: PeerCertAuthorizer::disabled("TimelineControlService"),
         }
     }
 
@@ -33,7 +37,25 @@ impl TsoControlService {
         Self {
             control_plane,
             health_status,
+            authorizer: PeerCertAuthorizer::disabled("TimelineControlService"),
         }
+    }
+
+    pub fn with_health_status_and_allowlist(
+        control_plane: TsoControlPlane,
+        health_status: HealthStatusHandle,
+        allowlist: &[String],
+    ) -> Result<Self, TsoConfigValidationError> {
+        Ok(Self {
+            control_plane,
+            health_status,
+            authorizer: PeerCertAuthorizer::from_allowlist("TimelineControlService", allowlist)
+                .map_err(TsoConfigValidationError::Security)?,
+        })
+    }
+
+    fn authorize<T>(&self, request: &Request<T>) -> Result<(), Status> {
+        self.authorizer.authorize(request)
     }
 }
 
@@ -43,13 +65,15 @@ impl TimelineControlService for TsoControlService {
         &self,
         request: Request<TransferTimelineRequest>,
     ) -> Result<Response<TransferTimelineResponse>, Status> {
+        self.authorize(&request)?;
         Ok(Response::new(
             transfer_adapter::transfer_timeline_response(&self.control_plane, request.into_inner())
                 .await?,
         ))
     }
 
-    async fn health(&self, _request: Request<()>) -> Result<Response<HealthResponse>, Status> {
+    async fn health(&self, request: Request<()>) -> Result<Response<HealthResponse>, Status> {
+        self.authorize(&request)?;
         let worker_status = self.health_status.snapshot();
         Ok(Response::new(status_mapping::health_response(
             worker_status,
@@ -60,11 +84,30 @@ impl TimelineControlService for TsoControlService {
 
 pub struct TsoTimelineStatusService {
     control_plane: TsoControlPlane,
+    authorizer: PeerCertAuthorizer,
 }
 
 impl TsoTimelineStatusService {
     pub fn new(control_plane: TsoControlPlane) -> Self {
-        Self { control_plane }
+        Self {
+            control_plane,
+            authorizer: PeerCertAuthorizer::disabled("TimelineStatusService"),
+        }
+    }
+
+    pub fn with_allowlist(
+        control_plane: TsoControlPlane,
+        allowlist: &[String],
+    ) -> Result<Self, TsoConfigValidationError> {
+        Ok(Self {
+            control_plane,
+            authorizer: PeerCertAuthorizer::from_allowlist("TimelineStatusService", allowlist)
+                .map_err(TsoConfigValidationError::Security)?,
+        })
+    }
+
+    fn authorize<T>(&self, request: &Request<T>) -> Result<(), Status> {
+        self.authorizer.authorize(request)
     }
 }
 
@@ -74,6 +117,7 @@ impl TimelineStatusService for TsoTimelineStatusService {
         &self,
         request: Request<GetTimelineStatusRequest>,
     ) -> Result<Response<GetTimelineStatusResponse>, Status> {
+        self.authorize(&request)?;
         Ok(Response::new(
             timeline_status_query::get_timeline_status_response(
                 &self.control_plane,
@@ -87,6 +131,7 @@ impl TimelineStatusService for TsoTimelineStatusService {
         &self,
         request: Request<ListTimelineStatusesRequest>,
     ) -> Result<Response<ListTimelineStatusesResponse>, Status> {
+        self.authorize(&request)?;
         Ok(Response::new(
             timeline_status_query::list_timeline_statuses_response(
                 &self.control_plane,

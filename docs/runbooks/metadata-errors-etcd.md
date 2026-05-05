@@ -3,7 +3,7 @@
 ## Signal
 
 - Alert: `ChronosMetadataErrors`
-- Related alerts: `ChronosWatchSendTimeouts`, `ChronosWatchKeepaliveDropped`, `ChronosRecoveryEvents`
+- Related alerts: `ChronosWatchResyncs`, `ChronosRecoveryEvents`
 
 ## Immediate checks
 
@@ -15,7 +15,7 @@
 
 1. Verify etcd quorum and endpoint reachability.
 2. If errors coincide with watch churn or recovery spikes, inspect:
-   - `tso_watch_resync_total`
+   - `tso_watch_resync_total` grouped by `event`
    - `tso_recovery_events_total`
 3. If metadata is degraded but Chronos is still serving, monitor for escalation to readiness loss.
 4. Re-run `make test-layer-4` or environment-equivalent etcd validation after mitigation.

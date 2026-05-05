@@ -4,9 +4,11 @@ mod common_etcd_endpoints;
 mod common_etcd_prefix;
 
 use std::{
-    io::Read,
+    fs::{self, File},
     net::{SocketAddr, TcpListener},
+    path::PathBuf,
     process::{Child, Command, Stdio},
+    sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
 
@@ -33,6 +35,21 @@ struct SpawnedChronosConfig<'a> {
     safety_gap_ms: u64,
 }
 
+struct SpawnedChronos {
+    child: Child,
+    stderr_path: PathBuf,
+}
+
+impl Drop for SpawnedChronos {
+    fn drop(&mut self) {
+        if matches!(self.child.try_wait(), Ok(None)) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+        let _ = fs::remove_file(&self.stderr_path);
+    }
+}
+
 fn chronos_bin() -> &'static str {
     env!("CARGO_BIN_EXE_chronos")
 }
@@ -50,9 +67,24 @@ fn free_loopback_addr() -> SocketAddr {
     addr
 }
 
-fn spawn_chronos_process(config: SpawnedChronosConfig<'_>) -> Child {
-    let advertise_endpoint = config.bind_addr.to_string();
-    Command::new(chronos_bin())
+fn routable_test_advertise_endpoint(worker_id: &str, bind_addr: SocketAddr) -> String {
+    format!("{worker_id}.localhost:{}", bind_addr.port())
+}
+
+fn next_stderr_path(worker_id: &str) -> PathBuf {
+    static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+    std::env::temp_dir().join(format!(
+        "chronos-multiprocess-{worker_id}-{}-{}.stderr",
+        std::process::id(),
+        NEXT_ID.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
+fn spawn_chronos_process(config: SpawnedChronosConfig<'_>) -> SpawnedChronos {
+    let advertise_endpoint = routable_test_advertise_endpoint(config.worker_id, config.bind_addr);
+    let stderr_path = next_stderr_path(config.worker_id);
+    let stderr_file = File::create(&stderr_path).expect("child stderr file should be created");
+    let child = Command::new(chronos_bin())
         .env("CHRONOS_METADATA", "etcd")
         .env("CHRONOS_ETCD_ENDPOINTS", test_etcd_endpoints_csv())
         .env("CHRONOS_ETCD_PREFIX", config.prefix)
@@ -67,9 +99,11 @@ fn spawn_chronos_process(config: SpawnedChronosConfig<'_>) -> Child {
             config.metrics_bind_addr.to_string(),
         )
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::from(stderr_file))
         .spawn()
-        .expect("chronos process should spawn")
+        .expect("chronos process should spawn");
+
+    SpawnedChronos { child, stderr_path }
 }
 
 fn endpoint_uri(addr: SocketAddr) -> String {
@@ -94,16 +128,11 @@ async fn timestamp_client(endpoint: SocketAddr) -> TimestampServiceClient<Channe
         .expect("timestamp client should connect")
 }
 
-fn read_child_stderr(child: &mut Child) -> String {
-    let mut stderr = String::new();
-    if let Some(mut pipe) = child.stderr.take() {
-        pipe.read_to_string(&mut stderr)
-            .expect("child stderr should read");
-    }
-    stderr
+fn read_child_stderr(child: &SpawnedChronos) -> String {
+    fs::read_to_string(&child.stderr_path).unwrap_or_default()
 }
 
-async fn wait_for_identity_key(prefix: &str, instance_id: &str, child: &mut Child) {
+async fn wait_for_identity_key(prefix: &str, instance_id: &str, child: &mut SpawnedChronos) {
     let key = format!("{prefix}/identity/instances/{instance_id}");
     let endpoints = parsed_test_etcd_endpoints();
     let mut client = Client::connect(endpoints, None)
@@ -112,7 +141,11 @@ async fn wait_for_identity_key(prefix: &str, instance_id: &str, child: &mut Chil
 
     timeout(Duration::from_secs(10), async {
         loop {
-            if let Some(status) = child.try_wait().expect("child try_wait should succeed") {
+            if let Some(status) = child
+                .child
+                .try_wait()
+                .expect("child try_wait should succeed")
+            {
                 let stderr = read_child_stderr(child);
                 panic!(
                     "chronos process exited before identity key appeared: status={status} stderr={stderr}"
@@ -133,10 +166,14 @@ async fn wait_for_identity_key(prefix: &str, instance_id: &str, child: &mut Chil
     .expect("identity key should appear before timeout");
 }
 
-async fn wait_for_ready(endpoint: SocketAddr, child: &mut Child) {
+async fn wait_for_ready(endpoint: SocketAddr, child: &mut SpawnedChronos) {
     timeout(Duration::from_secs(15), async {
         loop {
-            if let Some(status) = child.try_wait().expect("child try_wait should succeed") {
+            if let Some(status) = child
+                .child
+                .try_wait()
+                .expect("child try_wait should succeed")
+            {
                 let stderr = read_child_stderr(child);
                 panic!("chronos process exited before readiness: status={status} stderr={stderr}");
             }
@@ -171,10 +208,14 @@ async fn identity_key_exists(prefix: &str, instance_id: &str) -> bool {
     !response.kvs().is_empty()
 }
 
-async fn wait_for_exit(child: &mut Child) -> std::process::ExitStatus {
+async fn wait_for_exit(child: &mut SpawnedChronos) -> std::process::ExitStatus {
     timeout(Duration::from_secs(10), async {
         loop {
-            if let Some(status) = child.try_wait().expect("child try_wait should succeed") {
+            if let Some(status) = child
+                .child
+                .try_wait()
+                .expect("child try_wait should succeed")
+            {
                 return status;
             }
             sleep(Duration::from_millis(50)).await;
@@ -184,15 +225,17 @@ async fn wait_for_exit(child: &mut Child) -> std::process::ExitStatus {
     .expect("child should exit before timeout")
 }
 
-async fn terminate_child(child: &mut Child) {
+async fn terminate_child(child: &mut SpawnedChronos) {
     if child
+        .child
         .try_wait()
         .expect("child try_wait should succeed")
         .is_none()
     {
-        child.kill().expect("child kill should succeed");
+        child.child.kill().expect("child kill should succeed");
     }
-    let _ = child.wait().expect("child wait should succeed");
+    let _ = child.child.wait().expect("child wait should succeed");
+    let _ = fs::remove_file(&child.stderr_path);
 }
 
 async fn ensure_timeline(endpoint: SocketAddr, timeline_key: &str) -> TimelineRoute {
@@ -302,13 +345,14 @@ async fn etcd_spawned_process_rejects_duplicate_instance_identity() {
     });
 
     let status = wait_for_exit(&mut second).await;
-    let stderr = read_child_stderr(&mut second);
+    let stderr = read_child_stderr(&second);
     assert!(
         !status.success(),
         "duplicate instance process should fail, status={status} stderr={stderr}"
     );
     assert!(
         first
+            .child
             .try_wait()
             .expect("first child try_wait should succeed")
             .is_none(),
@@ -336,8 +380,8 @@ async fn etcd_spawned_process_failover_preserves_tso_monotonicity() {
 
     let bind_a = free_loopback_addr();
     let bind_b = free_loopback_addr();
-    let endpoint_a = bind_a.to_string();
-    let endpoint_b = bind_b.to_string();
+    let endpoint_a = routable_test_advertise_endpoint("worker-a", bind_a);
+    let endpoint_b = routable_test_advertise_endpoint("worker-b", bind_b);
 
     let mut first = spawn_chronos_process(SpawnedChronosConfig {
         prefix: &prefix,
@@ -376,10 +420,13 @@ async fn etcd_spawned_process_failover_preserves_tso_monotonicity() {
     );
     let route_still_a = get_timeline_route(bind_b, timeline_key).await;
     assert_eq!(route_still_a.owner_worker_endpoint, endpoint_a);
-    let blocked_allocate =
-        allocate_timestamps_raw(bind_b, &route_still_a, "blocked-before-failover", 1)
-            .await
-            .expect_err("new owner must not allocate before failover succeeds");
+    let blocked_allocate = timeout(
+        Duration::from_secs(2),
+        allocate_timestamps_raw(bind_b, &route_still_a, "blocked-before-failover", 1),
+    )
+    .await
+    .expect("blocked allocation should return promptly")
+    .expect_err("new owner must not allocate before failover succeeds");
     assert!(
         matches!(
             blocked_allocate.code(),

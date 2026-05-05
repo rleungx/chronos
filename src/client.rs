@@ -8,7 +8,7 @@
 //! Internal route management stays inside the client. The client ensures the timeline,
 //! fetches the current route, caches it, and refreshes it on stale-route errors.
 //! Stale-route conditions such as owner, epoch, or route-version mismatch are retried
-//! internally once after a route refresh. Other RPC failures are returned to the caller.
+//! internally after route refresh. Other RPC failures are returned to the caller.
 //!
 //! ```no_run
 //! use chronos::{Client, ClientConfig};
@@ -27,11 +27,12 @@
 //! ```
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use prost::Message;
 use thiserror::Error;
 use tokio::sync::{Mutex, RwLock};
-use tonic::transport::{Channel, Endpoint};
+use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 use tonic::{Code, Status};
 
 use crate::proto::v1::{
@@ -41,11 +42,26 @@ use crate::proto::v1::{
     TimelineRoute, TimestampRange,
 };
 
+const DEFAULT_STALE_ROUTE_RETRY_ATTEMPTS: u32 = 3;
+const DEFAULT_STALE_ROUTE_RETRY_BACKOFF_MS: u64 = 5;
+
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
     timeline_key: String,
     desired_resource_tier: ResourceTier,
     request_timeout_ms: u32,
+    stale_route_retry_attempts: u32,
+    stale_route_retry_backoff_ms: u64,
+    transport: ClientTransportConfig,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ClientTransportConfig {
+    insecure: bool,
+    ca_pem: Option<Vec<u8>>,
+    client_cert_pem: Option<Vec<u8>>,
+    client_key_pem: Option<Vec<u8>>,
+    domain_name: Option<String>,
 }
 
 impl ClientConfig {
@@ -55,6 +71,9 @@ impl ClientConfig {
             timeline_key: timeline_key.into(),
             desired_resource_tier: ResourceTier::Shared,
             request_timeout_ms: 0,
+            stale_route_retry_attempts: DEFAULT_STALE_ROUTE_RETRY_ATTEMPTS,
+            stale_route_retry_backoff_ms: DEFAULT_STALE_ROUTE_RETRY_BACKOFF_MS,
+            transport: ClientTransportConfig::default(),
         }
     }
 
@@ -67,6 +86,55 @@ impl ClientConfig {
     /// Sets the per-request timeout forwarded to `AllocateTimestamps`.
     pub fn with_request_timeout_ms(mut self, request_timeout_ms: u32) -> Self {
         self.request_timeout_ms = request_timeout_ms;
+        self
+    }
+
+    /// Sets how many stale-route refresh retries a single allocation may perform.
+    pub fn with_stale_route_retry_attempts(mut self, stale_route_retry_attempts: u32) -> Self {
+        self.stale_route_retry_attempts = stale_route_retry_attempts;
+        self
+    }
+
+    /// Sets the backoff between stale-route refresh retries.
+    pub fn with_stale_route_retry_backoff_ms(mut self, stale_route_retry_backoff_ms: u64) -> Self {
+        self.stale_route_retry_backoff_ms = stale_route_retry_backoff_ms;
+        self
+    }
+
+    /// Sets the secure transport configuration used for initial route connect and owner reconnects.
+    pub fn with_transport(mut self, transport: ClientTransportConfig) -> Self {
+        self.transport = transport;
+        self
+    }
+}
+
+impl ClientTransportConfig {
+    /// Uses explicit plaintext transport instead of TLS.
+    pub fn with_insecure(mut self, insecure: bool) -> Self {
+        self.insecure = insecure;
+        self
+    }
+
+    /// Supplies PEM-encoded CA roots for TLS server verification.
+    pub fn with_ca_pem(mut self, ca_pem: impl Into<Vec<u8>>) -> Self {
+        self.ca_pem = Some(ca_pem.into());
+        self
+    }
+
+    /// Supplies PEM-encoded client certificate and private key for mutual TLS.
+    pub fn with_client_identity_pem(
+        mut self,
+        client_cert_pem: impl Into<Vec<u8>>,
+        client_key_pem: impl Into<Vec<u8>>,
+    ) -> Self {
+        self.client_cert_pem = Some(client_cert_pem.into());
+        self.client_key_pem = Some(client_key_pem.into());
+        self
+    }
+
+    /// Overrides the TLS server name / authority used during verification.
+    pub fn with_domain_name(mut self, domain_name: impl Into<String>) -> Self {
+        self.domain_name = Some(domain_name.into());
         self
     }
 }
@@ -87,6 +155,8 @@ pub enum ClientError {
     Rpc(Box<Status>),
     #[error("chronos returned no route from {operation}")]
     MissingRoute { operation: &'static str },
+    #[error("invalid client transport configuration: {message}")]
+    InvalidTransportConfig { message: String },
 }
 
 impl From<Status> for ClientError {
@@ -104,6 +174,7 @@ pub struct Client {
     tso_client: RwLock<TimestampServiceClient<Channel>>,
     owner_endpoint: Mutex<String>,
     route: RwLock<TimelineRoute>,
+    route_refresh: Mutex<()>,
     config: ClientConfig,
     request_id: AtomicU64,
 }
@@ -123,11 +194,7 @@ impl Client {
         config: ClientConfig,
     ) -> Result<Self, ClientError> {
         let endpoint = endpoint.into();
-        let channel = Endpoint::from_shared(normalize_endpoint(&endpoint))
-            .map_err(|source| ClientError::Endpoint {
-                endpoint: endpoint.clone(),
-                source,
-            })?
+        let channel = build_endpoint(&endpoint, &config.transport)?
             .connect()
             .await
             .map_err(|source| ClientError::Endpoint {
@@ -150,14 +217,17 @@ impl Client {
             .ok_or(ClientError::MissingRoute {
                 operation: "ensure_timeline",
             })?;
-        let tso_client =
-            TimestampServiceClient::new(connect_channel(&ensured_route.owner_worker_endpoint)?);
+        let tso_client = TimestampServiceClient::new(connect_channel(
+            &ensured_route.owner_worker_endpoint,
+            &config.transport,
+        )?);
 
         Ok(Self {
             route_client: Mutex::new(route_client),
             tso_client: RwLock::new(tso_client),
             owner_endpoint: Mutex::new(ensured_route.owner_worker_endpoint.clone()),
             route: RwLock::new(ensured_route),
+            route_refresh: Mutex::new(()),
             config,
             request_id: AtomicU64::new(1),
         })
@@ -165,25 +235,54 @@ impl Client {
 
     /// Allocates one or more timestamp ranges from the bound timeline.
     ///
-    /// This method refreshes the cached route and retries once when Chronos reports that the
+    /// This method refreshes the cached route and retries when Chronos reports that the
     /// current route is stale. Other failures are returned as `ClientError`.
     pub async fn allocate_timestamps(
         &self,
         count: u32,
     ) -> Result<Vec<TimestampRange>, ClientError> {
-        let route = self.route.read().await.clone();
-        let tso_client = self.tso_client.read().await.clone();
-        match self.allocate_once(tso_client, &route, count).await {
-            Ok(ranges) => Ok(ranges),
-            Err(status) if is_stale_route_error(&status) => {
-                let route = self.refresh_route().await?;
-                let tso_client = self.tso_client.read().await.clone();
-                self.allocate_once(tso_client, &route, count)
-                    .await
-                    .map_err(ClientError::from)
+        let client_request_id = self.next_client_request_id();
+        let mut stale_retries = 0;
+
+        loop {
+            let route = self.route.read().await.clone();
+            let tso_client = self.tso_client.read().await.clone();
+            match self
+                .allocate_once(tso_client, &route, count, &client_request_id)
+                .await
+            {
+                Ok(ranges) => return Ok(ranges),
+                Err(status)
+                    if is_stale_route_error(&status)
+                        && stale_retries < self.config.stale_route_retry_attempts =>
+                {
+                    stale_retries += 1;
+                    self.refresh_route_if_unchanged(&route).await?;
+                    if self.config.stale_route_retry_backoff_ms > 0 {
+                        tokio::time::sleep(Duration::from_millis(
+                            self.config.stale_route_retry_backoff_ms,
+                        ))
+                        .await;
+                    }
+                }
+                Err(status) => return Err(status.into()),
             }
-            Err(status) => Err(status.into()),
         }
+    }
+
+    async fn refresh_route_if_unchanged(
+        &self,
+        observed_route: &TimelineRoute,
+    ) -> Result<TimelineRoute, ClientError> {
+        let _refresh_guard = self.route_refresh.lock().await;
+        let current_route = self.route.read().await.clone();
+        if !same_route_identity(&current_route, observed_route) {
+            self.ensure_owner_client(&current_route.owner_worker_endpoint)
+                .await?;
+            return Ok(current_route);
+        }
+
+        self.refresh_route().await
     }
 
     async fn refresh_route(&self) -> Result<TimelineRoute, ClientError> {
@@ -212,7 +311,7 @@ impl Client {
             return Ok(());
         }
 
-        let channel = connect_channel(owner_endpoint)?;
+        let channel = connect_channel(owner_endpoint, &self.config.transport)?;
         *self.tso_client.write().await = TimestampServiceClient::new(channel);
         *current_owner = owner_endpoint.to_string();
         Ok(())
@@ -223,8 +322,9 @@ impl Client {
         mut tso_client: TimestampServiceClient<Channel>,
         route: &TimelineRoute,
         count: u32,
+        client_request_id: &str,
     ) -> Result<Vec<TimestampRange>, Status> {
-        self.allocate_with_client(&mut tso_client, route, count)
+        self.allocate_with_client(&mut tso_client, route, count, client_request_id)
             .await
     }
 
@@ -233,6 +333,7 @@ impl Client {
         tso_client: &mut TimestampServiceClient<Channel>,
         route: &TimelineRoute,
         count: u32,
+        client_request_id: &str,
     ) -> Result<Vec<TimestampRange>, Status> {
         Ok(tso_client
             .allocate_timestamps(tonic::Request::new(AllocateTimestampsRequest {
@@ -240,34 +341,96 @@ impl Client {
                 count,
                 expected_epoch: route.epoch,
                 expected_route_version: route.route_version,
-                client_request_id: format!(
-                    "{}-{}",
-                    self.config.timeline_key,
-                    self.request_id.fetch_add(1, Ordering::Relaxed)
-                ),
+                client_request_id: client_request_id.to_string(),
                 request_timeout_ms: self.config.request_timeout_ms,
             }))
             .await?
             .into_inner()
             .ranges)
     }
-}
 
-fn normalize_endpoint(endpoint: &str) -> String {
-    if endpoint.contains("://") {
-        endpoint.to_string()
-    } else {
-        format!("http://{endpoint}")
+    fn next_client_request_id(&self) -> String {
+        format!(
+            "{}-{}",
+            self.config.timeline_key,
+            self.request_id.fetch_add(1, Ordering::Relaxed)
+        )
     }
 }
 
-fn connect_channel(endpoint: &str) -> Result<Channel, ClientError> {
-    let normalized = normalize_endpoint(endpoint);
-    let endpoint = Endpoint::from_shared(normalized).map_err(|source| ClientError::Endpoint {
-        endpoint: endpoint.to_string(),
-        source,
-    })?;
-    Ok(endpoint.connect_lazy())
+fn same_route_identity(left: &TimelineRoute, right: &TimelineRoute) -> bool {
+    left.timeline_key == right.timeline_key
+        && left.generator_id == right.generator_id
+        && left.owner_worker_endpoint == right.owner_worker_endpoint
+        && left.epoch == right.epoch
+        && left.route_version == right.route_version
+        && left.resource_tier == right.resource_tier
+}
+
+fn normalize_endpoint(endpoint: &str, insecure: bool) -> String {
+    if endpoint.contains("://") {
+        endpoint.to_string()
+    } else {
+        let scheme = if insecure { "http" } else { "https" };
+        format!("{scheme}://{endpoint}")
+    }
+}
+
+fn build_endpoint(
+    endpoint: &str,
+    transport: &ClientTransportConfig,
+) -> Result<Endpoint, ClientError> {
+    validate_transport_config(transport)?;
+    let normalized = normalize_endpoint(endpoint, transport.insecure);
+    let endpoint_label = endpoint.to_string();
+    let mut endpoint =
+        Endpoint::from_shared(normalized.clone()).map_err(|source| ClientError::Endpoint {
+            endpoint: endpoint_label.clone(),
+            source,
+        })?;
+    if should_use_tls(&normalized, transport) {
+        let mut tls = ClientTlsConfig::new();
+        if let Some(ca_pem) = &transport.ca_pem {
+            tls = tls.ca_certificate(Certificate::from_pem(ca_pem.clone()));
+        }
+        if let (Some(cert_pem), Some(key_pem)) =
+            (&transport.client_cert_pem, &transport.client_key_pem)
+        {
+            tls = tls.identity(Identity::from_pem(cert_pem.clone(), key_pem.clone()));
+        }
+        if let Some(domain_name) = &transport.domain_name {
+            tls = tls.domain_name(domain_name.clone());
+        }
+        endpoint = endpoint
+            .tls_config(tls)
+            .map_err(|source| ClientError::Endpoint {
+                endpoint: endpoint_label,
+                source,
+            })?;
+    }
+    Ok(endpoint)
+}
+
+fn connect_channel(
+    endpoint: &str,
+    transport: &ClientTransportConfig,
+) -> Result<Channel, ClientError> {
+    Ok(build_endpoint(endpoint, transport)?.connect_lazy())
+}
+
+fn should_use_tls(endpoint: &str, transport: &ClientTransportConfig) -> bool {
+    !transport.insecure && !endpoint.starts_with("http://")
+}
+
+fn validate_transport_config(transport: &ClientTransportConfig) -> Result<(), ClientError> {
+    let has_cert = transport.client_cert_pem.is_some();
+    let has_key = transport.client_key_pem.is_some();
+    if has_cert != has_key {
+        return Err(ClientError::InvalidTransportConfig {
+            message: "client certificate and private key must be configured together".into(),
+        });
+    }
+    Ok(())
 }
 
 fn is_stale_route_error(status: &Status) -> bool {
@@ -289,6 +452,7 @@ fn is_stale_route_error(status: &Status) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::{Arc, Mutex as StdMutex};
 
     use prost::Message;
@@ -348,6 +512,7 @@ mod tests {
     #[derive(Clone)]
     struct FakeRouteService {
         route: Arc<StdMutex<TimelineRoute>>,
+        get_calls: Arc<AtomicUsize>,
     }
 
     #[tonic::async_trait]
@@ -356,6 +521,7 @@ mod tests {
             &self,
             request: Request<GetTimelineRouteRequest>,
         ) -> Result<Response<GetTimelineRouteResponse>, Status> {
+            self.get_calls.fetch_add(1, AtomicOrdering::AcqRel);
             let mut route = self.route.lock().unwrap().clone();
             route.timeline_key = request.into_inner().timeline_key;
             Ok(Response::new(GetTimelineRouteResponse {
@@ -431,6 +597,7 @@ mod tests {
         let incoming = TcpListenerStream::new(listener);
         let route_service = FakeRouteService {
             route: Arc::new(StdMutex::new(route)),
+            get_calls: Arc::new(AtomicUsize::new(0)),
         };
 
         tokio::spawn(async move {
@@ -442,6 +609,31 @@ mod tests {
         });
 
         addr.to_string()
+    }
+
+    async fn spawn_counting_route_only_server(route: TimelineRoute) -> (String, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener
+            .local_addr()
+            .expect("listener should have local addr");
+        let incoming = TcpListenerStream::new(listener);
+        let get_calls = Arc::new(AtomicUsize::new(0));
+        let route_service = FakeRouteService {
+            route: Arc::new(StdMutex::new(route)),
+            get_calls: Arc::clone(&get_calls),
+        };
+
+        tokio::spawn(async move {
+            Server::builder()
+                .add_service(TimelineRouteServiceServer::new(route_service))
+                .serve_with_incoming(incoming)
+                .await
+                .expect("server should serve");
+        });
+
+        (addr.to_string(), get_calls)
     }
 
     async fn spawn_timestamp_only_server(route: TimelineRoute) -> String {
@@ -470,9 +662,13 @@ mod tests {
     #[tokio::test]
     async fn connect_initializes_timeline_and_allocation_only_needs_count() {
         let endpoint = spawn_test_server().await;
-        let client = Client::connect(endpoint, "orders.primary")
-            .await
-            .expect("client should connect");
+        let client = Client::connect_with_config(
+            endpoint,
+            ClientConfig::new("orders.primary")
+                .with_transport(ClientTransportConfig::default().with_insecure(true)),
+        )
+        .await
+        .expect("client should connect");
 
         let ranges = client
             .allocate_timestamps(1)
@@ -485,9 +681,13 @@ mod tests {
     #[tokio::test]
     async fn allocate_refreshes_stale_cached_route_and_retries() {
         let endpoint = spawn_test_server().await;
-        let client = Client::connect(endpoint, "orders.primary")
-            .await
-            .expect("client should connect");
+        let client = Client::connect_with_config(
+            endpoint,
+            ClientConfig::new("orders.primary")
+                .with_transport(ClientTransportConfig::default().with_insecure(true)),
+        )
+        .await
+        .expect("client should connect");
 
         {
             let mut route = client.route.write().await;
@@ -503,12 +703,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn repeated_stale_route_refresh_reuses_newer_cached_route() {
+        let (endpoint, get_calls) = spawn_counting_route_only_server(TimelineRoute {
+            timeline_key: "orders.primary".into(),
+            generator_id: 7,
+            owner_worker_endpoint: "127.0.0.1:0".into(),
+            epoch: 3,
+            route_version: 11,
+            resource_tier: ResourceTier::Shared as i32,
+        })
+        .await;
+        let client = Client::connect_with_config(
+            endpoint,
+            ClientConfig::new("orders.primary")
+                .with_transport(ClientTransportConfig::default().with_insecure(true)),
+        )
+        .await
+        .expect("client should connect");
+
+        {
+            let mut route = client.route.write().await;
+            route.route_version = 10;
+        }
+        let stale_observation = client.route.read().await.clone();
+
+        client
+            .refresh_route_if_unchanged(&stale_observation)
+            .await
+            .expect("first refresh should load from control plane");
+        client
+            .refresh_route_if_unchanged(&stale_observation)
+            .await
+            .expect("second refresh should reuse cached route");
+
+        assert_eq!(get_calls.load(AtomicOrdering::Acquire), 1);
+    }
+
+    #[tokio::test]
     async fn concurrent_allocations_recover_from_shared_stale_cached_route() {
         let endpoint = spawn_test_server().await;
         let client = Arc::new(
-            Client::connect(endpoint, "orders.primary")
-                .await
-                .expect("client should connect"),
+            Client::connect_with_config(
+                endpoint,
+                ClientConfig::new("orders.primary")
+                    .with_transport(ClientTransportConfig::default().with_insecure(true)),
+            )
+            .await
+            .expect("client should connect"),
         );
 
         {
@@ -554,9 +795,13 @@ mod tests {
         })
         .await;
 
-        let client = Client::connect(route_addr, "orders.primary")
-            .await
-            .expect("client should connect");
+        let client = Client::connect_with_config(
+            route_addr,
+            ClientConfig::new("orders.primary")
+                .with_transport(ClientTransportConfig::default().with_insecure(true)),
+        )
+        .await
+        .expect("client should connect");
 
         let ranges = client
             .allocate_timestamps(1)
@@ -568,14 +813,35 @@ mod tests {
     }
 
     #[test]
-    fn normalize_endpoint_accepts_bare_host_port() {
+    fn normalize_endpoint_defaults_to_secure_and_respects_explicit_insecure() {
         assert_eq!(
-            normalize_endpoint("127.0.0.1:50051"),
+            normalize_endpoint("127.0.0.1:50051", false),
+            "https://127.0.0.1:50051"
+        );
+        assert_eq!(
+            normalize_endpoint("127.0.0.1:50051", true),
             "http://127.0.0.1:50051"
         );
         assert_eq!(
-            normalize_endpoint("https://chronos.internal:50051"),
+            normalize_endpoint("https://chronos.internal:50051", false),
             "https://chronos.internal:50051"
         );
+    }
+
+    #[test]
+    fn transport_config_rejects_partial_client_identity() {
+        validate_transport_config(
+            &ClientTransportConfig::default()
+                .with_ca_pem(b"ca".to_vec())
+                .with_domain_name("chronos.internal"),
+        )
+        .expect("complete secure transport settings should validate");
+
+        let error = validate_transport_config(&ClientTransportConfig {
+            client_cert_pem: Some(b"cert".to_vec()),
+            ..ClientTransportConfig::default()
+        })
+        .expect_err("partial client identity should be rejected");
+        assert!(matches!(error, ClientError::InvalidTransportConfig { .. }));
     }
 }

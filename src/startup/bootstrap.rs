@@ -55,6 +55,19 @@ async fn finalize_etcd_startup(
     metadata: Arc<EtcdMetadataStore>,
     mut identity_lease: InstanceIdentityLease,
 ) -> AppResult<(Arc<TsoService>, Option<InstanceIdentityLease>)> {
+    if let Err(error) = metadata
+        .verify_instance_identity_write_path(
+            identity_lease.lease_id(),
+            config.effective_instance_id(),
+            &config.worker_id,
+            &config.advertise_endpoint,
+        )
+        .await
+    {
+        identity_lease.shutdown().await;
+        return Err(Box::new(error));
+    }
+
     if let Err(error) = run_metadata_startup_probe(metadata.as_ref()).await {
         identity_lease.shutdown().await;
         return Err(error);

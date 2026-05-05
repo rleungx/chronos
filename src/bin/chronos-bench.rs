@@ -26,6 +26,7 @@ struct BenchConfig {
     warmup_secs: u64,
     resource_tier: ResourceTier,
     scenario: String,
+    idempotency_enabled: bool,
 }
 
 #[derive(Default)]
@@ -68,6 +69,7 @@ fn load_config() -> BenchConfig {
     let resource_tier =
         parse_resource_tier(&env_or_string("CHRONOS_BENCH_RESOURCE_TIER", "shared"));
     let scenario = env_or_string("CHRONOS_BENCH_SCENARIO", "round_robin");
+    let idempotency_enabled = env_or("CHRONOS_BENCH_IDEMPOTENCY", true);
     BenchConfig {
         endpoint,
         concurrency,
@@ -77,6 +79,7 @@ fn load_config() -> BenchConfig {
         warmup_secs,
         resource_tier,
         scenario,
+        idempotency_enabled,
     }
 }
 
@@ -136,6 +139,7 @@ async fn main() -> AppResult<()> {
         let endpoint = config.endpoint.clone();
         let id_gen = id_gen.clone();
         let batch = config.batch;
+        let idempotency_enabled = config.idempotency_enabled;
         handles.push(tokio::spawn(async move {
             let channel = connect_channel(endpoint).await?;
             let mut client = TimestampServiceClient::new(channel);
@@ -151,6 +155,11 @@ async fn main() -> AppResult<()> {
 
                 let route = &routes[route_idx];
                 route_idx = (route_idx + 1) % routes.len();
+                let client_request_id = if idempotency_enabled {
+                    format!("{}-{}", worker_idx, id_gen.fetch_add(1, Ordering::Relaxed))
+                } else {
+                    String::new()
+                };
 
                 let start = Instant::now();
                 let result = client
@@ -159,11 +168,7 @@ async fn main() -> AppResult<()> {
                         count: batch,
                         expected_epoch: route.1,
                         expected_route_version: route.2,
-                        client_request_id: format!(
-                            "{}-{}",
-                            worker_idx,
-                            id_gen.fetch_add(1, Ordering::Relaxed)
-                        ),
+                        client_request_id,
                         request_timeout_ms: 0,
                     }))
                     .await;
@@ -200,6 +205,7 @@ async fn main() -> AppResult<()> {
     println!("concurrency={}", config.concurrency);
     println!("timelines={}", config.timeline_count);
     println!("batch={}", config.batch);
+    println!("idempotency_enabled={}", config.idempotency_enabled);
     println!("duration_secs={}", config.duration_secs);
     println!("requests={}", total_requests);
     println!("tsos={}", total_tsos);

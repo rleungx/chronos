@@ -489,20 +489,13 @@
         },
         {
           "editorMode": "code",
-          "expr": "rate(tso_watch_route_send_timeout_total[5m])",
-          "legendFormat": "watch send timeouts/s",
+          "expr": "sum by (event) (rate(tso_watch_resync_total[5m]))",
+          "legendFormat": "watch {{event}}/s",
           "range": true,
           "refId": "B"
-        },
-        {
-          "editorMode": "code",
-          "expr": "rate(tso_watch_keepalive_dropped_total[5m])",
-          "legendFormat": "watch keepalive dropped/s",
-          "range": true,
-          "refId": "C"
         }
       ],
-      "title": "Proxy / Watch Pressure",
+      "title": "Proxy / Watch Recovery",
       "type": "timeseries"
     },
     {

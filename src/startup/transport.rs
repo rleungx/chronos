@@ -3,10 +3,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::stream;
+use http_body_util::Full;
+use hyper::body::Bytes;
 use hyper::header::{HeaderValue, CONTENT_TYPE};
-use hyper::server::conn::Http;
+use hyper::server::conn::http1;
 use hyper::service::service_fn;
-use hyper::{Body, Request as HyperRequest, Response as HyperResponse, StatusCode};
+use hyper::{Request as HyperRequest, Response as HyperResponse, StatusCode};
+use hyper_util::rt::TokioIo;
 use prometheus::{Encoder, TextEncoder};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::WebPkiClientVerifier;
@@ -23,14 +26,19 @@ use chronos::TsoConfig;
 
 use crate::AppResult;
 
-fn plain_text_response(status: StatusCode, body: impl Into<Body>) -> HyperResponse<Body> {
-    let mut response = HyperResponse::new(body.into());
+type MetricsResponseBody = Full<Bytes>;
+
+fn plain_text_response(
+    status: StatusCode,
+    body: impl Into<Bytes>,
+) -> HyperResponse<MetricsResponseBody> {
+    let mut response = HyperResponse::new(Full::new(body.into()));
     *response.status_mut() = status;
     response
 }
 
-fn metrics_response(buffer: Vec<u8>) -> HyperResponse<Body> {
-    let mut response = HyperResponse::new(Body::from(buffer));
+fn metrics_response(buffer: Vec<u8>) -> HyperResponse<MetricsResponseBody> {
+    let mut response = HyperResponse::new(Full::new(Bytes::from(buffer)));
     *response.status_mut() = StatusCode::OK;
     response.headers_mut().insert(
         CONTENT_TYPE,
@@ -45,25 +53,13 @@ fn listener_addr_label(listen_addr: Option<std::net::SocketAddr>) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-pub(crate) async fn metrics_handler(
-    req: HyperRequest<Body>,
+pub(crate) async fn metrics_handler<B>(
+    req: HyperRequest<B>,
     ready: Arc<AtomicBool>,
-) -> Result<HyperResponse<Body>, hyper::Error> {
-    match req.uri().path() {
-        "/healthz" => Ok(plain_text_response(StatusCode::OK, "ok")),
-        "/readyz" => {
-            let status = if ready.load(Ordering::Relaxed) {
-                StatusCode::OK
-            } else {
-                StatusCode::SERVICE_UNAVAILABLE
-            };
-            let body = if status == StatusCode::OK {
-                "ready"
-            } else {
-                "not ready"
-            };
-            Ok(plain_text_response(status, body))
-        }
+) -> Result<HyperResponse<MetricsResponseBody>, hyper::Error> {
+    let path = req.uri().path().to_owned();
+    match path.as_str() {
+        "/healthz" | "/readyz" => health_handler(req, ready).await,
         "/metrics" => {
             let encoder = TextEncoder::new();
             let metric_families = prometheus::gather();
@@ -86,6 +82,29 @@ pub(crate) async fn metrics_handler(
     }
 }
 
+pub(crate) async fn health_handler<B>(
+    req: HyperRequest<B>,
+    ready: Arc<AtomicBool>,
+) -> Result<HyperResponse<MetricsResponseBody>, hyper::Error> {
+    match req.uri().path() {
+        "/healthz" => Ok(plain_text_response(StatusCode::OK, "ok")),
+        "/readyz" => {
+            let status = if ready.load(Ordering::Relaxed) {
+                StatusCode::OK
+            } else {
+                StatusCode::SERVICE_UNAVAILABLE
+            };
+            let body = if status == StatusCode::OK {
+                "ready"
+            } else {
+                "not ready"
+            };
+            Ok(plain_text_response(status, body))
+        }
+        _ => Ok(plain_text_response(StatusCode::NOT_FOUND, "not found")),
+    }
+}
+
 pub(crate) async fn bind_metrics_listener(
     config: &TsoConfig,
 ) -> Result<(TcpListener, Option<TlsAcceptor>), Box<dyn std::error::Error>> {
@@ -93,6 +112,17 @@ pub(crate) async fn bind_metrics_listener(
     let listener = TcpListener::bind(addr).await?;
     let tls_acceptor = load_metrics_tls_acceptor(config)?;
     Ok((listener, tls_acceptor))
+}
+
+pub(crate) async fn bind_health_listener(
+    config: &TsoConfig,
+) -> Result<Option<TcpListener>, Box<dyn std::error::Error>> {
+    let Some(addr) = config.health_bind_addr.as_deref() else {
+        return Ok(None);
+    };
+    Ok(Some(
+        TcpListener::bind(addr.parse::<std::net::SocketAddr>()?).await?,
+    ))
 }
 
 pub(crate) async fn serve_metrics_listener(
@@ -118,7 +148,10 @@ pub(crate) async fn serve_metrics_listener(
                     if let Some(tls_acceptor) = tls_acceptor {
                         match tls_acceptor.accept(stream).await {
                             Ok(tls_stream) => {
-                                if let Err(error) = Http::new().serve_connection(tls_stream, service).await {
+                                if let Err(error) = http1::Builder::new()
+                                    .serve_connection(TokioIo::new(tls_stream), service)
+                                    .await
+                                {
                                     warn!(
                                         component = "startup",
                                         event = "listener_connection_error",
@@ -139,13 +172,79 @@ pub(crate) async fn serve_metrics_listener(
                                 );
                             }
                         }
-                    } else if let Err(error) = Http::new().serve_connection(stream, service).await {
+                    } else if let Err(error) = http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await
+                    {
                         warn!(
                             component = "startup",
                             event = "listener_connection_error",
                             result = "degraded",
                             reason = %error,
                             transport = "plain"
+                        );
+                    }
+                });
+            }
+            Some(join_result) = connections.join_next(), if !connections.is_empty() => {
+                if let Err(error) = join_result {
+                    warn!(
+                        component = "startup",
+                        event = "listener_task_error",
+                        result = "degraded",
+                        reason = %error
+                    );
+                }
+            }
+        }
+    }
+
+    connections.abort_all();
+    while let Some(join_result) = connections.join_next().await {
+        if let Err(error) = join_result {
+            if !error.is_cancelled() {
+                warn!(
+                    component = "startup",
+                    event = "listener_task_error",
+                    result = "degraded",
+                    reason = %error
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+pub(crate) async fn serve_health_listener(
+    listener: TcpListener,
+    ready: Arc<AtomicBool>,
+    shutdown_rx: watch::Receiver<bool>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut shutdown = Box::pin(wait_for_shutdown_signal(shutdown_rx));
+    let mut connections = JoinSet::new();
+    let listen_addr = listener_addr_label(listener.local_addr().ok());
+
+    loop {
+        tokio::select! {
+            _ = &mut shutdown => break,
+            accept_result = listener.accept() => {
+                let (stream, _) = accept_result?;
+                let ready = ready.clone();
+                let listen_addr = listen_addr.clone();
+                connections.spawn(async move {
+                    let service = service_fn(move |req| health_handler(req, ready.clone()));
+                    if let Err(error) = http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await
+                    {
+                        warn!(
+                            component = "startup",
+                            event = "listener_connection_error",
+                            result = "degraded",
+                            reason = %error,
+                            transport = "health",
+                            listen_addr = %listen_addr
                         );
                     }
                 });

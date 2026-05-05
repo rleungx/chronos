@@ -14,20 +14,25 @@ use tokio::{sync::broadcast, sync::Mutex};
 use crate::{metrics, recovery::record_recovery_event, TimelineRoute, TsoError};
 
 use super::{
+    keys,
     types::{collect_timeline_route_update, RouteUpdateSignal},
-    ControlPlaneStore, GeneratorBatchOp, GeneratorLeaseAuthority, GeneratorRecord,
-    RouteUpdateSource, TimelineAuthority, TimelineBatchOp, TimelineFilterRecord,
-    TimelineFilterRecordListPage, TimelineRecord, TimelineRecordListPage, TimelineRouteRecord,
+    ControlPlaneStore, GeneratorBatchOp, GeneratorLeaseAuthority, GeneratorRecord, RequestRecord,
+    RequestRecordAuthority, RouteUpdateSource, TimelineAuthority, TimelineBatchOp,
+    TimelineFilterRecord, TimelineFilterRecordListPage, TimelineRecord, TimelineRecordListPage,
+    TimelineRouteRecord,
 };
 
 pub struct MemoryMetadataStore {
     // P2: Use DashMap to reduce lock contention in large concurrent tests
     records: DashMap<String, (TimelineRecord, u64)>,
     generators: DashMap<u32, (GeneratorRecord, u64)>,
+    request_records: DashMap<String, (RequestRecord, u64)>,
+    request_cleanup_index: DashMap<String, String>,
     sorted_timeline_keys: RwLock<Option<Arc<[String]>>>,
     route_updates: broadcast::Sender<RouteUpdateSignal>,
     timeline_cas_lock: Mutex<()>,
     generator_cas_lock: Mutex<()>,
+    request_cas_lock: Mutex<()>,
     #[cfg(test)]
     timeline_batch_cas_acquired: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     #[cfg(test)]
@@ -40,10 +45,13 @@ impl MemoryMetadataStore {
         Self {
             records: DashMap::new(),
             generators: DashMap::new(),
+            request_records: DashMap::new(),
+            request_cleanup_index: DashMap::new(),
             sorted_timeline_keys: RwLock::new(None),
             route_updates,
             timeline_cas_lock: Mutex::new(()),
             generator_cas_lock: Mutex::new(()),
+            request_cas_lock: Mutex::new(()),
             #[cfg(test)]
             timeline_batch_cas_acquired: std::sync::Mutex::new(None),
             #[cfg(test)]
@@ -112,6 +120,50 @@ impl MemoryMetadataStore {
         let _ = self
             .route_updates
             .send(RouteUpdateSignal::Route(route.clone()));
+    }
+
+    fn request_key(timeline_key: &str, client_request_id: &str) -> String {
+        keys::request_key("", timeline_key, client_request_id)
+    }
+
+    fn request_cleanup_index_key(
+        record: &RequestRecord,
+        timeline_key: &str,
+        client_request_id: &str,
+    ) -> String {
+        keys::request_cleanup_index_key("", record.updated_at_ms, timeline_key, client_request_id)
+    }
+
+    fn insert_request_cleanup_index(
+        &self,
+        timeline_key: &str,
+        client_request_id: &str,
+        record: &RequestRecord,
+    ) {
+        if record.state != super::RequestRecordState::Completed {
+            return;
+        }
+        self.request_cleanup_index.insert(
+            Self::request_cleanup_index_key(record, timeline_key, client_request_id),
+            Self::request_key(timeline_key, client_request_id),
+        );
+    }
+
+    fn remove_request_cleanup_index(
+        &self,
+        timeline_key: &str,
+        client_request_id: &str,
+        record: &RequestRecord,
+    ) {
+        if record.state != super::RequestRecordState::Completed {
+            return;
+        }
+        self.request_cleanup_index
+            .remove(&Self::request_cleanup_index_key(
+                record,
+                timeline_key,
+                client_request_id,
+            ));
     }
 
     fn sorted_timeline_keys_read(&self) -> RwLockReadGuard<'_, Option<Arc<[String]>>> {
@@ -645,7 +697,214 @@ impl RouteUpdateSource for MemoryMetadataStore {
 }
 
 #[async_trait]
-impl ControlPlaneStore for MemoryMetadataStore {}
+impl RequestRecordAuthority for MemoryMetadataStore {
+    async fn load_request_record(
+        &self,
+        timeline_key: &str,
+        client_request_id: &str,
+    ) -> Result<Option<(RequestRecord, u64)>, TsoError> {
+        let _timer = metrics::TSO_METADATA_LATENCY
+            .with_label_values(&["get_request"])
+            .start_timer();
+        self.request_records
+            .get(&Self::request_key(timeline_key, client_request_id))
+            .map(|entry| {
+                let (record, revision) = entry.value().clone();
+                record.validate_schema_version()?;
+                Ok((record, revision))
+            })
+            .transpose()
+    }
+
+    async fn create_request_record(
+        &self,
+        timeline_key: &str,
+        client_request_id: &str,
+        record: &RequestRecord,
+    ) -> Result<u64, TsoError> {
+        let _timer = metrics::TSO_METADATA_LATENCY
+            .with_label_values(&["create_request"])
+            .start_timer();
+        record.validate_schema_version()?;
+        let stamped = record.stamped_for_persistence();
+        let _cas_guard = self.request_cas_lock.lock().await;
+        let revision = Self::create_entry(
+            &self.request_records,
+            Self::request_key(timeline_key, client_request_id),
+            &stamped,
+            "create_request",
+        )?;
+        self.insert_request_cleanup_index(timeline_key, client_request_id, &stamped);
+        Ok(revision)
+    }
+
+    async fn compare_exchange_request_record(
+        &self,
+        timeline_key: &str,
+        client_request_id: &str,
+        expected_revision: u64,
+        record: &RequestRecord,
+    ) -> Result<u64, TsoError> {
+        let _timer = metrics::TSO_METADATA_LATENCY
+            .with_label_values(&["cas_request"])
+            .start_timer();
+        record.validate_schema_version()?;
+        let stamped = record.stamped_for_persistence();
+        let _cas_guard = self.request_cas_lock.lock().await;
+        let key = Self::request_key(timeline_key, client_request_id);
+        let old_record;
+        let new_revision;
+        {
+            let Some(mut entry) = self.request_records.get_mut(&key) else {
+                metrics::TSO_METADATA_ERRORS_TOTAL
+                    .with_label_values(&["cas_request"])
+                    .inc();
+                return Err(TsoError::TimelineNotFound {
+                    timeline_key: format!("request:{timeline_key}:{client_request_id}"),
+                });
+            };
+
+            let (current_record, current_revision) = entry.value();
+            if *current_revision != expected_revision {
+                metrics::TSO_METADATA_ERRORS_TOTAL
+                    .with_label_values(&["cas_request"])
+                    .inc();
+                return Err(TsoError::CasFailed);
+            }
+
+            old_record = current_record.clone();
+            new_revision = *current_revision + 1;
+            *entry.value_mut() = (stamped.clone(), new_revision);
+        }
+        self.remove_request_cleanup_index(timeline_key, client_request_id, &old_record);
+        self.insert_request_cleanup_index(timeline_key, client_request_id, &stamped);
+        Ok(new_revision)
+    }
+
+    async fn compare_delete_request_record(
+        &self,
+        timeline_key: &str,
+        client_request_id: &str,
+        expected_revision: u64,
+    ) -> Result<(), TsoError> {
+        let _timer = metrics::TSO_METADATA_LATENCY
+            .with_label_values(&["delete_request"])
+            .start_timer();
+        let key = Self::request_key(timeline_key, client_request_id);
+        let _cas_guard = self.request_cas_lock.lock().await;
+        let Some(entry) = self.request_records.get(&key) else {
+            metrics::TSO_METADATA_ERRORS_TOTAL
+                .with_label_values(&["delete_request"])
+                .inc();
+            return Err(TsoError::TimelineNotFound {
+                timeline_key: format!("request:{timeline_key}:{client_request_id}"),
+            });
+        };
+        if entry.value().1 != expected_revision {
+            metrics::TSO_METADATA_ERRORS_TOTAL
+                .with_label_values(&["delete_request"])
+                .inc();
+            return Err(TsoError::CasFailed);
+        }
+        let record = entry.value().0.clone();
+        drop(entry);
+        self.request_records.remove(&key);
+        self.remove_request_cleanup_index(timeline_key, client_request_id, &record);
+        Ok(())
+    }
+
+    async fn prune_completed_request_records(
+        &self,
+        older_than_ms: u64,
+        limit: usize,
+    ) -> Result<usize, TsoError> {
+        let _timer = metrics::TSO_METADATA_LATENCY
+            .with_label_values(&["prune_requests"])
+            .start_timer();
+        if limit == 0 {
+            return Ok(0);
+        }
+
+        let _cas_guard = self.request_cas_lock.lock().await;
+        let mut pruned = 0;
+        let index_prefix = keys::request_cleanup_index_prefix("");
+        let index_cutoff = keys::request_cleanup_index_cutoff("", older_than_ms);
+        let mut index_candidates: Vec<(String, String)> = self
+            .request_cleanup_index
+            .iter()
+            .filter_map(|entry| {
+                let index_key = entry.key();
+                (index_key.starts_with(&index_prefix) && index_key < &index_cutoff)
+                    .then(|| (index_key.clone(), entry.value().clone()))
+            })
+            .collect();
+        index_candidates.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+
+        for (index_key, request_key) in index_candidates {
+            if pruned >= limit {
+                return Ok(pruned);
+            }
+            let Some(entry) = self.request_records.get(&request_key) else {
+                self.request_cleanup_index.remove(&index_key);
+                continue;
+            };
+            let record = entry.value().0.clone();
+            if record.state != super::RequestRecordState::Completed
+                || record.updated_at_ms >= older_than_ms
+            {
+                drop(entry);
+                self.request_cleanup_index.remove(&index_key);
+                continue;
+            }
+            drop(entry);
+            self.request_records.remove(&request_key);
+            self.request_cleanup_index.remove(&index_key);
+            pruned += 1;
+        }
+
+        if pruned >= limit {
+            return Ok(pruned);
+        }
+
+        let mut legacy_candidates = Vec::with_capacity(limit - pruned);
+        for entry in self.request_records.iter() {
+            let (record, _revision) = entry.value();
+            if record.state == super::RequestRecordState::Completed
+                && record.updated_at_ms < older_than_ms
+            {
+                legacy_candidates.push(entry.key().clone());
+                if legacy_candidates.len() >= limit - pruned {
+                    break;
+                }
+            }
+        }
+
+        for key in legacy_candidates {
+            if self.request_records.remove(&key).is_some() {
+                let stale_index_keys: Vec<String> = self
+                    .request_cleanup_index
+                    .iter()
+                    .filter_map(|entry| (entry.value() == &key).then(|| entry.key().clone()))
+                    .collect();
+                for index_key in stale_index_keys {
+                    self.request_cleanup_index.remove(&index_key);
+                }
+                pruned += 1;
+            };
+            if pruned >= limit {
+                break;
+            }
+        }
+        Ok(pruned)
+    }
+}
+
+#[async_trait]
+impl ControlPlaneStore for MemoryMetadataStore {
+    fn request_records(&self) -> Option<&dyn RequestRecordAuthority> {
+        Some(self)
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -658,6 +917,9 @@ mod tests {
 
     use super::*;
     use crate::metadata::types::CURRENT_METADATA_SCHEMA_VERSION;
+    use crate::metadata::{
+        AllocationRequestFingerprint, AllocationResponseRecord, RequestRecordState,
+    };
 
     fn sample_record(timeline_key: &str, generator_id: u32) -> TimelineRecord {
         TimelineRecord {
@@ -677,6 +939,186 @@ mod tests {
             lease_expire_at_ms: Some(100),
             updated_at_ms: 1,
         }
+    }
+
+    fn sample_request_record(state: RequestRecordState, updated_at_ms: u64) -> RequestRecord {
+        RequestRecord {
+            schema_version: 1,
+            fingerprint: AllocationRequestFingerprint { count: 1 },
+            state,
+            response: None,
+            updated_at_ms,
+        }
+    }
+
+    #[tokio::test]
+    async fn prune_completed_request_records_removes_only_old_completed_records() {
+        let store = MemoryMetadataStore::new();
+        let old_completed = RequestRecord {
+            response: Some(AllocationResponseRecord {
+                generator_id: 1,
+                epoch: 1,
+                route_version: 1,
+                ranges: vec![crate::TimestampRange {
+                    start_tso: 10,
+                    end_tso: 10,
+                }],
+            }),
+            ..sample_request_record(RequestRecordState::Completed, 100)
+        };
+        let fresh_completed = RequestRecord {
+            response: Some(AllocationResponseRecord {
+                generator_id: 1,
+                epoch: 1,
+                route_version: 1,
+                ranges: vec![crate::TimestampRange {
+                    start_tso: 11,
+                    end_tso: 11,
+                }],
+            }),
+            ..sample_request_record(RequestRecordState::Completed, 300)
+        };
+
+        store
+            .create_request_record("timeline", "old", &old_completed)
+            .await
+            .unwrap();
+        store
+            .create_request_record("timeline", "fresh", &fresh_completed)
+            .await
+            .unwrap();
+        store
+            .create_request_record(
+                "timeline",
+                "pending",
+                &sample_request_record(RequestRecordState::Pending, 50),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store
+                .prune_completed_request_records(200, 10)
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(store
+            .load_request_record("timeline", "old")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(store
+            .load_request_record("timeline", "fresh")
+            .await
+            .unwrap()
+            .is_some());
+        assert!(store
+            .load_request_record("timeline", "pending")
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn request_cleanup_index_tracks_completed_record_updates() {
+        let store = MemoryMetadataStore::new();
+        let pending = sample_request_record(RequestRecordState::Pending, 100);
+        let completed = RequestRecord {
+            response: Some(AllocationResponseRecord {
+                generator_id: 1,
+                epoch: 1,
+                route_version: 1,
+                ranges: vec![crate::TimestampRange {
+                    start_tso: 10,
+                    end_tso: 10,
+                }],
+            }),
+            ..sample_request_record(RequestRecordState::Completed, 200)
+        };
+        let fresh_completed = RequestRecord {
+            updated_at_ms: 300,
+            ..completed.clone()
+        };
+
+        let pending_revision = store
+            .create_request_record("timeline", "indexed", &pending)
+            .await
+            .unwrap();
+        assert!(store.request_cleanup_index.is_empty());
+
+        let completed_revision = store
+            .compare_exchange_request_record("timeline", "indexed", pending_revision, &completed)
+            .await
+            .unwrap();
+        assert_eq!(store.request_cleanup_index.len(), 1);
+
+        store
+            .compare_exchange_request_record(
+                "timeline",
+                "indexed",
+                completed_revision,
+                &fresh_completed,
+            )
+            .await
+            .unwrap();
+        assert_eq!(store.request_cleanup_index.len(), 1);
+        assert_eq!(
+            store
+                .prune_completed_request_records(250, 10)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            store
+                .prune_completed_request_records(400, 10)
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(store
+            .load_request_record("timeline", "indexed")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(store.request_cleanup_index.is_empty());
+    }
+
+    #[tokio::test]
+    async fn prune_completed_request_records_handles_legacy_records_without_cleanup_index() {
+        let store = MemoryMetadataStore::new();
+        let legacy_completed = RequestRecord {
+            response: Some(AllocationResponseRecord {
+                generator_id: 1,
+                epoch: 1,
+                route_version: 1,
+                ranges: vec![crate::TimestampRange {
+                    start_tso: 20,
+                    end_tso: 20,
+                }],
+            }),
+            ..sample_request_record(RequestRecordState::Completed, 100)
+        };
+
+        store.request_records.insert(
+            MemoryMetadataStore::request_key("timeline", "legacy"),
+            (legacy_completed, 1),
+        );
+        assert!(store.request_cleanup_index.is_empty());
+
+        assert_eq!(
+            store
+                .prune_completed_request_records(200, 10)
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(store
+            .load_request_record("timeline", "legacy")
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]

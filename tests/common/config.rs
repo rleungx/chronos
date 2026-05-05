@@ -11,6 +11,18 @@ pub fn required_test_config(config: TsoConfig) -> TsoConfig {
         grpc_tls_cert_file: Some(cert_path.to_string()),
         grpc_tls_key_file: Some(key_path.to_string()),
         grpc_client_ca_file: Some(ca_path.to_string()),
+        grpc_control_cert_allowlist: vec![
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+        ],
+        grpc_route_cert_allowlist: vec![
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+        ],
+        grpc_timestamp_cert_allowlist: vec![
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+        ],
+        grpc_status_cert_allowlist: vec![
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+        ],
         grpc_request_timeout_ms: Some(100),
         grpc_max_request_bytes: Some(1024),
         grpc_max_concurrent_requests: Some(16),

@@ -1,7 +1,9 @@
 #include <atomic>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include <grpcpp/grpcpp.h>
 #include <grpcpp/server.h>
@@ -24,6 +26,12 @@ using chronos::tso::v1::TimestampRange;
 using chronos::tso::v1::TimestampService;
 
 namespace {
+
+Client::TransportConfig InsecureTransport() {
+  Client::TransportConfig config;
+  config.insecure = true;
+  return config;
+}
 
 struct RouteServiceImpl final : TimelineRouteService::Service {
   explicit RouteServiceImpl(std::shared_ptr<TimelineRoute> route) : route(std::move(route)) {}
@@ -58,6 +66,10 @@ struct TimestampServiceImpl final : TimestampService::Service {
       const AllocateTimestampsRequest* request,
       AllocateTimestampsResponse* response) override {
     ++allocate_calls;
+    {
+      std::lock_guard<std::mutex> lock(request_ids_mu);
+      request_ids.push_back(request->client_request_id());
+    }
 
     if (stale_once.exchange(false)) {
       route->set_route_version(route->route_version() + 1);
@@ -96,6 +108,8 @@ struct TimestampServiceImpl final : TimestampService::Service {
   std::shared_ptr<TimelineRoute> route;
   std::atomic<bool> stale_once;
   std::atomic<int> allocate_calls{0};
+  std::mutex request_ids_mu;
+  std::vector<std::string> request_ids;
 };
 
 struct RunningServer {
@@ -132,7 +146,10 @@ void TestAllocateAgainstOwnerEndpoint() {
   auto route_service = RouteServiceImpl(route);
   auto route_server = StartServer(&route_service);
 
-  Client client("127.0.0.1:" + std::to_string(route_server.port), "orders.primary");
+  Client client(
+      "127.0.0.1:" + std::to_string(route_server.port),
+      "orders.primary",
+      InsecureTransport());
   auto ranges = client.AllocateTimestamps(1);
   if (ranges.size() != 1 || ranges.front().start_tso() != 100) {
     throw std::runtime_error("allocate against owner endpoint failed");
@@ -151,13 +168,36 @@ void TestRefreshesStaleRouteAndRetries() {
   auto route_service = RouteServiceImpl(route);
   auto route_server = StartServer(&route_service);
 
-  Client client("127.0.0.1:" + std::to_string(route_server.port), "orders.primary");
+  Client client(
+      "127.0.0.1:" + std::to_string(route_server.port),
+      "orders.primary",
+      InsecureTransport());
   auto ranges = client.AllocateTimestamps(1);
   if (ranges.size() != 1 || ranges.front().start_tso() != 100) {
     throw std::runtime_error("stale route retry failed");
   }
   if (owner_service.allocate_calls.load() != 2) {
     throw std::runtime_error("expected one stale attempt and one retry");
+  }
+  {
+    std::lock_guard<std::mutex> lock(owner_service.request_ids_mu);
+    if (owner_service.request_ids.size() != 2 ||
+        owner_service.request_ids[0] != owner_service.request_ids[1]) {
+      throw std::runtime_error("retry did not reuse logical request id");
+    }
+  }
+}
+
+void TestRejectsPartialClientIdentity() {
+  try {
+    Client::TransportConfig config;
+    config.pem_cert_chain = "cert";
+    Client client(
+        "127.0.0.1:1",
+        "orders.primary",
+        config);
+    throw std::runtime_error("expected partial client identity to be rejected");
+  } catch (const std::invalid_argument&) {
   }
 }
 
@@ -167,6 +207,7 @@ int main() {
   try {
     TestAllocateAgainstOwnerEndpoint();
     TestRefreshesStaleRouteAndRetries();
+    TestRejectsPartialClientIdentity();
     return 0;
   } catch (const std::exception& ex) {
     std::cerr << ex.what() << std::endl;

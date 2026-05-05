@@ -1,10 +1,17 @@
 .git
 .github
+.venv
+.cache
 target
 artifacts
 docs
+deploy
 observability
 hack
 tests
+clients/**/build
+clients/**/.gradle
+**/__pycache__
+**/*.pyc
 **/*.log
 **/.DS_Store

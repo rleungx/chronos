@@ -5,16 +5,17 @@ promote a build, not as the general operations guide.
 
 ## Required validation before cutting a release
 
-Run all of the following from a clean working tree:
+Run the full repo-local release gate from a clean working tree:
 
 ```bash
-cargo clippy --locked --all-targets -- -D warnings
-make test-layer-0
-make test-layer-2
-make test-layer-3
+make release-gate
+```
+
+This is equivalent to the following validation bundle:
+
+```bash
+make release-check
 make test-layer-4
-make observability-check
-make dependency-check
 make test-soak
 make test-chaos
 make test-failover-bench
@@ -46,6 +47,7 @@ Before publishing or deploying, ensure you have:
 3. retained soak/chaos/failover/rebalance artifacts for the validation run
 4. alert rules validated with `make observability-check`
 5. dependency policy validated with `make dependency-check`
+6. release-shape and container delivery checks validated via `make release-check`
 
 ## Rollback expectation
 

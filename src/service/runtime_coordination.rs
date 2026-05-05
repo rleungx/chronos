@@ -7,8 +7,7 @@ pub(in crate::service) use loading::TimelineLoadCoordinator;
 use std::collections::HashMap;
 
 use crate::lifecycle::{TimelineLifecycleContract, TimelineServingReadiness};
-use crate::metadata::{GeneratorRecord, TimelineFilterRecord, TimelineRecord};
-use crate::service::endpoints_match;
+use crate::metadata::{GeneratorRecord, TimelineRecord};
 use crate::status::{
     build_timeline_status_snapshot, TimelineStatusListPage, TimelineStatusSnapshot,
 };
@@ -17,44 +16,6 @@ use crate::{TimelineLifecycleState, TimelineRoute, TsoError};
 use super::TsoService;
 
 impl TsoService {
-    fn timeline_state_matches_status_filters(
-        state: TimelineLifecycleState,
-        route: &TimelineRoute,
-        states: &[TimelineLifecycleState],
-        owner_worker_endpoint: Option<&str>,
-    ) -> bool {
-        (states.is_empty() || states.contains(&state))
-            && owner_worker_endpoint
-                .map(|endpoint| endpoints_match(&route.owner_worker_endpoint, endpoint))
-                .unwrap_or(true)
-    }
-
-    fn timeline_matches_status_filters(
-        timeline: &TimelineRecord,
-        states: &[TimelineLifecycleState],
-        owner_worker_endpoint: Option<&str>,
-    ) -> bool {
-        Self::timeline_state_matches_status_filters(
-            timeline.state,
-            &timeline.route,
-            states,
-            owner_worker_endpoint,
-        )
-    }
-
-    fn timeline_filter_record_matches_status_filters(
-        timeline: &TimelineFilterRecord,
-        states: &[TimelineLifecycleState],
-        owner_worker_endpoint: Option<&str>,
-    ) -> bool {
-        Self::timeline_state_matches_status_filters(
-            timeline.state,
-            &timeline.route,
-            states,
-            owner_worker_endpoint,
-        )
-    }
-
     pub(super) fn timeline_is_ready(state: TimelineLifecycleState) -> bool {
         matches!(
             TimelineLifecycleContract::classify(state).serving_readiness(),
@@ -77,6 +38,30 @@ impl TsoService {
             self.local_instance_id(),
             now_ms,
         )
+    }
+
+    fn cached_local_generator_record(
+        &self,
+        generator_id: u32,
+        now_ms: u64,
+    ) -> Option<GeneratorRecord> {
+        let lease = self.generator_runtime.lease_state(generator_id)?;
+        if lease.owner_instance_id != self.local_instance_id() || lease.lease_expire_at_ms <= now_ms
+        {
+            return None;
+        }
+
+        Some(GeneratorRecord {
+            schema_version: crate::metadata::CURRENT_METADATA_SCHEMA_VERSION,
+            generator_id,
+            owner_worker_endpoint: self.config.advertise_endpoint.clone(),
+            owner_instance_id: lease.owner_instance_id,
+            generator_lease_token: lease.generator_lease_token,
+            lease_expire_at_ms: Some(lease.lease_expire_at_ms),
+            last_issued_tso: lease.last_persisted_tso,
+            issued_upper_bound: lease.issued_upper_bound,
+            updated_at_ms: now_ms,
+        })
     }
 
     pub(super) fn compute_generator_upper_bound(
@@ -158,110 +143,61 @@ impl TsoService {
         let mut statuses = Vec::with_capacity(limit);
         let now_ms = self.clock.now_ms();
 
-        let mut scan_cursor = start_after_timeline_key.map(str::to_owned);
-        let scan_limit = limit;
-        while statuses.len() < limit {
-            let page = self
-                .metadata
-                .list_timelines_page(scan_cursor.as_deref(), scan_limit)
-                .await?;
-            if page.records.is_empty() {
-                break;
-            }
-            scan_cursor = page.next_start_after_timeline_key.clone();
+        let page = self
+            .metadata
+            .list_timelines_by_status_filter_page(
+                states,
+                owner_worker_endpoint,
+                start_after_timeline_key,
+                limit,
+            )
+            .await?;
 
-            let missing_generator_ids: Vec<_> = page
-                .records
-                .iter()
-                .filter(|timeline| {
-                    Self::timeline_matches_status_filters(timeline, states, owner_worker_endpoint)
-                })
-                .map(|timeline| timeline.route.generator_id)
-                .filter(|generator_id| !generator_cache.contains_key(generator_id))
-                .collect::<std::collections::BTreeSet<_>>()
-                .into_iter()
-                .collect();
-            if !missing_generator_ids.is_empty() {
-                generator_cache.extend(
-                    self.metadata
-                        .load_generators(&missing_generator_ids)
-                        .await?,
-                );
-            }
+        let missing_generator_ids: Vec<_> = page
+            .records
+            .iter()
+            .map(|timeline| timeline.route.generator_id)
+            .filter(|generator_id| !generator_cache.contains_key(generator_id))
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
 
-            for timeline in page.records {
-                if !Self::timeline_matches_status_filters(&timeline, states, owner_worker_endpoint)
-                {
-                    continue;
+        let mut metadata_generator_ids = Vec::with_capacity(missing_generator_ids.len());
+        for generator_id in missing_generator_ids {
+            match self.cached_local_generator_record(generator_id, now_ms) {
+                Some(record) => {
+                    generator_cache.insert(generator_id, Some(record));
                 }
-                let generator_id = timeline.route.generator_id;
-                let generator = match generator_cache.get(&generator_id) {
-                    Some(generator) => (*generator).as_ref(),
-                    _ => None,
-                };
-
-                statuses.push(build_timeline_status_snapshot(
-                    &self.config,
-                    now_ms,
-                    &timeline,
-                    generator,
-                ));
-                if statuses.len() == limit {
-                    break;
-                }
-            }
-
-            if scan_cursor.is_none() {
-                break;
+                None => metadata_generator_ids.push(generator_id),
             }
         }
 
-        let next_start_after = if statuses.len() < limit {
-            None
-        } else if states.is_empty() && owner_worker_endpoint.is_none() {
-            scan_cursor.as_ref().and_then(|_| {
-                statuses
-                    .last()
-                    .map(|status| status.route.timeline_key.clone())
-            })
-        } else if let Some(last_returned_key) = statuses
-            .last()
-            .map(|status| status.route.timeline_key.clone())
-        {
-            let mut lookahead_cursor = Some(last_returned_key.clone());
-            let mut has_more_matching = false;
-            loop {
-                let page = self
-                    .metadata
-                    .list_timeline_filters_page(lookahead_cursor.as_deref(), scan_limit)
-                    .await?;
-                if page.records.is_empty() {
-                    break;
-                }
-                if page.records.iter().any(|timeline| {
-                    Self::timeline_filter_record_matches_status_filters(
-                        timeline,
-                        states,
-                        owner_worker_endpoint,
-                    )
-                }) {
-                    has_more_matching = true;
-                    break;
-                }
-                let next_cursor = page.next_start_after_timeline_key;
-                let Some(next_cursor) = next_cursor else {
-                    break;
-                };
-                lookahead_cursor = Some(next_cursor);
-            }
-            has_more_matching.then_some(last_returned_key)
-        } else {
-            None
-        };
+        if !metadata_generator_ids.is_empty() {
+            generator_cache.extend(
+                self.metadata
+                    .load_generators(&metadata_generator_ids)
+                    .await?,
+            );
+        }
+
+        for timeline in page.records {
+            let generator_id = timeline.route.generator_id;
+            let generator = match generator_cache.get(&generator_id) {
+                Some(generator) => (*generator).as_ref(),
+                _ => None,
+            };
+
+            statuses.push(build_timeline_status_snapshot(
+                &self.config,
+                now_ms,
+                &timeline,
+                generator,
+            ));
+        }
 
         Ok(TimelineStatusListPage {
             statuses,
-            next_start_after,
+            next_start_after: page.next_start_after_timeline_key,
         })
     }
 

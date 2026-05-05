@@ -1,3 +1,4 @@
+pub(crate) mod authz;
 mod build_info;
 pub mod client;
 mod clock;
@@ -27,12 +28,15 @@ mod tso_codec;
 mod types;
 
 pub use build_info::{build_commit, build_identity, build_version, BuildIdentity};
-pub use client::{Client, ClientConfig, ClientError};
+pub use client::{Client, ClientConfig, ClientError, ClientTransportConfig};
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use config::{
     parse_advertise_endpoint_host, TsoConfig, TsoSecurityMode, DEFAULT_ADVERTISE_ENDPOINT,
-    DEFAULT_BIND_ADDR, DEFAULT_MAX_BATCH_PER_REQUEST, DEFAULT_MAX_TIMELINE_PROXY_LANES,
+    DEFAULT_AUTO_FAILOVER_BATCH_SIZE, DEFAULT_AUTO_FAILOVER_INTERVAL_MS, DEFAULT_BIND_ADDR,
+    DEFAULT_MAX_BATCH_PER_REQUEST, DEFAULT_MAX_TIMELINE_PROXY_LANES,
     DEFAULT_MAX_TIMELINE_RUNTIME_ENTRIES, DEFAULT_METADATA_KIND, DEFAULT_METRICS_BIND_ADDR,
+    DEFAULT_REQUEST_RECORD_CLEANUP_BATCH_SIZE, DEFAULT_REQUEST_RECORD_CLEANUP_INTERVAL_MS,
+    DEFAULT_REQUEST_RECORD_PENDING_TIMEOUT_MS, DEFAULT_REQUEST_RECORD_RETENTION_MS,
     DEFAULT_WORKER_ID, PRODUCTION_MAX_BATCH_PER_REQUEST, PRODUCTION_MAX_TIMELINE_PROXY_LANES,
     PRODUCTION_MAX_TIMELINE_RUNTIME_ENTRIES,
 };

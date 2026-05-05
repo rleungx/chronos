@@ -423,7 +423,26 @@ fn is_transient_rebalance_error(detail: Option<&ErrorDetail>) -> bool {
             | Some(ErrorCode::RouteVersionMismatch)
             | Some(ErrorCode::EpochMismatch)
             | Some(ErrorCode::NotTimelineOwner)
+            | Some(ErrorCode::RateLimited)
     )
+}
+
+fn should_refresh_route_after_rebalance_error(detail: Option<&ErrorDetail>) -> bool {
+    matches!(
+        detail.and_then(|detail| ErrorCode::try_from(detail.code).ok()),
+        Some(ErrorCode::LeaseExpired)
+            | Some(ErrorCode::TemporarilyUnavailable)
+            | Some(ErrorCode::RouteVersionMismatch)
+            | Some(ErrorCode::EpochMismatch)
+            | Some(ErrorCode::NotTimelineOwner)
+    )
+}
+
+fn rebalance_retry_backoff_ms(detail: Option<&ErrorDetail>) -> u64 {
+    match detail.and_then(|detail| ErrorCode::try_from(detail.code).ok()) {
+        Some(ErrorCode::RateLimited) => 5,
+        _ => REBALANCE_ALLOCATE_RETRY_BACKOFF_MS,
+    }
 }
 
 fn decode_error_detail(status: &Status) -> Option<ErrorDetail> {
@@ -527,6 +546,7 @@ async fn run_allocate_during_rebalance_bench(
         let route_snapshots = route_snapshots.clone();
         let route_keys = route_keys.clone();
         worker_handles.push(tokio::spawn(async move {
+            barrier.wait().await;
             let channel = connect_channel(endpoint).await?;
             let mut timestamp_client = TimestampServiceClient::new(channel.clone());
             let mut route_client = TimelineRouteServiceClient::new(channel);
@@ -541,7 +561,6 @@ async fn run_allocate_during_rebalance_bench(
             let mut route_idx = 0usize;
             let mut request_ordinal = 0u64;
 
-            barrier.wait().await;
             loop {
                 let request_start = Instant::now();
                 if request_start >= measure_until {
@@ -587,45 +606,46 @@ async fn run_allocate_during_rebalance_bench(
                                             .unwrap_or("transport_error"),
                                     );
 
-                                    let refresh_start = Instant::now();
-                                    let refreshed = match refresh_route(
-                                        &mut route_client,
-                                        &current_route.timeline_key,
-                                    )
-                                    .await
+                                    if !is_transient_rebalance_error(detail.as_ref())
+                                        || attempt == REBALANCE_ALLOCATE_RETRY_ATTEMPTS
                                     {
-                                        Ok(refreshed) => refreshed,
-                                        Err(_) => {
-                                            record_error_count(
-                                                &mut stats.error_counts,
-                                                "route_refresh_failed",
-                                            );
-                                            return Err(());
-                                        }
-                                    };
-                                    let refresh_elapsed =
-                                        refresh_start.elapsed().as_micros() as u64;
-                                    route_snapshots.insert(
-                                        current_route.timeline_key.clone(),
-                                        refreshed.clone(),
-                                    );
-                                    current_route = refreshed;
-
-                                    if request_start >= warmup_until {
-                                        stats.route_refresh_total += 1;
-                                        stats.route_refresh_latencies_us.push(refresh_elapsed);
-                                    }
-
-                                    if attempt == REBALANCE_ALLOCATE_RETRY_ATTEMPTS {
                                         return Err(());
                                     }
 
-                                    if is_transient_rebalance_error(detail.as_ref()) {
-                                        tokio::time::sleep(Duration::from_millis(
-                                            REBALANCE_ALLOCATE_RETRY_BACKOFF_MS,
-                                        ))
-                                        .await;
+                                    if should_refresh_route_after_rebalance_error(detail.as_ref()) {
+                                        let refresh_start = Instant::now();
+                                        let refreshed = match refresh_route(
+                                            &mut route_client,
+                                            &current_route.timeline_key,
+                                        )
+                                        .await
+                                        {
+                                            Ok(refreshed) => refreshed,
+                                            Err(_) => {
+                                                record_error_count(
+                                                    &mut stats.error_counts,
+                                                    "route_refresh_failed",
+                                                );
+                                                return Err(());
+                                            }
+                                        };
+                                        let refresh_elapsed =
+                                            refresh_start.elapsed().as_micros() as u64;
+                                        route_snapshots.insert(
+                                            current_route.timeline_key.clone(),
+                                            refreshed.clone(),
+                                        );
+                                        current_route = refreshed;
+
+                                        if request_start >= warmup_until {
+                                            stats.route_refresh_total += 1;
+                                            stats.route_refresh_latencies_us.push(refresh_elapsed);
+                                        }
                                     }
+                                    tokio::time::sleep(Duration::from_millis(
+                                        rebalance_retry_backoff_ms(detail.as_ref()),
+                                    ))
+                                    .await;
                                 }
                             }
                         }
@@ -666,8 +686,6 @@ async fn run_allocate_during_rebalance_bench(
     let transfer_targets = config.transfer_target_generators.clone();
     let transfer_interval_ms = config.transfer_interval_ms;
     let driver_handle = tokio::spawn(async move {
-        let channel = connect_channel(endpoint).await?;
-        let mut control_client = TimelineControlServiceClient::new(channel);
         let mut driver_routes = seeded_routes_for_driver
             .iter()
             .map(|route| (route.timeline_key.clone(), route.clone()))
@@ -676,6 +694,8 @@ async fn run_allocate_during_rebalance_bench(
         let mut transfer_idx = 0usize;
 
         barrier_driver.wait().await;
+        let channel = connect_channel(endpoint).await?;
+        let mut control_client = TimelineControlServiceClient::new(channel);
         let mut next_tick = Instant::now();
         loop {
             next_tick += Duration::from_millis(transfer_interval_ms);
@@ -986,6 +1006,23 @@ mod tests {
     #[test]
     fn parse_csv_u32_list_parses_and_skips_empty_entries() {
         assert_eq!(parse_csv_u32_list("1, 2,,3").unwrap(), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn rebalance_retry_classifier_treats_rate_limit_as_transient() {
+        let detail = ErrorDetail {
+            code: ErrorCode::RateLimited as i32,
+            message: "backpressure".into(),
+            current_epoch: 0,
+            current_route_version: 0,
+            redirect_endpoint: String::new(),
+            action_blocker: 0,
+            next_step: 0,
+        };
+
+        assert!(is_transient_rebalance_error(Some(&detail)));
+        assert!(!should_refresh_route_after_rebalance_error(Some(&detail)));
+        assert_eq!(rebalance_retry_backoff_ms(Some(&detail)), 5);
     }
 
     #[test]
