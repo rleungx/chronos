@@ -1,50 +1,74 @@
 # Chronos
 
-Chronos is a gRPC-based timestamp service for applications that need monotonic, timeline-scoped
-timestamp allocation without exposing routing, ownership, or failover mechanics to application
-code.
+Chronos is a gRPC timestamp service for applications that need monotonic, timeline-scoped timestamp
+allocation without carrying route, ownership, or failover logic in application code.
 
-From an application developer's perspective, the happy path is intentionally small:
+The application path is intentionally small:
 
-1. Create one client bound to one timeline
-2. Call one allocation API
+1. Pick a `timeline_key` for the workload shard
+2. Create one Chronos client bound to that timeline
+3. Call `allocate_timestamps(count)`
 
-Everything else — route discovery, stale-route recovery, owner changes, and retry behavior — is
-handled by the Chronos client/runtime layer.
+The client handles timeline creation, route lookup, owner reconnects, stale-route refresh, and
+failover recovery.
 
-## What Chronos provides
+## When to use Chronos
 
-- A single allocation surface for normal application usage
-- Timeline-scoped routing so one logical workload can keep using the same client contract
-- Horizontal scaling across independent `timeline_key` shards; a single global strict sequence is
-  intentionally not the scalability boundary
-- Internal handling for route ensure, route refresh, and stale-route retry
-- Production-oriented operational assets in this repo: validation gates, alerts, dashboards,
-  runbooks, and release/rollback guidance
+- You need monotonic timestamp ranges for each logical workload or partition
+- You want clients to keep working through route changes and owner failover
+- You can scale throughput by using multiple `timeline_key` shards or larger allocation batches
+- You do not require one global strictly increasing sequence across all traffic
 
-## Start here
+## Quick Start
 
-- If you want to integrate Chronos into an application, start with `clients/README.md`.
-- If you want to operate or evaluate Chronos in a production setting, start with
-  `docs/production.md`.
+Run a local memory-backed server:
 
-## Notes
+```bash
+export CHRONOS_SECURITY_MODE=dev-insecure
+export CHRONOS_BIND_ADDR=127.0.0.1:50051
+export CHRONOS_ADVERTISE_ENDPOINT=127.0.0.1:50051
+cargo run --bin chronos
+```
 
-- Your application should not call internal routing RPCs directly.
-- `timeline_key` is chosen once when the client is created.
-- Use multiple timeline keys when the workload needs horizontal throughput scaling.
-- Allocation is the only operation the application should need during normal use.
-- Route ensure, route refresh, and stale-route retry are internal client behavior.
-- Route refresh reconnects allocation traffic to the current owner endpoint.
-- Direct protobuf route-management RPC use is considered internal or advanced usage.
+Then run a client example:
 
-## Clients
+```bash
+cargo run --example client_example
+```
 
-- Client index: `clients/README.md`
+More examples:
 
-## Production operations
+- Rust: `examples/rust/client_example.rs`
+- Go: `examples/go/main.go`
+- Java: `examples/java/ClientExample.java`
+- C++: `examples/cpp/client_example.cc`
 
-- Start with `docs/production.md` for the operator path.
-- Use `docs/release.md` for release validation and `docs/rollback.md` for rollback handling.
-- Use `observability/README.md` for Prometheus, Grafana, alerts, and runbook links.
-- Dependency policy lives in `deny.toml` and is enforced by CI.
+## Client Integration
+
+Start with `clients/README.md`.
+
+Supported application-facing clients:
+
+| Language | Status |
+|---|---|
+| Rust | Primary |
+| Go | Primary |
+| Java | Repository-local |
+| C++ | Repository-local |
+
+Applications should use the client libraries instead of calling route-management RPCs directly.
+Route RPCs remain part of the wire contract, but normal allocation traffic only needs the client
+allocation API.
+
+## Production
+
+Production deployments should use etcd metadata, routable advertise endpoints, explicit security
+configuration, and capacity sized for active timelines. For horizontal allocation scale, partition
+traffic across timeline keys and configure multi-node generator ownership.
+
+Operator docs:
+
+- Production guide: `docs/production.md`
+- Release gate: `docs/release.md`
+- Rollback: `docs/rollback.md`
+- Observability: `observability/README.md`

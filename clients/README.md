@@ -1,25 +1,32 @@
 # Chronos Clients
 
-Chronos provides application-facing `Client` implementations for multiple languages.
+Chronos clients are the preferred application integration surface.
 
-All clients follow the same model:
+The model is the same in every language:
 
 1. Create one `Client` bound to one timeline
 2. Call one allocation API
 3. Close or destroy the client when done
 
-Shared behavior:
+The client handles the operational details that applications should not duplicate:
 
 - The client ensures the bound timeline on first connect
 - The client fetches and caches the current route internally
-- Stale-route errors are handled internally with refresh-and-retry behavior
+- Stale-route errors are handled internally with a configurable refresh-and-retry budget
 - Route refresh reconnects allocation traffic to the current owner endpoint
-- Allocations omit request-record idempotency by default to keep the hot path metadata-free;
-  enable the language-specific idempotency option when replay protection is required
-- Other RPC failures are returned to the caller
+- Allocation idempotency is optional; enable it only when callers need replay protection for
+  ambiguous retries
 
-The protobuf route-management RPCs remain part of the wire contract, but they are treated as
-internal client machinery rather than the preferred application integration surface.
+Route-management RPCs remain in the protobuf contract for control-plane use, but they are not the
+normal application API.
+
+Common client options are available in every language:
+
+- Desired resource tier for first timeline ensure
+- Per-allocation request timeout forwarded to Chronos
+- Stale-route retry attempts and retry backoff
+- Optional allocation request idempotency
+- TLS, mTLS, server-name override, and explicit plaintext for local development
 
 ## Languages
 
@@ -27,6 +34,13 @@ internal client machinery rather than the preferred application integration surf
 - Rust: `clients/rust/README.md`
 - Java: `clients/java/README.md`
 - C++: `clients/cpp/README.md`
+
+## Examples
+
+- Rust: `cargo run --example client_example`
+- Go: `cd examples/go && go run .`
+- Java: `cd clients/java && gradle runExample`
+- C++: `cmake -S clients/cpp -B clients/cpp/build && cmake --build clients/cpp/build --target client_example`
 
 ## Support level
 

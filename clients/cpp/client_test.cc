@@ -42,6 +42,7 @@ struct RouteServiceImpl final : TimelineRouteService::Service {
       const EnsureTimelineRequest* request,
       EnsureTimelineResponse* response) override {
     route->set_timeline_key(request->timeline_key());
+    last_desired_resource_tier = request->desired_resource_tier();
     response->mutable_route()->CopyFrom(*route);
     return grpc::Status::OK;
   }
@@ -56,6 +57,7 @@ struct RouteServiceImpl final : TimelineRouteService::Service {
   }
 
   std::shared_ptr<TimelineRoute> route;
+  ResourceTier last_desired_resource_tier = ResourceTier::RESOURCE_TIER_UNSPECIFIED;
 };
 
 struct TimestampServiceImpl final : TimestampService::Service {
@@ -67,6 +69,7 @@ struct TimestampServiceImpl final : TimestampService::Service {
       const AllocateTimestampsRequest* request,
       AllocateTimestampsResponse* response) override {
     ++allocate_calls;
+    last_request_timeout_ms = request->request_timeout_ms();
     {
       std::lock_guard<std::mutex> lock(request_ids_mu);
       request_ids.push_back(request->client_request_id());
@@ -109,6 +112,7 @@ struct TimestampServiceImpl final : TimestampService::Service {
   std::shared_ptr<TimelineRoute> route;
   std::atomic<bool> stale_once;
   std::atomic<int> allocate_calls{0};
+  std::atomic<uint32_t> last_request_timeout_ms{0};
   std::mutex request_ids_mu;
   std::vector<std::string> request_ids;
 };
@@ -236,6 +240,45 @@ void TestRefreshesStaleRouteAndRetries() {
   }
 }
 
+void TestClientConfigFlowsIntoRequests() {
+  auto route = std::make_shared<TimelineRoute>(MakeRoute("unused"));
+  auto owner_service = TimestampServiceImpl(route, false);
+  auto owner_server = StartServer(&owner_service);
+  route->set_owner_worker_endpoint("127.0.0.1:" + std::to_string(owner_server.port));
+
+  auto route_service = RouteServiceImpl(route);
+  auto route_server = StartServer(&route_service);
+
+  Client::Config config;
+  config.transport = InsecureTransport();
+  config.desired_resource_tier = ResourceTier::RESOURCE_TIER_WARM;
+  config.request_timeout_ms = 1500;
+  config.stale_route_retry_attempts = 2;
+  config.stale_route_retry_backoff_ms = 0;
+  config.idempotency_enabled = true;
+
+  Client client(
+      "127.0.0.1:" + std::to_string(route_server.port),
+      "orders.primary",
+      std::move(config));
+  auto ranges = client.AllocateTimestamps(1);
+  if (ranges.size() != 1 || ranges.front().start_tso() != 100) {
+    throw std::runtime_error("configured client allocation failed");
+  }
+  if (route_service.last_desired_resource_tier != ResourceTier::RESOURCE_TIER_WARM) {
+    throw std::runtime_error("configured desired resource tier was not sent");
+  }
+  if (owner_service.last_request_timeout_ms.load() != 1500) {
+    throw std::runtime_error("configured request timeout was not sent");
+  }
+  {
+    std::lock_guard<std::mutex> lock(owner_service.request_ids_mu);
+    if (owner_service.request_ids.size() != 1 || owner_service.request_ids[0].empty()) {
+      throw std::runtime_error("configured idempotency did not send request id");
+    }
+  }
+}
+
 void TestIdempotentClientsUseDistinctRequestIds() {
   auto route = std::make_shared<TimelineRoute>(MakeRoute("unused"));
   auto owner_service = TimestampServiceImpl(route, false);
@@ -324,6 +367,7 @@ int main() {
   try {
     TestAllocateAgainstOwnerEndpoint();
     TestRefreshesStaleRouteAndRetries();
+    TestClientConfigFlowsIntoRequests();
     TestIdempotentClientsUseDistinctRequestIds();
     TestRejectsPartialClientIdentity();
     TestRejectsMissingEnsureRoute();

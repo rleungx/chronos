@@ -5,6 +5,9 @@
 #include <chrono>
 #include <random>
 #include <sstream>
+#include <stdexcept>
+#include <thread>
+#include <utility>
 
 using chronos::tso::v1::AllocateTimestampsRequest;
 using chronos::tso::v1::AllocateTimestampsResponse;
@@ -12,7 +15,6 @@ using chronos::tso::v1::EnsureTimelineRequest;
 using chronos::tso::v1::ErrorCode;
 using chronos::tso::v1::ErrorDetail;
 using chronos::tso::v1::GetTimelineRouteRequest;
-using chronos::tso::v1::ResourceTier;
 using chronos::tso::v1::TimelineRoute;
 using chronos::tso::v1::TimelineRouteService;
 using chronos::tso::v1::TimestampService;
@@ -30,6 +32,20 @@ std::string MakeIdempotencyScope() {
   return out.str();
 }
 
+Client::Config ConfigWithTransport(Client::TransportConfig transport_config) {
+  Client::Config config;
+  config.transport = std::move(transport_config);
+  return config;
+}
+
+Client::Config ConfigWithTransport(
+    Client::TransportConfig transport_config,
+    bool idempotency_enabled) {
+  auto config = ConfigWithTransport(std::move(transport_config));
+  config.idempotency_enabled = idempotency_enabled;
+  return config;
+}
+
 }  // namespace
 
 Client::Client(const std::string& addr, const std::string& timeline_key)
@@ -39,18 +55,26 @@ Client::Client(
     const std::string& addr,
     const std::string& timeline_key,
     TransportConfig transport_config)
-    : Client(addr, timeline_key, std::move(transport_config), false) {}
+    : Client(addr, timeline_key, ConfigWithTransport(std::move(transport_config))) {}
 
 Client::Client(
     const std::string& addr,
     const std::string& timeline_key,
     TransportConfig transport_config,
     bool idempotency_enabled)
+    : Client(
+          addr,
+          timeline_key,
+          ConfigWithTransport(std::move(transport_config), idempotency_enabled)) {}
+
+Client::Client(
+    const std::string& addr,
+    const std::string& timeline_key,
+    Config config)
     : route_channel_(nullptr),
       route_stub_(nullptr),
       timeline_key_(timeline_key),
-      transport_config_(std::move(transport_config)),
-      idempotency_enabled_(idempotency_enabled),
+      config_(std::move(config)),
       idempotency_scope_(MakeIdempotencyScope()) {
   route_channel_ = CreateChannel(addr);
   route_stub_ = TimelineRouteService::NewStub(route_channel_);
@@ -66,23 +90,26 @@ std::vector<chronos::tso::v1::TimestampRange> Client::AllocateTimestamps(uint32_
   }
   AllocateTimestampsResponse response;
   const auto client_request_id = NextClientRequestId(route.timeline_key());
-  auto status = AllocateOnce(*tso_stub, route, &response, count, client_request_id);
-  if (status.ok()) {
-    return {response.ranges().begin(), response.ranges().end()};
+  uint32_t stale_retries = 0;
+
+  while (true) {
+    auto status = AllocateOnce(*tso_stub, route, &response, count, client_request_id);
+    if (status.ok()) {
+      return {response.ranges().begin(), response.ranges().end()};
+    }
+    if (!IsStaleRouteError(status) || stale_retries >= config_.stale_route_retry_attempts) {
+      throw std::runtime_error(status.error_message());
+    }
+
+    ++stale_retries;
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      route = RefreshRouteIfUnchangedLocked(route);
+      tso_stub = tso_stub_;
+    }
+    SleepBeforeStaleRouteRetry();
+    response.Clear();
   }
-  if (!IsStaleRouteError(status)) {
-    throw std::runtime_error(status.error_message());
-  }
-  {
-    std::lock_guard<std::mutex> lock(mu_);
-    route = RefreshRouteLocked();
-    tso_stub = tso_stub_;
-  }
-  status = AllocateOnce(*tso_stub, route, &response, count, client_request_id);
-  if (!status.ok()) {
-    throw std::runtime_error(status.error_message());
-  }
-  return {response.ranges().begin(), response.ranges().end()};
 }
 
 TimelineRoute Client::EnsureRoute() {
@@ -98,7 +125,7 @@ TimelineRoute Client::EnsureRouteLocked() {
   grpc::ClientContext ctx;
   EnsureTimelineRequest request;
   request.set_timeline_key(timeline_key_);
-  request.set_desired_resource_tier(ResourceTier::RESOURCE_TIER_SHARED);
+  request.set_desired_resource_tier(config_.desired_resource_tier);
   chronos::tso::v1::EnsureTimelineResponse response;
   auto status = route_stub_->EnsureTimeline(&ctx, request, &response);
   if (!status.ok()) {
@@ -110,6 +137,14 @@ TimelineRoute Client::EnsureRouteLocked() {
   if (response.route().owner_worker_endpoint().empty()) {
     throw std::runtime_error(
         "chronos returned route with empty owner endpoint from EnsureTimeline");
+  }
+  return RefreshRouteLocked();
+}
+
+TimelineRoute Client::RefreshRouteIfUnchangedLocked(const TimelineRoute& observed_route) {
+  auto it = cache_.find(timeline_key_);
+  if (it != cache_.end() && !SameRouteIdentity(it->second, observed_route)) {
+    return it->second;
   }
   return RefreshRouteLocked();
 }
@@ -137,6 +172,13 @@ TimelineRoute Client::RefreshRouteLocked() {
   return route;
 }
 
+void Client::SleepBeforeStaleRouteRetry() const {
+  if (config_.stale_route_retry_backoff_ms == 0) {
+    return;
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(config_.stale_route_retry_backoff_ms));
+}
+
 grpc::Status Client::AllocateOnce(
     TimestampService::Stub& tso_stub,
     const TimelineRoute& route,
@@ -150,14 +192,26 @@ grpc::Status Client::AllocateOnce(
   request.set_expected_epoch(route.epoch());
   request.set_expected_route_version(route.route_version());
   request.set_client_request_id(client_request_id);
+  request.set_request_timeout_ms(config_.request_timeout_ms);
   return tso_stub.AllocateTimestamps(&ctx, request, response);
 }
 
 std::string Client::NextClientRequestId(const std::string& timeline_key) {
-  if (!idempotency_enabled_) {
+  if (!config_.idempotency_enabled) {
     return "";
   }
   return timeline_key + "-" + idempotency_scope_ + "-" + std::to_string(request_id_++);
+}
+
+bool Client::SameRouteIdentity(
+    const TimelineRoute& left,
+    const TimelineRoute& right) const {
+  return left.timeline_key() == right.timeline_key() &&
+         left.generator_id() == right.generator_id() &&
+         left.owner_worker_endpoint() == right.owner_worker_endpoint() &&
+         left.epoch() == right.epoch() &&
+         left.route_version() == right.route_version() &&
+         left.resource_tier() == right.resource_tier();
 }
 
 bool Client::IsStaleRouteError(const grpc::Status& status) {
@@ -174,29 +228,29 @@ bool Client::IsStaleRouteError(const grpc::Status& status) {
 }
 
 std::shared_ptr<grpc::ChannelCredentials> Client::CreateChannelCredentials() const {
-  if (transport_config_.insecure) {
+  if (config_.transport.insecure) {
     return grpc::InsecureChannelCredentials();
   }
 
-  const bool has_private_key = !transport_config_.pem_private_key.empty();
-  const bool has_cert_chain = !transport_config_.pem_cert_chain.empty();
+  const bool has_private_key = !config_.transport.pem_private_key.empty();
+  const bool has_cert_chain = !config_.transport.pem_cert_chain.empty();
   if (has_private_key != has_cert_chain) {
     throw std::invalid_argument(
         "Chronos TLS client certificate and private key must be configured together");
   }
 
   grpc::SslCredentialsOptions options;
-  options.pem_root_certs = transport_config_.pem_root_certs;
-  options.pem_private_key = transport_config_.pem_private_key;
-  options.pem_cert_chain = transport_config_.pem_cert_chain;
+  options.pem_root_certs = config_.transport.pem_root_certs;
+  options.pem_private_key = config_.transport.pem_private_key;
+  options.pem_cert_chain = config_.transport.pem_cert_chain;
   return grpc::SslCredentials(options);
 }
 
 std::shared_ptr<grpc::Channel> Client::CreateChannel(const std::string& endpoint) const {
   grpc::ChannelArguments arguments;
-  if (!transport_config_.ssl_target_name_override.empty()) {
+  if (!config_.transport.ssl_target_name_override.empty()) {
     arguments.SetString(
-        GRPC_SSL_TARGET_NAME_OVERRIDE_ARG, transport_config_.ssl_target_name_override);
+        GRPC_SSL_TARGET_NAME_OVERRIDE_ARG, config_.transport.ssl_target_name_override);
   }
   return grpc::CreateCustomChannel(endpoint, CreateChannelCredentials(), arguments);
 }

@@ -13,6 +13,10 @@ path = "src/lib.rs"
 name = "chronos"
 path = "src/main.rs"
 
+[[example]]
+name = "client_example"
+path = "examples/rust/client_example.rs"
+
 [dependencies]
 tonic = { version = "0.14.5", features = ["transport", "tls-ring", "tls-webpki-roots", "tls-connect-info"] }
 tonic-prost = "0.14.5"

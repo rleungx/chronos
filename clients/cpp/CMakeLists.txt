@@ -43,4 +43,8 @@ add_executable(client_test "client_test.cc")
 target_include_directories(client_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}" "${GENERATED_DIR}")
 target_link_libraries(client_test PRIVATE chronos_client_lib)
 
+add_executable(client_example "../../examples/cpp/client_example.cc")
+target_include_directories(client_example PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}" "${GENERATED_DIR}")
+target_link_libraries(client_example PRIVATE chronos_client_lib)
+
 add_test(NAME client_test COMMAND client_test)

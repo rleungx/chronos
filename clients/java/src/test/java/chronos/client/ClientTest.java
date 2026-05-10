@@ -212,6 +212,95 @@ final class ClientTest {
   }
 
   @Test
+  void configFlowsIntoEnsureAndAllocateRequests() throws Exception {
+    var observedTier = new AtomicReference<ResourceTier>();
+    var observedTimeoutMs = new AtomicInteger(-1);
+    var observedRequestId = new AtomicReference<String>("");
+    var ownerServerName = InProcessServerBuilder.generateName();
+    var routeServerName = InProcessServerBuilder.generateName();
+
+    Server ownerServer =
+        InProcessServerBuilder.forName(ownerServerName)
+            .directExecutor()
+            .addService(
+                new TimestampServiceGrpc.TimestampServiceImplBase() {
+                  @Override
+                  public void allocateTimestamps(
+                      AllocateTimestampsRequest request,
+                      StreamObserver<AllocateTimestampsResponse> responseObserver) {
+                    observedTimeoutMs.set(request.getRequestTimeoutMs());
+                    observedRequestId.set(request.getClientRequestId());
+                    responseObserver.onNext(
+                        AllocateTimestampsResponse.newBuilder()
+                            .setTimelineKey(request.getTimelineKey())
+                            .setGeneratorId(7)
+                            .setEpoch(3)
+                            .setRouteVersion(11)
+                            .addRanges(
+                                TimestampRange.newBuilder().setStartTso(100).setEndTso(100).build())
+                            .build());
+                    responseObserver.onCompleted();
+                  }
+                })
+            .build()
+            .start();
+
+    Server routeServer =
+        InProcessServerBuilder.forName(routeServerName)
+            .directExecutor()
+            .addService(
+                new TimelineRouteServiceGrpc.TimelineRouteServiceImplBase() {
+                  @Override
+                  public void ensureTimeline(
+                      EnsureTimelineRequest request,
+                      StreamObserver<EnsureTimelineResponse> responseObserver) {
+                    observedTier.set(request.getDesiredResourceTier());
+                    responseObserver.onNext(
+                        EnsureTimelineResponse.newBuilder()
+                            .setRoute(route(request.getTimelineKey(), ownerServerName, 11))
+                            .build());
+                    responseObserver.onCompleted();
+                  }
+
+                  @Override
+                  public void getTimelineRoute(
+                      GetTimelineRouteRequest request,
+                      StreamObserver<GetTimelineRouteResponse> responseObserver) {
+                    responseObserver.onNext(
+                        GetTimelineRouteResponse.newBuilder()
+                            .setRoute(route(request.getTimelineKey(), ownerServerName, 11))
+                            .build());
+                    responseObserver.onCompleted();
+                  }
+                })
+            .build()
+            .start();
+
+    ManagedChannel routeChannel =
+        InProcessChannelBuilder.forName(routeServerName).directExecutor().build();
+
+    try (Client client = new Client(
+        routeChannel,
+        "orders.primary",
+        ignored -> InProcessChannelBuilder.forName(ownerServerName).directExecutor().build(),
+        Client.Config.defaults()
+            .withDesiredResourceTier(ResourceTier.RESOURCE_TIER_WARM)
+            .withRequestTimeoutMs(1500)
+            .withStaleRouteRetryAttempts(2)
+            .withStaleRouteRetryBackoffMs(0)
+            .withIdempotency(true))) {
+      assertEquals(1, client.allocateTimestamps(1).size());
+      assertEquals(ResourceTier.RESOURCE_TIER_WARM, observedTier.get());
+      assertEquals(1500, observedTimeoutMs.get());
+      assertFalse(observedRequestId.get().isBlank());
+    } finally {
+      routeChannel.shutdownNow();
+      ownerServer.shutdownNow();
+      routeServer.shutdownNow();
+    }
+  }
+
+  @Test
   void idempotentClientsUseDistinctRequestIds() throws Exception {
     var requestIds = new CopyOnWriteArrayList<String>();
     var ownerServerName = InProcessServerBuilder.generateName();

@@ -21,16 +21,20 @@ import (
 )
 
 const maxRetainedStaleOwnerConns = 16
+const defaultStaleRouteRetryAttempts uint32 = 3
+const defaultStaleRouteRetryBackoffMs uint64 = 5
 
 var clientScopeCounter atomic.Uint64
 
 type Option func(*config)
 
 type config struct {
-	desiredResourceTier tsov1.ResourceTier
-	requestTimeoutMs    uint32
-	idempotencyEnabled  bool
-	transport           transportConfig
+	desiredResourceTier      tsov1.ResourceTier
+	requestTimeoutMs         uint32
+	staleRouteRetryAttempts  uint32
+	staleRouteRetryBackoffMs uint64
+	idempotencyEnabled       bool
+	transport                transportConfig
 }
 
 type transportConfig struct {
@@ -43,10 +47,12 @@ type transportConfig struct {
 
 func defaultConfig() config {
 	return config{
-		desiredResourceTier: tsov1.ResourceTier_RESOURCE_TIER_SHARED,
-		requestTimeoutMs:    0,
-		idempotencyEnabled:  false,
-		transport:           transportConfig{},
+		desiredResourceTier:      tsov1.ResourceTier_RESOURCE_TIER_SHARED,
+		requestTimeoutMs:         0,
+		staleRouteRetryAttempts:  defaultStaleRouteRetryAttempts,
+		staleRouteRetryBackoffMs: defaultStaleRouteRetryBackoffMs,
+		idempotencyEnabled:       false,
+		transport:                transportConfig{},
 	}
 }
 
@@ -59,6 +65,18 @@ func WithDesiredResourceTier(tier tsov1.ResourceTier) Option {
 func WithRequestTimeoutMs(timeoutMs uint32) Option {
 	return func(cfg *config) {
 		cfg.requestTimeoutMs = timeoutMs
+	}
+}
+
+func WithStaleRouteRetryAttempts(attempts uint32) Option {
+	return func(cfg *config) {
+		cfg.staleRouteRetryAttempts = attempts
+	}
+}
+
+func WithStaleRouteRetryBackoffMs(backoffMs uint64) Option {
+	return func(cfg *config) {
+		cfg.staleRouteRetryBackoffMs = backoffMs
 	}
 }
 
@@ -169,19 +187,29 @@ func (c *Client) AllocateTimestamps(ctx context.Context, count uint32) ([]*tsov1
 	}
 
 	clientRequestID := c.nextClientRequestID(route.TimelineKey)
-	ranges, err := c.allocateOnce(ctx, route, count, clientRequestID)
-	if err == nil {
-		return ranges, nil
-	}
-	if !isStaleRouteError(err) {
-		return nil, err
-	}
+	var staleRetries uint32
+	for {
+		ranges, err := c.allocateOnce(ctx, route, count, clientRequestID)
+		if err == nil {
+			return ranges, nil
+		}
+		if !isStaleRouteError(err) || staleRetries >= c.config.staleRouteRetryAttempts {
+			return nil, err
+		}
 
-	route, err = c.refreshRoute(ctx)
-	if err != nil {
-		return nil, err
+		staleRetries++
+		route, err = c.refreshRouteIfUnchanged(ctx, route)
+		if err != nil {
+			return nil, err
+		}
+		if c.config.staleRouteRetryBackoffMs > 0 {
+			select {
+			case <-time.After(time.Duration(c.config.staleRouteRetryBackoffMs) * time.Millisecond):
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
 	}
-	return c.allocateOnce(ctx, route, count, clientRequestID)
 }
 
 func (c *Client) ensureRoute(ctx context.Context) (*tsov1.TimelineRoute, error) {
@@ -206,6 +234,19 @@ func (c *Client) ensureRoute(ctx context.Context) (*tsov1.TimelineRoute, error) 
 	return c.refreshRoute(ctx)
 }
 
+func (c *Client) refreshRouteIfUnchanged(ctx context.Context, observedRoute *tsov1.TimelineRoute) (*tsov1.TimelineRoute, error) {
+	c.mu.RLock()
+	currentRoute := c.cache[c.timelineKey]
+	c.mu.RUnlock()
+	if currentRoute != nil && !sameRouteIdentity(currentRoute, observedRoute) {
+		if err := c.ensureOwnerClient(ctx, currentRoute.OwnerWorkerEndpoint); err != nil {
+			return nil, err
+		}
+		return currentRoute, nil
+	}
+	return c.refreshRoute(ctx)
+}
+
 func (c *Client) refreshRoute(ctx context.Context) (*tsov1.TimelineRoute, error) {
 	resp, err := c.routeClient.GetTimelineRoute(ctx, &tsov1.GetTimelineRouteRequest{
 		TimelineKey: c.timelineKey,
@@ -225,6 +266,15 @@ func (c *Client) refreshRoute(ctx context.Context) (*tsov1.TimelineRoute, error)
 	c.cache[c.timelineKey] = route
 	c.mu.Unlock()
 	return route, nil
+}
+
+func sameRouteIdentity(left *tsov1.TimelineRoute, right *tsov1.TimelineRoute) bool {
+	return left.GetTimelineKey() == right.GetTimelineKey() &&
+		left.GetGeneratorId() == right.GetGeneratorId() &&
+		left.GetOwnerWorkerEndpoint() == right.GetOwnerWorkerEndpoint() &&
+		left.GetEpoch() == right.GetEpoch() &&
+		left.GetRouteVersion() == right.GetRouteVersion() &&
+		left.GetResourceTier() == right.GetResourceTier()
 }
 
 func (c *Client) ensureOwnerClient(ctx context.Context, ownerAddr string) error {
