@@ -3,6 +3,7 @@ package chronos
 import (
 	"context"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 
@@ -28,6 +29,8 @@ type fakeChronosServer struct {
 	returnedRequest []string
 	lastEnsureTier  tsov1.ResourceTier
 	lastTimeoutMs   uint32
+	omitEnsureRoute bool
+	omitGetRoute    bool
 }
 
 type fakeRouteOnlyServer struct {
@@ -74,6 +77,9 @@ func (s *fakeChronosServer) EnsureTimeline(_ context.Context, req *tsov1.EnsureT
 	defer s.mu.Unlock()
 	s.ensureCalls++
 	s.lastEnsureTier = req.DesiredResourceTier
+	if s.omitEnsureRoute {
+		return &tsov1.EnsureTimelineResponse{}, nil
+	}
 	s.route.TimelineKey = req.TimelineKey
 	return &tsov1.EnsureTimelineResponse{Route: cloneRoute(s.route)}, nil
 }
@@ -82,6 +88,9 @@ func (s *fakeChronosServer) GetTimelineRoute(_ context.Context, req *tsov1.GetTi
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.getRouteCalls++
+	if s.omitGetRoute {
+		return &tsov1.GetTimelineRouteResponse{}, nil
+	}
 	s.route.TimelineKey = req.TimelineKey
 	return &tsov1.GetTimelineRouteResponse{Route: cloneRoute(s.route)}, nil
 }
@@ -130,6 +139,7 @@ func TestClientOptionsFlowIntoRequests(t *testing.T) {
 		WithInsecureTransport(),
 		WithDesiredResourceTier(tsov1.ResourceTier_RESOURCE_TIER_WARM),
 		WithRequestTimeoutMs(1500),
+		WithIdempotency(true),
 	)
 	if err != nil {
 		t.Fatalf("NewWithOptions returned error: %v", err)
@@ -147,6 +157,9 @@ func TestClientOptionsFlowIntoRequests(t *testing.T) {
 	}
 	if server.lastTimeoutMs != 1500 {
 		t.Fatalf("expected timeout 1500, got %d", server.lastTimeoutMs)
+	}
+	if server.lastRequestID == "" {
+		t.Fatal("expected idempotency option to send a client request id")
 	}
 }
 
@@ -179,15 +192,21 @@ func TestClientNewAndAllocateTimestamps(t *testing.T) {
 	if server.allocateCalls != 1 {
 		t.Fatalf("expected one allocate call, got %d", server.allocateCalls)
 	}
-	if server.lastRequestID == "" {
-		t.Fatal("expected non-empty client request id")
+	if server.lastRequestID != "" {
+		t.Fatalf("expected default allocation to omit client request id, got %q", server.lastRequestID)
 	}
 }
 
 func TestClientRefreshesStaleRouteAndRetries(t *testing.T) {
 	server, addr := startFakeChronosServer(t, true)
 
-	client, err := NewWithOptions(context.Background(), addr, "orders.primary", WithInsecureTransport())
+	client, err := NewWithOptions(
+		context.Background(),
+		addr,
+		"orders.primary",
+		WithInsecureTransport(),
+		WithIdempotency(true),
+	)
 	if err != nil {
 		t.Fatalf("New returned error: %v", err)
 	}
@@ -209,8 +228,42 @@ func TestClientRefreshesStaleRouteAndRetries(t *testing.T) {
 	if server.allocateCalls != 2 {
 		t.Fatalf("expected one failed allocate and one retry, got %d calls", server.allocateCalls)
 	}
-	if len(server.returnedRequest) != 2 || server.returnedRequest[0] != server.returnedRequest[1] {
+	if len(server.returnedRequest) != 2 || server.returnedRequest[0] == "" || server.returnedRequest[0] != server.returnedRequest[1] {
 		t.Fatalf("expected retry to reuse logical request id, got %v", server.returnedRequest)
+	}
+}
+
+func TestIdempotentClientsUseDistinctRequestIDs(t *testing.T) {
+	server, addr := startFakeChronosServer(t, false)
+
+	first, err := NewWithOptions(context.Background(), addr, "orders.primary", WithInsecureTransport(), WithIdempotency(true))
+	if err != nil {
+		t.Fatalf("first NewWithOptions returned error: %v", err)
+	}
+	defer first.Close()
+	second, err := NewWithOptions(context.Background(), addr, "orders.primary", WithInsecureTransport(), WithIdempotency(true))
+	if err != nil {
+		t.Fatalf("second NewWithOptions returned error: %v", err)
+	}
+	defer second.Close()
+
+	if _, err := first.AllocateTimestamps(context.Background(), 1); err != nil {
+		t.Fatalf("first AllocateTimestamps returned error: %v", err)
+	}
+	if _, err := second.AllocateTimestamps(context.Background(), 1); err != nil {
+		t.Fatalf("second AllocateTimestamps returned error: %v", err)
+	}
+
+	server.mu.Lock()
+	defer server.mu.Unlock()
+	if len(server.returnedRequest) != 2 {
+		t.Fatalf("expected two request ids, got %v", server.returnedRequest)
+	}
+	if server.returnedRequest[0] == "" || server.returnedRequest[1] == "" {
+		t.Fatalf("expected idempotent clients to send request ids, got %v", server.returnedRequest)
+	}
+	if server.returnedRequest[0] == server.returnedRequest[1] {
+		t.Fatalf("expected independent clients to use distinct request ids, got %v", server.returnedRequest)
 	}
 }
 
@@ -245,6 +298,71 @@ func TestClientAllocatesAgainstRouteOwnerEndpoint(t *testing.T) {
 	}
 	if owner.allocateCalls != 1 {
 		t.Fatalf("owner server should serve allocate, got %d calls", owner.allocateCalls)
+	}
+}
+
+func TestClientBoundsRetainedStaleOwnerConnections(t *testing.T) {
+	firstOwner := newFakeChronosServer(false)
+	firstOwnerAddr := startTimestampOnlyServer(t, firstOwner)
+
+	route := newFakeChronosServer(false)
+	route.route.OwnerWorkerEndpoint = firstOwnerAddr
+	routeAddr := startRouteOnlyServer(t, route)
+
+	client, err := NewWithOptions(context.Background(), routeAddr, "orders.primary", WithInsecureTransport())
+	if err != nil {
+		t.Fatalf("New returned error: %v", err)
+	}
+	defer client.Close()
+
+	for i := 0; i < maxRetainedStaleOwnerConns+3; i++ {
+		owner := newFakeChronosServer(false)
+		ownerAddr := startTimestampOnlyServer(t, owner)
+		route.mu.Lock()
+		route.route.OwnerWorkerEndpoint = ownerAddr
+		route.route.RouteVersion++
+		route.mu.Unlock()
+
+		if _, err := client.refreshRoute(context.Background()); err != nil {
+			t.Fatalf("refreshRoute returned error: %v", err)
+		}
+	}
+
+	client.mu.RLock()
+	staleConnCount := len(client.staleConns)
+	client.mu.RUnlock()
+	if staleConnCount != maxRetainedStaleOwnerConns {
+		t.Fatalf("expected %d retained stale owner connections, got %d", maxRetainedStaleOwnerConns, staleConnCount)
+	}
+}
+
+func TestClientRejectsMissingEnsureRoute(t *testing.T) {
+	server, addr := startFakeChronosServer(t, false)
+	server.mu.Lock()
+	server.omitEnsureRoute = true
+	server.mu.Unlock()
+
+	_, err := NewWithOptions(context.Background(), addr, "orders.primary", WithInsecureTransport())
+	if err == nil {
+		t.Fatal("expected missing ensure route to fail")
+	}
+	if !strings.Contains(err.Error(), "chronos returned no route from ensure_timeline") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestClientRejectsMissingRefreshedRoute(t *testing.T) {
+	server, addr := startFakeChronosServer(t, false)
+	server.mu.Lock()
+	server.omitGetRoute = true
+	server.mu.Unlock()
+
+	_, err := NewWithOptions(context.Background(), addr, "orders.primary", WithInsecureTransport())
+	if err == nil {
+		t.Fatal("expected missing refreshed route to fail")
+	}
+	if !strings.Contains(err.Error(), "chronos returned no route from get_timeline_route") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 

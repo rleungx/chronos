@@ -600,6 +600,19 @@ impl GeneratorLeaseAuthority for MemoryMetadataStore {
         Ok(loaded)
     }
 
+    async fn scan_generators(&self) -> Result<Vec<GeneratorRecord>, TsoError> {
+        let _timer = metrics::TSO_METADATA_LATENCY
+            .with_label_values(&["scan_generators"])
+            .start_timer();
+        let mut records = Vec::with_capacity(self.generators.len());
+        for entry in self.generators.iter() {
+            let (record, _) = entry.value().clone();
+            record.validate_schema_version()?;
+            records.push(record);
+        }
+        Ok(records)
+    }
+
     async fn create_generator(
         &self,
         generator_id: u32,

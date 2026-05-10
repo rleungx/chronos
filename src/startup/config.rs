@@ -12,9 +12,6 @@ const REMOVED_STARTUP_TUNING_ENV_VARS: &[&str] = &[
     "CHRONOS_SHARED_GENERATORS",
     "CHRONOS_WARM_GENERATORS",
     "CHRONOS_MAX_BATCH_PER_REQUEST",
-    "CHRONOS_MAX_TIMELINE_PROXY_LANES",
-    "CHRONOS_MAX_TIMELINE_RUNTIME_ENTRIES",
-    "CHRONOS_MAX_CONCURRENT_TIMELINE_LOADS",
     "CHRONOS_DEFAULT_RESOURCE_TIER",
     "CHRONOS_MAX_FUTURE_BORROW_MS",
     "CHRONOS_MAX_CLOCK_REWIND_MS",
@@ -319,12 +316,37 @@ fn apply_transport_limit_env(config: &mut TsoConfig) -> AppResult<()> {
 
 fn apply_capacity_env(config: &mut TsoConfig) -> AppResult<()> {
     apply_parsed_env(
+        "CHRONOS_MAX_TIMELINE_PROXY_LANES",
+        &mut config.max_timeline_proxy_lanes,
+    )?;
+    apply_parsed_env(
+        "CHRONOS_MAX_TIMELINE_RUNTIME_ENTRIES",
+        &mut config.max_timeline_runtime_entries,
+    )?;
+    apply_parsed_env(
+        "CHRONOS_MAX_CONCURRENT_TIMELINE_LOADS",
+        &mut config.max_concurrent_timeline_loads,
+    )?;
+    apply_parsed_env(
         "CHRONOS_REQUEST_RECORD_CLEANUP_BATCH_SIZE",
         &mut config.request_record_cleanup_batch_size,
     )?;
     apply_parsed_env(
         "CHRONOS_AUTO_FAILOVER_BATCH_SIZE",
         &mut config.auto_failover_batch_size,
+    )?;
+    Ok(())
+}
+
+fn apply_generator_ownership_env(config: &mut TsoConfig) -> AppResult<()> {
+    apply_string_env("CHRONOS_OWNERSHIP_PLAN_ID", &mut config.ownership_plan_id);
+    apply_parsed_env(
+        "CHRONOS_GENERATOR_OWNERSHIP_MODULO",
+        &mut config.generator_ownership_modulo,
+    )?;
+    apply_parsed_env(
+        "CHRONOS_GENERATOR_OWNERSHIP_REMAINDER",
+        &mut config.generator_ownership_remainder,
     )?;
     Ok(())
 }
@@ -386,6 +408,7 @@ fn build_config_and_metadata_env() -> AppResult<(TsoConfig, MetadataEnvConfig, S
     apply_security_surface_env(&mut config)?;
     apply_transport_limit_env(&mut config)?;
     apply_capacity_env(&mut config)?;
+    apply_generator_ownership_env(&mut config)?;
     apply_timing_env(&mut config)?;
 
     Ok((config, metadata, logging))

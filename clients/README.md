@@ -12,8 +12,10 @@ Shared behavior:
 
 - The client ensures the bound timeline on first connect
 - The client fetches and caches the current route internally
-- Stale-route errors are handled with one refresh-and-retry cycle
+- Stale-route errors are handled internally with refresh-and-retry behavior
 - Route refresh reconnects allocation traffic to the current owner endpoint
+- Allocations omit request-record idempotency by default to keep the hot path metadata-free;
+  enable the language-specific idempotency option when replay protection is required
 - Other RPC failures are returned to the caller
 
 The protobuf route-management RPCs remain part of the wire contract, but they are treated as

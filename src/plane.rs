@@ -29,10 +29,49 @@ impl RequestCancellation {
     }
 
     pub(crate) async fn cancelled(&self) {
-        if self.is_cancelled() {
-            return;
+        loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.is_cancelled() {
+                return;
+            }
+            notified.await;
         }
-        self.notify.notified().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::time::{timeout, Duration};
+
+    use super::RequestCancellation;
+
+    #[tokio::test]
+    async fn request_cancellation_waiter_observes_pre_cancelled_token() {
+        let cancellation = RequestCancellation::new();
+        cancellation.cancel();
+
+        timeout(Duration::from_millis(100), cancellation.cancelled())
+            .await
+            .expect("pre-cancelled token should return immediately");
+    }
+
+    #[tokio::test]
+    async fn request_cancellation_waiter_observes_later_cancel() {
+        let cancellation = RequestCancellation::new();
+        let waiter_cancellation = cancellation.clone();
+        let waiter = tokio::spawn(async move {
+            waiter_cancellation.cancelled().await;
+        });
+
+        tokio::task::yield_now().await;
+        cancellation.cancel();
+
+        timeout(Duration::from_millis(100), waiter)
+            .await
+            .expect("cancelled waiter should finish")
+            .expect("waiter task should succeed");
     }
 }
 

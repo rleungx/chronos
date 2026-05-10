@@ -72,7 +72,7 @@ fn print_help() {
 
 fn print_env_template() {
     println!(
-        "# Minimal local memory-backed startup\nexport CHRONOS_SECURITY_MODE=dev-insecure\nexport CHRONOS_BIND_ADDR=127.0.0.1:50051\nexport CHRONOS_ADVERTISE_ENDPOINT=127.0.0.1:50051\nexport CHRONOS_LOG_FORMAT=json\nexport CHRONOS_LOG_FILTER=info\n\n# Optional identity\n# export CHRONOS_WORKER_ID=worker-a\n# export CHRONOS_INSTANCE_ID=instance-a\n\n# To switch to etcd-backed metadata, also set:\n# export CHRONOS_METADATA=etcd\n# export CHRONOS_ETCD_ENDPOINTS=127.0.0.1:2379\n# export CHRONOS_ETCD_PREFIX=/chronos-local\n# export CHRONOS_WORKER_ID=worker-a\n# export CHRONOS_SAFETY_GAP_MS=1\n"
+        "# Minimal local memory-backed startup\nexport CHRONOS_SECURITY_MODE=dev-insecure\nexport CHRONOS_BIND_ADDR=127.0.0.1:50051\nexport CHRONOS_ADVERTISE_ENDPOINT=127.0.0.1:50051\nexport CHRONOS_LOG_FORMAT=json\nexport CHRONOS_LOG_FILTER=info\n\n# Optional identity\n# export CHRONOS_WORKER_ID=worker-a\n# export CHRONOS_INSTANCE_ID=instance-a\n\n# To switch to etcd-backed metadata, also set:\n# export CHRONOS_METADATA=etcd\n# export CHRONOS_ETCD_ENDPOINTS=127.0.0.1:2379\n# export CHRONOS_ETCD_PREFIX=/chronos-local\n# export CHRONOS_WORKER_ID=worker-a\n# export CHRONOS_SAFETY_GAP_MS=1\n\n# Optional multi-node generator partitioning:\n# export CHRONOS_OWNERSHIP_PLAN_ID=scale-2026-05-10-a\n# export CHRONOS_GENERATOR_OWNERSHIP_MODULO=2\n# export CHRONOS_GENERATOR_OWNERSHIP_REMAINDER=0\n"
     );
 }
 
@@ -109,6 +109,15 @@ fn print_config_lines(config: &TsoConfig) {
     );
     println!("metrics_bind_addr={}", config.metrics_bind_addr);
     println!("production_profile={}", config.production_profile);
+    println!("ownership_plan_id={}", config.ownership_plan_id);
+    println!(
+        "generator_ownership_modulo={}",
+        config.generator_ownership_modulo
+    );
+    println!(
+        "generator_ownership_remainder={}",
+        config.generator_ownership_remainder
+    );
     println!("safety_gap_ms={}", config.safety_gap_ms);
     println!("auto_failover_enabled={}", config.auto_failover_enabled);
     println!(

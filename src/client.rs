@@ -11,12 +11,14 @@
 //! internally after route refresh. Other RPC failures are returned to the caller.
 //!
 //! ```no_run
-//! use chronos::{Client, ClientConfig};
+//! use chronos::{Client, ClientConfig, ClientTransportConfig};
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-//! let client = Client::connect(
+//! let config = ClientConfig::new("orders.primary")
+//!     .with_transport(ClientTransportConfig::default().with_insecure(true));
+//! let client = Client::connect_with_config(
 //!     "127.0.0.1:50051",
-//!     "orders.primary",
+//!     config,
 //! )
 //! .await?;
 //!
@@ -27,7 +29,7 @@
 //! ```
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use prost::Message;
 use thiserror::Error;
@@ -44,6 +46,7 @@ use crate::proto::v1::{
 
 const DEFAULT_STALE_ROUTE_RETRY_ATTEMPTS: u32 = 3;
 const DEFAULT_STALE_ROUTE_RETRY_BACKOFF_MS: u64 = 5;
+static CLIENT_SCOPE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
@@ -52,6 +55,7 @@ pub struct ClientConfig {
     request_timeout_ms: u32,
     stale_route_retry_attempts: u32,
     stale_route_retry_backoff_ms: u64,
+    idempotency_enabled: bool,
     transport: ClientTransportConfig,
 }
 
@@ -73,6 +77,7 @@ impl ClientConfig {
             request_timeout_ms: 0,
             stale_route_retry_attempts: DEFAULT_STALE_ROUTE_RETRY_ATTEMPTS,
             stale_route_retry_backoff_ms: DEFAULT_STALE_ROUTE_RETRY_BACKOFF_MS,
+            idempotency_enabled: false,
             transport: ClientTransportConfig::default(),
         }
     }
@@ -98,6 +103,16 @@ impl ClientConfig {
     /// Sets the backoff between stale-route refresh retries.
     pub fn with_stale_route_retry_backoff_ms(mut self, stale_route_retry_backoff_ms: u64) -> Self {
         self.stale_route_retry_backoff_ms = stale_route_retry_backoff_ms;
+        self
+    }
+
+    /// Enables server-side request-record idempotency for each allocation.
+    ///
+    /// This adds metadata I/O on authoritative stores such as etcd, so the default keeps the
+    /// allocation hot path non-idempotent. Enable it when callers need replay protection for
+    /// ambiguous client-side retries.
+    pub fn with_idempotency_enabled(mut self, idempotency_enabled: bool) -> Self {
+        self.idempotency_enabled = idempotency_enabled;
         self
     }
 
@@ -176,6 +191,7 @@ pub struct Client {
     route: RwLock<TimelineRoute>,
     route_refresh: Mutex<()>,
     config: ClientConfig,
+    idempotency_scope: String,
     request_id: AtomicU64,
 }
 
@@ -229,6 +245,7 @@ impl Client {
             route: RwLock::new(ensured_route),
             route_refresh: Mutex::new(()),
             config,
+            idempotency_scope: new_idempotency_scope(),
             request_id: AtomicU64::new(1),
         })
     }
@@ -350,12 +367,26 @@ impl Client {
     }
 
     fn next_client_request_id(&self) -> String {
-        format!(
-            "{}-{}",
-            self.config.timeline_key,
-            self.request_id.fetch_add(1, Ordering::Relaxed)
-        )
+        if self.config.idempotency_enabled {
+            format!(
+                "{}-{}-{}",
+                self.config.timeline_key,
+                self.idempotency_scope,
+                self.request_id.fetch_add(1, Ordering::Relaxed)
+            )
+        } else {
+            String::new()
+        }
     }
+}
+
+fn new_idempotency_scope() -> String {
+    let counter = CLIENT_SCOPE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let now_ns = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    format!("{:x}-{:x}-{:x}", std::process::id(), now_ns, counter)
 }
 
 fn same_route_identity(left: &TimelineRoute, right: &TimelineRoute) -> bool {
@@ -810,6 +841,25 @@ mod tests {
 
         assert_eq!(ranges.len(), 1);
         assert_eq!(ranges[0].start_tso, 100);
+    }
+
+    #[test]
+    fn client_config_disables_request_record_idempotency_by_default() {
+        let default_config = ClientConfig::new("orders.primary");
+        assert!(!default_config.idempotency_enabled);
+
+        let idempotent_config = ClientConfig::new("orders.primary").with_idempotency_enabled(true);
+        assert!(idempotent_config.idempotency_enabled);
+    }
+
+    #[test]
+    fn idempotency_scope_is_unique_per_client_instance() {
+        let first = new_idempotency_scope();
+        let second = new_idempotency_scope();
+
+        assert_ne!(first, second);
+        assert!(first.contains('-'));
+        assert!(second.contains('-'));
     }
 
     #[test]

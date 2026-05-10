@@ -103,7 +103,7 @@ pub(crate) fn validate_startup_preflight(
         StartupMetadata::Memory => build_validated_startup_plan(startup),
         StartupMetadata::Etcd(etcd) => {
             config.validate_authoritative_metadata_store_contract(&etcd.endpoints, &etcd.prefix)?;
-            config.validate_authoritative_metadata_runtime_contract()?;
+            config.validate_authoritative_metadata_runtime_contract_for_etcd()?;
             build_validated_startup_plan(startup)
         }
     }

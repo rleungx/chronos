@@ -21,13 +21,15 @@ cargo test client::tests --lib
 ## Minimal usage
 
 ```rust
-use chronos::Client;
+use chronos::{Client, ClientConfig, ClientTransportConfig};
 
 type AppResult<T> = Result<T, Box<dyn std::error::Error>>;
 
 #[tokio::main]
 async fn main() -> AppResult<()> {
-    let client = Client::connect("127.0.0.1:50051", "orders.primary").await?;
+    let config = ClientConfig::new("orders.primary")
+        .with_transport(ClientTransportConfig::default().with_insecure(true));
+    let client = Client::connect_with_config("127.0.0.1:50051", config).await?;
     let ranges = client.allocate_timestamps(1).await?;
     println!("tso={}", ranges[0].start_tso);
     Ok(())
@@ -38,8 +40,10 @@ async fn main() -> AppResult<()> {
 
 - The client ensures the bound timeline on first connect
 - The client fetches and caches the current route internally
-- Stale-route errors are handled with one refresh-and-retry cycle
+- Stale-route errors are handled with a configurable refresh-and-retry budget
 - Route refresh reconnects allocation traffic to the current owner endpoint
+- Allocation request-record idempotency is disabled by default; use
+  `ClientConfig::with_idempotency_enabled(true)` when callers need replay protection
 - Other RPC failures are returned to the caller
 
 ## Files

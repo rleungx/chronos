@@ -16,6 +16,8 @@ handled by the Chronos client/runtime layer.
 
 - A single allocation surface for normal application usage
 - Timeline-scoped routing so one logical workload can keep using the same client contract
+- Horizontal scaling across independent `timeline_key` shards; a single global strict sequence is
+  intentionally not the scalability boundary
 - Internal handling for route ensure, route refresh, and stale-route retry
 - Production-oriented operational assets in this repo: validation gates, alerts, dashboards,
   runbooks, and release/rollback guidance
@@ -30,6 +32,7 @@ handled by the Chronos client/runtime layer.
 
 - Your application should not call internal routing RPCs directly.
 - `timeline_key` is chosen once when the client is created.
+- Use multiple timeline keys when the workload needs horizontal throughput scaling.
 - Allocation is the only operation the application should need during normal use.
 - Route ensure, route refresh, and stale-route retry are internal client behavior.
 - Route refresh reconnects allocation traffic to the current owner endpoint.

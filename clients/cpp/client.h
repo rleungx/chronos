@@ -26,6 +26,11 @@ class Client {
       const std::string& addr,
       const std::string& timeline_key,
       TransportConfig transport_config);
+  Client(
+      const std::string& addr,
+      const std::string& timeline_key,
+      TransportConfig transport_config,
+      bool idempotency_enabled);
   std::vector<chronos::tso::v1::TimestampRange> AllocateTimestamps(uint32_t count);
 
  private:
@@ -50,6 +55,8 @@ class Client {
   std::unordered_map<std::string, chronos::tso::v1::TimelineRoute> cache_;
   std::string timeline_key_;
   TransportConfig transport_config_;
+  bool idempotency_enabled_;
+  std::string idempotency_scope_;
   std::mutex mu_;
   std::atomic<uint64_t> request_id_{1};
 };

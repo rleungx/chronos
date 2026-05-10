@@ -19,13 +19,17 @@ import io.grpc.netty.shaded.io.grpc.netty.NettyChannelBuilder;
 import io.grpc.protobuf.StatusProto;
 import java.io.ByteArrayInputStream;
 import java.io.InputStream;
+import java.util.ArrayDeque;
+import java.util.Deque;
 import java.util.List;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.UUID;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import javax.net.ssl.SSLException;
 
 public class Client implements AutoCloseable {
+  private static final int MAX_RETAINED_STALE_OWNER_CHANNELS = 16;
+
   public static final class TransportConfig {
     private final boolean plaintext;
     private final byte[] trustedCaPem;
@@ -89,41 +93,66 @@ public class Client implements AutoCloseable {
   private final AtomicReference<ManagedChannel> tsoChannel = new AtomicReference<>();
   private final AtomicReference<TimestampServiceGrpc.TimestampServiceBlockingStub> tsoStub =
       new AtomicReference<>();
-  private final ConcurrentHashMap<String, TimelineRoute> cache = new ConcurrentHashMap<>();
+  private final AtomicReference<TimelineRoute> route = new AtomicReference<>();
   private final AtomicLong requestId = new AtomicLong(1);
   private final String timelineKey;
   private final AllocationChannelFactory allocationChannelFactory;
+  private final boolean idempotencyEnabled;
+  private final String idempotencyScope;
+  private final Object routeRefreshLock = new Object();
+  private final Deque<ManagedChannel> staleOwnerChannels = new ArrayDeque<>();
+  private String ownerEndpoint = "";
 
   public Client(String addr, String timelineKey) {
     this(addr, timelineKey, TransportConfig.secure());
   }
 
   public Client(String addr, String timelineKey, TransportConfig transportConfig) {
+    this(addr, timelineKey, transportConfig, false);
+  }
+
+  public Client(
+      String addr,
+      String timelineKey,
+      TransportConfig transportConfig,
+      boolean idempotencyEnabled) {
     this(
         createManagedChannel(addr, transportConfig),
         timelineKey,
-        ownerWorkerEndpoint -> createManagedChannel(ownerWorkerEndpoint, transportConfig));
+        ownerWorkerEndpoint -> createManagedChannel(ownerWorkerEndpoint, transportConfig),
+        idempotencyEnabled);
   }
 
   Client(ManagedChannel routeChannel, String timelineKey) {
     this(
         routeChannel,
         timelineKey,
-        ownerWorkerEndpoint -> ManagedChannelBuilder.forTarget(ownerWorkerEndpoint).usePlaintext().build());
+        ownerWorkerEndpoint -> ManagedChannelBuilder.forTarget(ownerWorkerEndpoint).usePlaintext().build(),
+        false);
   }
 
   Client(
       ManagedChannel routeChannel,
       String timelineKey,
       AllocationChannelFactory allocationChannelFactory) {
+    this(routeChannel, timelineKey, allocationChannelFactory, false);
+  }
+
+  Client(
+      ManagedChannel routeChannel,
+      String timelineKey,
+      AllocationChannelFactory allocationChannelFactory,
+      boolean idempotencyEnabled) {
     this.routeChannel = routeChannel;
     this.routeStub = TimelineRouteServiceGrpc.newBlockingStub(routeChannel);
     this.timelineKey = timelineKey;
     this.allocationChannelFactory = allocationChannelFactory;
+    this.idempotencyEnabled = idempotencyEnabled;
+    this.idempotencyScope = UUID.randomUUID().toString();
     ensureRoute();
   }
 
-  public synchronized List<TimestampRange> allocateTimestamps(int count) {
+  public List<TimestampRange> allocateTimestamps(int count) {
     TimelineRoute route = ensureRoute();
     String clientRequestId = nextClientRequestId(route.getTimelineKey());
     try {
@@ -132,39 +161,88 @@ public class Client implements AutoCloseable {
       if (!isStaleRouteError(err)) {
         throw err;
       }
-      route = refreshRoute();
+      route = refreshRouteIfUnchanged(route);
       return allocateOnce(route, count, clientRequestId).getRangesList();
     }
   }
 
-  private synchronized TimelineRoute ensureRoute() {
-    TimelineRoute route = cache.get(timelineKey);
-    if (route != null) {
-      return route;
+  private TimelineRoute ensureRoute() {
+    TimelineRoute cached = route.get();
+    if (cached != null) {
+      return cached;
     }
 
-    routeStub.ensureTimeline(
-        EnsureTimelineRequest.newBuilder()
-            .setTimelineKey(timelineKey)
-            .setDesiredResourceTier(ResourceTier.RESOURCE_TIER_SHARED)
-            .build());
+    synchronized (routeRefreshLock) {
+      cached = route.get();
+      if (cached != null) {
+        return cached;
+      }
 
-    return refreshRoute();
+      var ensureResponse =
+          routeStub.ensureTimeline(
+              EnsureTimelineRequest.newBuilder()
+                  .setTimelineKey(timelineKey)
+                  .setDesiredResourceTier(ResourceTier.RESOURCE_TIER_SHARED)
+                  .build());
+      requireRoute("ensureTimeline", ensureResponse.hasRoute(), ensureResponse.getRoute());
+
+      return refreshRouteLocked();
+    }
   }
 
-  private synchronized TimelineRoute refreshRoute() {
-    TimelineRoute route =
-        routeStub
-            .getTimelineRoute(GetTimelineRouteRequest.newBuilder().setTimelineKey(timelineKey).build())
-            .getRoute();
-    ManagedChannel previous = tsoChannel.getAndSet(null);
-    if (previous != null) {
-      previous.shutdownNow();
+  private TimelineRoute refreshRouteIfUnchanged(TimelineRoute observedRoute) {
+    synchronized (routeRefreshLock) {
+      TimelineRoute currentRoute = route.get();
+      if (currentRoute != null && !sameRouteIdentity(currentRoute, observedRoute)) {
+        ensureOwnerChannelLocked(currentRoute.getOwnerWorkerEndpoint());
+        return currentRoute;
+      }
+      return refreshRouteLocked();
     }
-    ManagedChannel nextChannel = allocationChannelFactory.create(route.getOwnerWorkerEndpoint());
-    tsoChannel.set(nextChannel);
+  }
+
+  private TimelineRoute refreshRouteLocked() {
+    var response =
+        routeStub
+            .getTimelineRoute(
+                GetTimelineRouteRequest.newBuilder().setTimelineKey(timelineKey).build());
+    TimelineRoute route = requireRoute("getTimelineRoute", response.hasRoute(), response.getRoute());
+    ensureOwnerChannelLocked(route.getOwnerWorkerEndpoint());
+    this.route.set(route);
+    return route;
+  }
+
+  private void ensureOwnerChannelLocked(String nextOwnerEndpoint) {
+    if (nextOwnerEndpoint.equals(ownerEndpoint) && tsoStub.get() != null) {
+      return;
+    }
+
+    ManagedChannel nextChannel = allocationChannelFactory.create(nextOwnerEndpoint);
+    ManagedChannel previous = tsoChannel.getAndSet(nextChannel);
     tsoStub.set(TimestampServiceGrpc.newBlockingStub(nextChannel));
-    cache.put(timelineKey, route);
+    ownerEndpoint = nextOwnerEndpoint;
+    retainStaleOwnerChannelLocked(previous);
+  }
+
+  private void retainStaleOwnerChannelLocked(ManagedChannel previous) {
+    if (previous == null) {
+      return;
+    }
+
+    staleOwnerChannels.addLast(previous);
+    if (staleOwnerChannels.size() > MAX_RETAINED_STALE_OWNER_CHANNELS) {
+      staleOwnerChannels.removeFirst().shutdownNow();
+    }
+  }
+
+  private static TimelineRoute requireRoute(String operation, boolean hasRoute, TimelineRoute route) {
+    if (!hasRoute) {
+      throw new IllegalStateException("Chronos returned no route from " + operation);
+    }
+    if (route.getOwnerWorkerEndpoint().isBlank()) {
+      throw new IllegalStateException(
+          "Chronos returned route with empty owner endpoint from " + operation);
+    }
     return route;
   }
 
@@ -181,7 +259,19 @@ public class Client implements AutoCloseable {
   }
 
   private String nextClientRequestId(String timelineKey) {
-    return timelineKey + "-" + requestId.getAndIncrement();
+    if (!idempotencyEnabled) {
+      return "";
+    }
+    return timelineKey + "-" + idempotencyScope + "-" + requestId.getAndIncrement();
+  }
+
+  private static boolean sameRouteIdentity(TimelineRoute left, TimelineRoute right) {
+    return left.getTimelineKey().equals(right.getTimelineKey())
+        && left.getGeneratorId() == right.getGeneratorId()
+        && left.getOwnerWorkerEndpoint().equals(right.getOwnerWorkerEndpoint())
+        && left.getEpoch() == right.getEpoch()
+        && left.getRouteVersion() == right.getRouteVersion()
+        && left.getResourceTier() == right.getResourceTier();
   }
 
   private static boolean isStaleRouteError(RuntimeException err) {
@@ -207,12 +297,19 @@ public class Client implements AutoCloseable {
   }
 
   @Override
-  public synchronized void close() {
-    ManagedChannel currentTsoChannel = tsoChannel.getAndSet(null);
-    if (currentTsoChannel != null) {
-      currentTsoChannel.shutdownNow();
+  public void close() {
+    synchronized (routeRefreshLock) {
+      for (ManagedChannel stale : staleOwnerChannels) {
+        stale.shutdownNow();
+      }
+      staleOwnerChannels.clear();
+      ManagedChannel currentTsoChannel = tsoChannel.getAndSet(null);
+      if (currentTsoChannel != null) {
+        currentTsoChannel.shutdownNow();
+      }
+      route.set(null);
+      routeChannel.shutdownNow();
     }
-    routeChannel.shutdownNow();
   }
 
   private static ManagedChannel createManagedChannel(String target, TransportConfig transportConfig) {

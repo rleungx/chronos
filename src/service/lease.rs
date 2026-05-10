@@ -28,8 +28,12 @@ impl TsoService {
         cancellation: Option<RequestCancellation>,
     ) -> Result<(), TsoError> {
         let _flight = self
-            .acquire_generator_lease_singleflight(generator_id)
-            .await;
+            .acquire_generator_lease_singleflight_with_cancellation(
+                generator_id,
+                cancellation.clone(),
+            )
+            .await?;
+        Self::check_request_cancellation(cancellation.as_ref())?;
         if self.is_generator_lease_valid(generator_id, self.clock.now_ms()) {
             return Ok(());
         }
@@ -247,8 +251,12 @@ impl TsoService {
         Self::check_request_cancellation(cancellation.as_ref())?;
 
         let _flight = self
-            .acquire_generator_lease_singleflight(generator_id)
-            .await;
+            .acquire_generator_lease_singleflight_with_cancellation(
+                generator_id,
+                cancellation.clone(),
+            )
+            .await?;
+        Self::check_request_cancellation(cancellation.as_ref())?;
         let now_ms = self.clock.now_ms();
         if let Some(issued_upper_bound) =
             self.valid_generator_lease_upper_bound(generator_id, now_ms)
@@ -403,8 +411,12 @@ impl TsoService {
         cancellation: Option<RequestCancellation>,
     ) -> Result<(), TsoError> {
         let _flight = self
-            .acquire_generator_lease_singleflight(generator_id)
-            .await;
+            .acquire_generator_lease_singleflight_with_cancellation(
+                generator_id,
+                cancellation.clone(),
+            )
+            .await?;
+        Self::check_request_cancellation(cancellation.as_ref())?;
         let now_ms = self.clock.now_ms();
         if let Some(lease_state) = self.generator_runtime.lease_state(generator_id) {
             if lease_state.lease_expire_at_ms > now_ms

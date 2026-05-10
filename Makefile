@@ -21,6 +21,10 @@ ETCD_ENDPOINTS ?= 127.0.0.1:2379
 	test-etcd \
 	test-failover-bench \
 	test-auto-failover-bench \
+	test-scale-bench \
+	test-scale-matrix \
+	test-scale-matrix-production \
+	scale-ownership-plan \
 	test-rebalance-bench \
 	test-soak \
 	test-chaos \
@@ -35,6 +39,7 @@ ETCD_ENDPOINTS ?= 127.0.0.1:2379
 	container-startup-smoke \
 	container-etcd-startup-smoke \
 	container-check \
+	release-source-check \
 	release-package \
 	release-shape-check \
 	release-check \
@@ -54,6 +59,7 @@ TRIVY_IMAGE ?= aquasec/trivy:0.57.1
 TRIVY_CACHE_DIR ?= $(CURDIR)/.cache/trivy
 CONTAINER_CHECK_IMAGE ?= chronos:container-check
 CONTAINER_CHECK_FORCE_BUILD ?= 1
+CHRONOS_ALLOW_DIRTY_RELEASE ?= 0
 CARGO_DENY_VERSION ?= 0.19.4
 CHRONOS_SKIP_RELEASE_BUILD ?= 0
 CHRONOS_RELEASE_BIN_DIR ?= $(CURDIR)/target/release
@@ -172,9 +178,30 @@ test-failover-bench:
 test-auto-failover-bench:
 	CHRONOS_SKIP_RELEASE_BUILD=$(CHRONOS_SKIP_RELEASE_BUILD) \
 	CHRONOS_RELEASE_BIN_DIR=$(CHRONOS_RELEASE_BIN_DIR) \
+	CHRONOS_FAILOVER_ARTIFACT_NAME=auto-failover \
 	CHRONOS_FAILOVER_BENCH_AUTO_FAILOVER_ENABLED=true \
 	CHRONOS_FAILOVER_BENCH_AUTO_FAILOVER_INTERVAL_MS=100 \
 	bash hack/failover/failover-etcd.sh
+
+test-scale-bench:
+	CHRONOS_SKIP_RELEASE_BUILD=$(CHRONOS_SKIP_RELEASE_BUILD) \
+	CHRONOS_RELEASE_BIN_DIR=$(CHRONOS_RELEASE_BIN_DIR) \
+	bash hack/scale/scale-etcd.sh
+
+test-scale-matrix:
+	CHRONOS_SKIP_RELEASE_BUILD=$(CHRONOS_SKIP_RELEASE_BUILD) \
+	CHRONOS_RELEASE_BIN_DIR=$(CHRONOS_RELEASE_BIN_DIR) \
+	bash hack/scale/scale-matrix.sh
+
+test-scale-matrix-production:
+	CHRONOS_SKIP_RELEASE_BUILD=$(CHRONOS_SKIP_RELEASE_BUILD) \
+	CHRONOS_RELEASE_BIN_DIR=$(CHRONOS_RELEASE_BIN_DIR) \
+	CHRONOS_SCALE_MATRIX_WORKERS=$${CHRONOS_SCALE_MATRIX_WORKERS:-2,3,5,8} \
+	CHRONOS_SCALE_MATRIX_LINEAR_EFFICIENCY_MIN=$${CHRONOS_SCALE_MATRIX_LINEAR_EFFICIENCY_MIN:-0.80} \
+	bash hack/scale/scale-matrix.sh
+
+scale-ownership-plan:
+	bash hack/scale/ownership-plan.sh
 
 test-rebalance-bench:
 	CHRONOS_SKIP_RELEASE_BUILD=$(CHRONOS_SKIP_RELEASE_BUILD) \
@@ -288,21 +315,34 @@ container-check:
 
 release-shape-check:
 	@tmpdir=$$(mktemp -d); \
+	build_commit=$$(git rev-parse HEAD); \
 	trap 'rm -rf "$$tmpdir"' EXIT; \
 	touch "$$tmpdir/server.crt" "$$tmpdir/server.key" "$$tmpdir/ca.pem"; \
 	chmod 600 "$$tmpdir/server.key"; \
-	cargo build --locked --bin chronos >/dev/null; \
-	CHRONOS_BUILD_COMMIT=$$(git rev-parse HEAD) \
+	CHRONOS_BUILD_COMMIT="$$build_commit" cargo build --locked --bin chronos >/dev/null; \
+	CHRONOS_BUILD_COMMIT="$$build_commit" \
 	$(call HOST_PRODUCTION_SHAPE_ENV,/chronos-release-check,release-check-worker,"$$tmpdir/server.crt","$$tmpdir/server.key","$$tmpdir/ca.pem") \
 	target/debug/chronos --check-config && \
-	CHRONOS_BUILD_COMMIT=$$(git rev-parse HEAD) \
+	CHRONOS_BUILD_COMMIT="$$build_commit" \
 	$(call HOST_PRODUCTION_SHAPE_ENV,/chronos-release-check,release-check-worker,"$$tmpdir/server.crt","$$tmpdir/server.key","$$tmpdir/ca.pem") \
 	target/debug/chronos --print-effective-config
 
+release-source-check:
+	@if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then \
+		echo "release packaging requires a git worktree" >&2; \
+		exit 1; \
+	fi
+	@if [ "$(CHRONOS_ALLOW_DIRTY_RELEASE)" != "1" ] && [ -n "$$(git status --porcelain --untracked-files=normal)" ]; then \
+		echo "release source tree is dirty; commit/stash changes or set CHRONOS_ALLOW_DIRTY_RELEASE=1 for a local non-production check" >&2; \
+		git status --short; \
+		exit 1; \
+	fi
+
 release-package:
+	$(MAKE) release-source-check
 	rm -rf artifacts/release
 	mkdir -p artifacts/release
-	cargo build --locked --release --bin chronos --bin chronos-bench --bin chronos-control-bench --bin chronos-failover-bench
+	CHRONOS_BUILD_COMMIT=$$(git rev-parse HEAD) cargo build --locked --release --bin chronos --bin chronos-bench --bin chronos-control-bench --bin chronos-failover-bench
 	cp target/release/chronos artifacts/release/
 	cp target/release/chronos-bench artifacts/release/
 	cp target/release/chronos-control-bench artifacts/release/
@@ -348,6 +388,7 @@ release-gate:
 	$(MAKE) CHRONOS_SKIP_RELEASE_BUILD=1 test-chaos
 	$(MAKE) CHRONOS_SKIP_RELEASE_BUILD=1 test-failover-bench
 	$(MAKE) CHRONOS_SKIP_RELEASE_BUILD=1 test-auto-failover-bench
+	$(MAKE) CHRONOS_SKIP_RELEASE_BUILD=1 test-scale-matrix-production
 	$(MAKE) CHRONOS_SKIP_RELEASE_BUILD=1 test-rebalance-bench
 	$(MAKE) CHRONOS_SKIP_RELEASE_BUILD=1 test-restore-dr
 

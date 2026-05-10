@@ -2,11 +2,15 @@ package chronos
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"fmt"
+	"os"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
@@ -16,11 +20,16 @@ import (
 	tsov1 "github.com/rleungx/chronos/gen/proto/tso/v1"
 )
 
+const maxRetainedStaleOwnerConns = 16
+
+var clientScopeCounter atomic.Uint64
+
 type Option func(*config)
 
 type config struct {
 	desiredResourceTier tsov1.ResourceTier
 	requestTimeoutMs    uint32
+	idempotencyEnabled  bool
 	transport           transportConfig
 }
 
@@ -36,6 +45,7 @@ func defaultConfig() config {
 	return config{
 		desiredResourceTier: tsov1.ResourceTier_RESOURCE_TIER_SHARED,
 		requestTimeoutMs:    0,
+		idempotencyEnabled:  false,
 		transport:           transportConfig{},
 	}
 }
@@ -49,6 +59,12 @@ func WithDesiredResourceTier(tier tsov1.ResourceTier) Option {
 func WithRequestTimeoutMs(timeoutMs uint32) Option {
 	return func(cfg *config) {
 		cfg.requestTimeoutMs = timeoutMs
+	}
+}
+
+func WithIdempotency(enabled bool) Option {
+	return func(cfg *config) {
+		cfg.idempotencyEnabled = enabled
 	}
 }
 
@@ -78,17 +94,18 @@ func WithTLSServerName(serverName string) Option {
 }
 
 type Client struct {
-	routeConn   *grpc.ClientConn
-	tsoConn     *grpc.ClientConn
-	staleConns  []*grpc.ClientConn
-	routeClient tsov1.TimelineRouteServiceClient
-	tsoClient   tsov1.TimestampServiceClient
-	cache       map[string]*tsov1.TimelineRoute
-	timelineKey string
-	ownerAddr   string
-	mu          sync.RWMutex
-	requestID   atomic.Uint64
-	config      config
+	routeConn    *grpc.ClientConn
+	tsoConn      *grpc.ClientConn
+	staleConns   []*grpc.ClientConn
+	routeClient  tsov1.TimelineRouteServiceClient
+	tsoClient    tsov1.TimestampServiceClient
+	cache        map[string]*tsov1.TimelineRoute
+	timelineKey  string
+	ownerAddr    string
+	mu           sync.RWMutex
+	requestID    atomic.Uint64
+	requestScope string
+	config       config
 }
 
 func New(ctx context.Context, addr string, timelineKey string) (*Client, error) {
@@ -116,11 +133,12 @@ func NewWithOptions(ctx context.Context, addr string, timelineKey string, opts .
 		return nil, err
 	}
 	client := &Client{
-		routeConn:   conn,
-		routeClient: tsov1.NewTimelineRouteServiceClient(conn),
-		cache:       map[string]*tsov1.TimelineRoute{},
-		timelineKey: timelineKey,
-		config:      cfg,
+		routeConn:    conn,
+		routeClient:  tsov1.NewTimelineRouteServiceClient(conn),
+		cache:        map[string]*tsov1.TimelineRoute{},
+		timelineKey:  timelineKey,
+		requestScope: newClientRequestScope(),
+		config:       cfg,
 	}
 	if _, err := client.ensureRoute(ctx); err != nil {
 		if client.tsoConn != nil {
@@ -174,11 +192,14 @@ func (c *Client) ensureRoute(ctx context.Context) (*tsov1.TimelineRoute, error) 
 		return route, nil
 	}
 
-	_, err := c.routeClient.EnsureTimeline(ctx, &tsov1.EnsureTimelineRequest{
+	resp, err := c.routeClient.EnsureTimeline(ctx, &tsov1.EnsureTimelineRequest{
 		TimelineKey:         c.timelineKey,
 		DesiredResourceTier: c.config.desiredResourceTier,
 	})
 	if err != nil {
+		return nil, err
+	}
+	if err := validateRoute("ensure_timeline", resp.GetRoute()); err != nil {
 		return nil, err
 	}
 
@@ -192,14 +213,18 @@ func (c *Client) refreshRoute(ctx context.Context) (*tsov1.TimelineRoute, error)
 	if err != nil {
 		return nil, err
 	}
-	if err := c.ensureOwnerClient(ctx, resp.Route.OwnerWorkerEndpoint); err != nil {
+	route := resp.GetRoute()
+	if err := validateRoute("get_timeline_route", route); err != nil {
+		return nil, err
+	}
+	if err := c.ensureOwnerClient(ctx, route.OwnerWorkerEndpoint); err != nil {
 		return nil, err
 	}
 
 	c.mu.Lock()
-	c.cache[c.timelineKey] = resp.Route
+	c.cache[c.timelineKey] = route
 	c.mu.Unlock()
-	return resp.Route, nil
+	return route, nil
 }
 
 func (c *Client) ensureOwnerClient(ctx context.Context, ownerAddr string) error {
@@ -226,13 +251,28 @@ func (c *Client) ensureOwnerClient(ctx context.Context, ownerAddr string) error 
 	}
 
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.tsoConn != nil {
-		c.staleConns = append(c.staleConns, c.tsoConn)
+	if c.ownerAddr == ownerAddr && c.tsoConn != nil {
+		c.mu.Unlock()
+		_ = conn.Close()
+		return nil
 	}
+	previous := c.tsoConn
+	var evicted *grpc.ClientConn
 	c.tsoConn = conn
 	c.tsoClient = tsov1.NewTimestampServiceClient(conn)
 	c.ownerAddr = ownerAddr
+	if previous != nil {
+		c.staleConns = append(c.staleConns, previous)
+		if len(c.staleConns) > maxRetainedStaleOwnerConns {
+			evicted = c.staleConns[0]
+			c.staleConns[0] = nil
+			c.staleConns = c.staleConns[1:]
+		}
+	}
+	c.mu.Unlock()
+	if evicted != nil {
+		_ = evicted.Close()
+	}
 	return nil
 }
 
@@ -257,7 +297,33 @@ func (c *Client) allocateOnce(ctx context.Context, route *tsov1.TimelineRoute, c
 }
 
 func (c *Client) nextClientRequestID(timelineKey string) string {
-	return fmt.Sprintf("%s-%d", timelineKey, c.requestID.Add(1))
+	if !c.config.idempotencyEnabled {
+		return ""
+	}
+	return fmt.Sprintf("%s-%s-%d", timelineKey, c.requestScope, c.requestID.Add(1))
+}
+
+func newClientRequestScope() string {
+	var randomBytes [16]byte
+	if _, err := rand.Read(randomBytes[:]); err == nil {
+		return hex.EncodeToString(randomBytes[:])
+	}
+	return fmt.Sprintf(
+		"%x-%x-%x",
+		os.Getpid(),
+		time.Now().UnixNano(),
+		clientScopeCounter.Add(1),
+	)
+}
+
+func validateRoute(operation string, route *tsov1.TimelineRoute) error {
+	if route == nil {
+		return fmt.Errorf("chronos returned no route from %s", operation)
+	}
+	if route.OwnerWorkerEndpoint == "" {
+		return fmt.Errorf("chronos returned route with empty owner endpoint from %s", operation)
+	}
+	return nil
 }
 
 func isStaleRouteError(err error) bool {

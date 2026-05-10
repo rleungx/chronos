@@ -19,8 +19,14 @@ make test-layer-4
 make test-soak
 make test-chaos
 make test-failover-bench
+make test-auto-failover-bench
+make test-scale-matrix
 make test-rebalance-bench
+make test-restore-dr
 ```
+
+For production scale evidence, also run `make test-scale-matrix-production` on production-like
+hosts with benchmark clients isolated from Chronos workers.
 
 ## Required config checks
 
@@ -44,7 +50,7 @@ Before publishing or deploying, ensure you have:
 
 1. the exact git commit
 2. the exact `CHRONOS_BUILD_COMMIT` used at runtime
-3. retained soak/chaos/failover/rebalance artifacts for the validation run
+3. retained soak/chaos/failover/scale/rebalance/restore artifacts for the validation run
 4. alert rules validated with `make observability-check`
 5. dependency policy validated with `make dependency-check`
 6. release-shape and container delivery checks validated via `make release-check`

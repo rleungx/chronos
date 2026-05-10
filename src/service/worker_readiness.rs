@@ -1,5 +1,7 @@
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+
+use crate::recovery::record_recovery_event;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OwnershipDriftEvidence {
@@ -30,6 +32,7 @@ pub(super) struct OwnershipDriftTracker {
 
 enum SinkAction {
     Started(OwnershipDriftEvidence),
+    Cleared,
 }
 
 impl OwnershipDriftTracker {
@@ -44,52 +47,49 @@ impl OwnershipDriftTracker {
         lease_expire_at_ms: u64,
         observed_at_ms: u64,
     ) {
-        let mut entries = self.entries.lock().unwrap();
-        let mut sink_action = None;
-        let entry = entries
-            .entry(generator_id)
-            .or_insert_with(|| OwnershipDriftEntry {
-                contending_instance_id: contending_instance_id.to_owned(),
-                last_lease_expire_at_ms: lease_expire_at_ms,
-                active: false,
-                next_retry_after_ms: observed_at_ms,
-            });
+        let sink_action = {
+            let mut entries = self.entries_lock();
+            let mut sink_action = None;
+            let entry = entries
+                .entry(generator_id)
+                .or_insert_with(|| OwnershipDriftEntry {
+                    contending_instance_id: contending_instance_id.to_owned(),
+                    last_lease_expire_at_ms: lease_expire_at_ms,
+                    active: false,
+                    next_retry_after_ms: observed_at_ms,
+                });
 
-        let renewed = entry.contending_instance_id == contending_instance_id
-            && lease_expire_at_ms > entry.last_lease_expire_at_ms;
-        entry.contending_instance_id = contending_instance_id.to_owned();
-        entry.last_lease_expire_at_ms = lease_expire_at_ms;
+            let renewed = entry.contending_instance_id == contending_instance_id
+                && lease_expire_at_ms > entry.last_lease_expire_at_ms;
+            entry.contending_instance_id = contending_instance_id.to_owned();
+            entry.last_lease_expire_at_ms = lease_expire_at_ms;
 
-        if renewed && !entry.active {
-            entry.active = true;
-            sink_action = Some(SinkAction::Started(OwnershipDriftEvidence {
-                generator_id,
-                contending_instance_id: contending_instance_id.to_owned(),
-                lease_expire_at_ms,
-                observed_at_ms,
-            }));
-        }
-
-        if let Some(sink) = self.sink.get() {
-            if let Some(action) = sink_action {
-                match action {
-                    SinkAction::Started(evidence) => sink.ownership_drift_started(evidence),
-                }
+            if renewed && !entry.active {
+                entry.active = true;
+                sink_action = Some(SinkAction::Started(OwnershipDriftEvidence {
+                    generator_id,
+                    contending_instance_id: contending_instance_id.to_owned(),
+                    lease_expire_at_ms,
+                    observed_at_ms,
+                }));
             }
-        }
+
+            sink_action
+        };
+
+        self.dispatch_sink_action(sink_action);
     }
 
     pub(super) fn clear_generator(&self, generator_id: u32) {
-        let mut entries = self.entries.lock().unwrap();
-        let removed = entries.remove(&generator_id);
-        let sink_action = removed.as_ref().is_some_and(|entry| entry.active)
-            && entries.values().all(|entry| !entry.active);
+        let sink_action = {
+            let mut entries = self.entries_lock();
+            let removed = entries.remove(&generator_id);
+            let should_clear = removed.as_ref().is_some_and(|entry| entry.active)
+                && entries.values().all(|entry| !entry.active);
+            should_clear.then_some(SinkAction::Cleared)
+        };
 
-        if let Some(sink) = self.sink.get() {
-            if sink_action {
-                sink.ownership_drift_cleared();
-            }
-        }
+        self.dispatch_sink_action(sink_action);
     }
 
     pub(super) fn next_generator_to_retry(
@@ -97,7 +97,7 @@ impl OwnershipDriftTracker {
         now_ms: u64,
         retry_interval_ms: u64,
     ) -> Option<u32> {
-        let mut entries = self.entries.lock().unwrap();
+        let mut entries = self.entries_lock();
         let mut selected = None;
         for (generator_id, entry) in entries.iter_mut() {
             if entry.active && entry.next_retry_after_ms <= now_ms {
@@ -111,11 +111,33 @@ impl OwnershipDriftTracker {
 
     #[cfg(test)]
     pub(super) fn is_active(&self, generator_id: u32) -> bool {
-        self.entries
-            .lock()
-            .unwrap()
+        self.entries_lock()
             .get(&generator_id)
             .is_some_and(|entry| entry.active)
+    }
+
+    fn entries_lock(&self) -> MutexGuard<'_, HashMap<u32, OwnershipDriftEntry>> {
+        match self.entries.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                record_recovery_event("service", "ownership_drift_entries", "mutex_poisoned");
+                poisoned.into_inner()
+            }
+        }
+    }
+
+    fn dispatch_sink_action(&self, sink_action: Option<SinkAction>) {
+        let Some(action) = sink_action else {
+            return;
+        };
+        let Some(sink) = self.sink.get() else {
+            return;
+        };
+
+        match action {
+            SinkAction::Started(evidence) => sink.ownership_drift_started(evidence),
+            SinkAction::Cleared => sink.ownership_drift_cleared(),
+        }
     }
 }
 
@@ -205,5 +227,47 @@ mod tests {
         assert!(tracker.is_active(8));
         let events = sink.events.lock().unwrap();
         assert_eq!(events.last().copied(), Some("started"));
+    }
+
+    struct ReentrantSink {
+        tracker: Arc<OwnershipDriftTracker>,
+    }
+
+    impl WorkerReadinessSink for ReentrantSink {
+        fn ownership_drift_started(&self, evidence: OwnershipDriftEvidence) {
+            assert_eq!(
+                self.tracker
+                    .next_generator_to_retry(evidence.observed_at_ms, 10),
+                Some(evidence.generator_id)
+            );
+        }
+
+        fn ownership_drift_cleared(&self) {}
+    }
+
+    #[test]
+    fn sink_callbacks_run_after_releasing_entries_lock() {
+        let tracker = Arc::new(OwnershipDriftTracker::default());
+        tracker.set_sink(Arc::new(ReentrantSink {
+            tracker: tracker.clone(),
+        }));
+
+        tracker.observe_contended_local_generator(7, "instance-b", 110, 100);
+        tracker.observe_contended_local_generator(7, "instance-b", 120, 105);
+        assert!(tracker.is_active(7));
+    }
+
+    #[test]
+    fn entries_lock_recovers_after_poison() {
+        let tracker = OwnershipDriftTracker::default();
+        let poisoned = std::panic::catch_unwind(|| {
+            let _guard = tracker.entries.lock().unwrap();
+            panic!("poison ownership drift entries");
+        });
+        assert!(poisoned.is_err());
+
+        tracker.observe_contended_local_generator(7, "instance-b", 110, 100);
+        tracker.observe_contended_local_generator(7, "instance-b", 120, 105);
+        assert!(tracker.is_active(7));
     }
 }

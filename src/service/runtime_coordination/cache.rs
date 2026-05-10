@@ -186,6 +186,7 @@ impl TsoService {
                         reason = "metadata_watch_reset"
                     );
                     service.timeline_runtime.clear();
+                    service.clear_dedicated_claims();
                     let _ = route_reset_notifier.send(());
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => {
@@ -516,10 +517,20 @@ mod tests {
             .ensure_timeline("route-reset.timeline")
             .await
             .unwrap();
+        let dedicated_route = service
+            .ensure_timeline_with_tier("route-reset.dedicated", ResourceTier::Dedicated)
+            .await
+            .unwrap();
         assert!(service
             .timeline_runtime
             .timeline_handle(&route.timeline_key)
             .is_some());
+        assert_eq!(
+            service
+                .generator_runtime
+                .claimed_generator_for_timeline(&dedicated_route.timeline_key),
+            Some(dedicated_route.generator_id)
+        );
 
         let mut reset_rx = service.timeline_runtime.reset_notifier().subscribe();
         metadata.send_reset();
@@ -533,6 +544,12 @@ mod tests {
             .timeline_runtime
             .timeline_handle(&route.timeline_key)
             .is_none());
+        assert_eq!(
+            service
+                .generator_runtime
+                .claimed_generator_for_timeline(&dedicated_route.timeline_key),
+            None
+        );
         assert_eq!(
             crate::metrics::TSO_WATCH_RESYNC_TOTAL
                 .with_label_values(&["broadcast_lagged"])

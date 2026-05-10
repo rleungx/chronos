@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use tokio::sync::broadcast;
 
@@ -69,6 +69,24 @@ pub struct GeneratorRecord {
     pub updated_at_ms: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnershipPlanMember {
+    pub remainder: u32,
+    pub worker_id: String,
+    pub advertise_endpoint: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnershipPlanRecord {
+    #[serde(default = "default_metadata_schema_version")]
+    pub schema_version: u32,
+    pub plan_id: String,
+    pub modulo: u32,
+    pub members: Vec<OwnershipPlanMember>,
+    #[serde(default)]
+    pub updated_at_ms: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RequestRecordState {
     Pending,
@@ -120,6 +138,157 @@ impl TimelineRecord {
         let mut record = self.clone();
         record.schema_version = CURRENT_METADATA_SCHEMA_VERSION;
         record
+    }
+}
+
+impl OwnershipPlanRecord {
+    pub fn new(
+        plan_id: String,
+        modulo: u32,
+        member: OwnershipPlanMember,
+        updated_at_ms: u64,
+    ) -> Self {
+        Self {
+            schema_version: CURRENT_METADATA_SCHEMA_VERSION,
+            plan_id,
+            modulo,
+            members: vec![member],
+            updated_at_ms,
+        }
+    }
+
+    pub fn validate_schema_version(&self) -> Result<(), TsoError> {
+        if self.schema_version == CURRENT_METADATA_SCHEMA_VERSION {
+            Ok(())
+        } else {
+            Err(TsoError::Internal(format!(
+                "unsupported ownership plan metadata schema_version {}",
+                self.schema_version
+            )))
+        }
+    }
+
+    pub fn admit_member(
+        &mut self,
+        expected_plan_id: &str,
+        expected_modulo: u32,
+        member: OwnershipPlanMember,
+        updated_at_ms: u64,
+    ) -> Result<bool, TsoError> {
+        self.validate_schema_version()?;
+        self.validate_integrity()?;
+        if self.plan_id != expected_plan_id {
+            return Err(TsoError::Internal(format!(
+                "ownership plan mismatch: metadata plan_id={} local plan_id={}",
+                self.plan_id, expected_plan_id
+            )));
+        }
+        if self.modulo != expected_modulo {
+            return Err(TsoError::Internal(format!(
+                "ownership plan modulo mismatch: metadata modulo={} local modulo={}",
+                self.modulo, expected_modulo
+            )));
+        }
+        if member.remainder >= self.modulo {
+            return Err(TsoError::Internal(format!(
+                "ownership plan member remainder {} is outside modulo {}",
+                member.remainder, self.modulo
+            )));
+        }
+
+        for existing in &self.members {
+            if existing.remainder == member.remainder {
+                if existing.worker_id == member.worker_id
+                    && existing.advertise_endpoint == member.advertise_endpoint
+                {
+                    return Ok(false);
+                }
+                return Err(TsoError::Internal(format!(
+                    "ownership plan remainder {} is already assigned to worker_id={} advertise_endpoint={}",
+                    existing.remainder, existing.worker_id, existing.advertise_endpoint
+                )));
+            }
+            if existing.worker_id == member.worker_id {
+                return Err(TsoError::Internal(format!(
+                    "ownership plan worker_id {} is already assigned to remainder {}",
+                    existing.worker_id, existing.remainder
+                )));
+            }
+            if existing.advertise_endpoint == member.advertise_endpoint {
+                return Err(TsoError::Internal(format!(
+                    "ownership plan advertise_endpoint {} is already assigned to remainder {}",
+                    existing.advertise_endpoint, existing.remainder
+                )));
+            }
+        }
+
+        self.members.push(member);
+        self.members.sort_by_key(|member| member.remainder);
+        self.updated_at_ms = updated_at_ms;
+        Ok(true)
+    }
+
+    pub fn prune_inactive_members(
+        &mut self,
+        active_members: &HashSet<(String, String)>,
+        updated_at_ms: u64,
+    ) -> Result<usize, TsoError> {
+        self.validate_schema_version()?;
+        self.validate_integrity()?;
+
+        let original_len = self.members.len();
+        self.members.retain(|member| {
+            active_members.contains(&(member.worker_id.clone(), member.advertise_endpoint.clone()))
+        });
+        let pruned = original_len.saturating_sub(self.members.len());
+        if pruned > 0 {
+            self.updated_at_ms = updated_at_ms;
+        }
+        Ok(pruned)
+    }
+
+    fn validate_integrity(&self) -> Result<(), TsoError> {
+        if self.plan_id.trim().is_empty() {
+            return Err(TsoError::Internal(
+                "ownership plan metadata plan_id must not be blank".into(),
+            ));
+        }
+        if self.modulo == 0 {
+            return Err(TsoError::Internal(
+                "ownership plan metadata modulo must be greater than 0".into(),
+            ));
+        }
+
+        let mut remainders = HashSet::new();
+        let mut worker_ids = HashSet::new();
+        let mut endpoints = HashSet::new();
+        for member in &self.members {
+            if member.remainder >= self.modulo {
+                return Err(TsoError::Internal(format!(
+                    "ownership plan member remainder {} is outside modulo {}",
+                    member.remainder, self.modulo
+                )));
+            }
+            if !remainders.insert(member.remainder) {
+                return Err(TsoError::Internal(format!(
+                    "ownership plan contains duplicate remainder {}",
+                    member.remainder
+                )));
+            }
+            if !worker_ids.insert(member.worker_id.as_str()) {
+                return Err(TsoError::Internal(format!(
+                    "ownership plan contains duplicate worker_id {}",
+                    member.worker_id
+                )));
+            }
+            if !endpoints.insert(member.advertise_endpoint.as_str()) {
+                return Err(TsoError::Internal(format!(
+                    "ownership plan contains duplicate advertise_endpoint {}",
+                    member.advertise_endpoint
+                )));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -477,6 +646,15 @@ pub trait GeneratorLeaseAuthority: Send + Sync {
         }
         Ok(loaded)
     }
+    async fn scan_generators(&self) -> Result<Vec<GeneratorRecord>, TsoError> {
+        let generator_ids = (0..crate::MAX_GENERATORS).collect::<Vec<_>>();
+        Ok(self
+            .load_generators(&generator_ids)
+            .await?
+            .into_values()
+            .flatten()
+            .collect())
+    }
     async fn create_generator(
         &self,
         generator_id: u32,
@@ -598,6 +776,83 @@ mod tests {
             lease_expire_at_ms: Some(100),
             updated_at_ms: 1,
         }
+    }
+
+    fn plan_member(remainder: u32, worker_id: &str, endpoint: &str) -> OwnershipPlanMember {
+        OwnershipPlanMember {
+            remainder,
+            worker_id: worker_id.into(),
+            advertise_endpoint: endpoint.into(),
+        }
+    }
+
+    #[test]
+    fn ownership_plan_accepts_unique_members_and_rejects_mixed_modulo() {
+        let mut plan = OwnershipPlanRecord::new(
+            "plan-a".into(),
+            2,
+            plan_member(0, "worker-a", "worker-a:50051"),
+            1,
+        );
+
+        assert_eq!(
+            plan.admit_member("plan-a", 2, plan_member(1, "worker-b", "worker-b:50051"), 2),
+            Ok(true)
+        );
+        assert_eq!(
+            plan.admit_member("plan-a", 2, plan_member(1, "worker-b", "worker-b:50051"), 3),
+            Ok(false)
+        );
+        assert!(matches!(
+            plan.admit_member("plan-a", 4, plan_member(2, "worker-c", "worker-c:50051"), 4),
+            Err(TsoError::Internal(_))
+        ));
+    }
+
+    #[test]
+    fn ownership_plan_rejects_duplicate_remainder_worker_or_endpoint() {
+        let mut plan = OwnershipPlanRecord::new(
+            "plan-a".into(),
+            3,
+            plan_member(0, "worker-a", "worker-a:50051"),
+            1,
+        );
+
+        assert!(matches!(
+            plan.admit_member("plan-a", 3, plan_member(0, "worker-b", "worker-b:50051"), 2),
+            Err(TsoError::Internal(_))
+        ));
+        assert!(matches!(
+            plan.admit_member("plan-a", 3, plan_member(1, "worker-a", "worker-b:50051"), 2),
+            Err(TsoError::Internal(_))
+        ));
+        assert!(matches!(
+            plan.admit_member("plan-a", 3, plan_member(1, "worker-b", "worker-a:50051"), 2),
+            Err(TsoError::Internal(_))
+        ));
+    }
+
+    #[test]
+    fn ownership_plan_prunes_inactive_members_before_replacement() {
+        let mut plan = OwnershipPlanRecord::new(
+            "plan-a".into(),
+            2,
+            plan_member(0, "worker-a", "worker-a:50051"),
+            1,
+        );
+        let active_members =
+            HashSet::from([("worker-b".to_string(), "worker-b:50051".to_string())]);
+
+        let pruned = plan
+            .prune_inactive_members(&active_members, 2)
+            .expect("inactive ownership member should prune");
+        assert_eq!(pruned, 1);
+        assert!(plan.members.is_empty());
+        assert_eq!(plan.updated_at_ms, 2);
+
+        assert!(plan
+            .admit_member("plan-a", 2, plan_member(0, "worker-b", "worker-b:50051"), 3)
+            .expect("replacement member should be admitted after stale member pruning"));
     }
 
     #[test]

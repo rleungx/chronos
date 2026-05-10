@@ -1,8 +1,10 @@
-use std::sync::Arc;
-use std::time::Instant;
+use std::sync::{Arc, LazyLock};
+use std::time::{Duration, Instant};
 
+use prometheus::{Histogram, IntCounter};
 use tokio::sync::Mutex;
 use tokio::task::yield_now;
+use tokio::time::sleep;
 
 use crate::plane::RequestCancellation;
 use crate::runtime::{AllocateAfterResult, TimelineState};
@@ -48,6 +50,77 @@ pub(super) struct AllocationServeOptions {
 
 const MAX_ALLOCATION_CONTENTION_RETRIES: u32 = 8;
 
+static OUTCOME_CACHED_METADATA_RETRY: LazyLock<IntCounter> = LazyLock::new(|| {
+    metrics::TSO_ALLOCATE_OUTCOMES_TOTAL.with_label_values(&["cached", "metadata_retry"])
+});
+static OUTCOME_CACHED_SERVED: LazyLock<IntCounter> =
+    LazyLock::new(|| metrics::TSO_ALLOCATE_OUTCOMES_TOTAL.with_label_values(&["cached", "served"]));
+static OUTCOME_CACHED_CONTENTION_EXHAUSTED: LazyLock<IntCounter> = LazyLock::new(|| {
+    metrics::TSO_ALLOCATE_OUTCOMES_TOTAL.with_label_values(&["cached", "contention_exhausted"])
+});
+static OUTCOME_CACHED_CONTENTION_WAIT: LazyLock<IntCounter> = LazyLock::new(|| {
+    metrics::TSO_ALLOCATE_OUTCOMES_TOTAL.with_label_values(&["cached", "contention_wait"])
+});
+static OUTCOME_CACHED_LEASE_REFRESH_RETRY: LazyLock<IntCounter> = LazyLock::new(|| {
+    metrics::TSO_ALLOCATE_OUTCOMES_TOTAL.with_label_values(&["cached", "lease_refresh_retry"])
+});
+static OUTCOME_CACHED_LEASE_RETRY: LazyLock<IntCounter> = LazyLock::new(|| {
+    metrics::TSO_ALLOCATE_OUTCOMES_TOTAL.with_label_values(&["cached", "lease_retry"])
+});
+static OUTCOME_CACHED_NOT_READY: LazyLock<IntCounter> = LazyLock::new(|| {
+    metrics::TSO_ALLOCATE_OUTCOMES_TOTAL.with_label_values(&["cached", "not_ready"])
+});
+static OUTCOME_CACHED_QUOTA_WAIT: LazyLock<IntCounter> = LazyLock::new(|| {
+    metrics::TSO_ALLOCATE_OUTCOMES_TOTAL.with_label_values(&["cached", "quota_wait"])
+});
+static OUTCOME_CACHED_FUTURE_BORROW_WAIT: LazyLock<IntCounter> = LazyLock::new(|| {
+    metrics::TSO_ALLOCATE_OUTCOMES_TOTAL.with_label_values(&["cached", "future_borrow_wait"])
+});
+static OUTCOME_METADATA_METADATA_RETRY: LazyLock<IntCounter> = LazyLock::new(|| {
+    metrics::TSO_ALLOCATE_OUTCOMES_TOTAL.with_label_values(&["metadata", "metadata_retry"])
+});
+static OUTCOME_METADATA_SERVED: LazyLock<IntCounter> = LazyLock::new(|| {
+    metrics::TSO_ALLOCATE_OUTCOMES_TOTAL.with_label_values(&["metadata", "served"])
+});
+static OUTCOME_METADATA_CONTENTION_EXHAUSTED: LazyLock<IntCounter> = LazyLock::new(|| {
+    metrics::TSO_ALLOCATE_OUTCOMES_TOTAL.with_label_values(&["metadata", "contention_exhausted"])
+});
+static OUTCOME_METADATA_CONTENTION_WAIT: LazyLock<IntCounter> = LazyLock::new(|| {
+    metrics::TSO_ALLOCATE_OUTCOMES_TOTAL.with_label_values(&["metadata", "contention_wait"])
+});
+static OUTCOME_METADATA_LEASE_REFRESH_RETRY: LazyLock<IntCounter> = LazyLock::new(|| {
+    metrics::TSO_ALLOCATE_OUTCOMES_TOTAL.with_label_values(&["metadata", "lease_refresh_retry"])
+});
+static OUTCOME_METADATA_QUOTA_WAIT: LazyLock<IntCounter> = LazyLock::new(|| {
+    metrics::TSO_ALLOCATE_OUTCOMES_TOTAL.with_label_values(&["metadata", "quota_wait"])
+});
+static OUTCOME_METADATA_FUTURE_BORROW_WAIT: LazyLock<IntCounter> = LazyLock::new(|| {
+    metrics::TSO_ALLOCATE_OUTCOMES_TOTAL.with_label_values(&["metadata", "future_borrow_wait"])
+});
+
+static STAGE_CACHED_CACHED_CHECK: LazyLock<Histogram> = LazyLock::new(|| {
+    metrics::TSO_ALLOCATE_STAGE_LATENCY.with_label_values(&["cached", "cached_check"])
+});
+static STAGE_CACHED_ADMISSION_WAIT: LazyLock<Histogram> = LazyLock::new(|| {
+    metrics::TSO_ALLOCATE_STAGE_LATENCY.with_label_values(&["cached", "admission_wait"])
+});
+static STAGE_CACHED_SERVE: LazyLock<Histogram> =
+    LazyLock::new(|| metrics::TSO_ALLOCATE_STAGE_LATENCY.with_label_values(&["cached", "serve"]));
+static STAGE_METADATA_METADATA_LOAD: LazyLock<Histogram> = LazyLock::new(|| {
+    metrics::TSO_ALLOCATE_STAGE_LATENCY.with_label_values(&["metadata", "metadata_load"])
+});
+static STAGE_METADATA_ACTIVATE_LOCAL: LazyLock<Histogram> = LazyLock::new(|| {
+    metrics::TSO_ALLOCATE_STAGE_LATENCY.with_label_values(&["metadata", "activate_local"])
+});
+static STAGE_METADATA_LEASE_ENSURE: LazyLock<Histogram> = LazyLock::new(|| {
+    metrics::TSO_ALLOCATE_STAGE_LATENCY.with_label_values(&["metadata", "lease_ensure"])
+});
+static STAGE_METADATA_ADMISSION_WAIT: LazyLock<Histogram> = LazyLock::new(|| {
+    metrics::TSO_ALLOCATE_STAGE_LATENCY.with_label_values(&["metadata", "admission_wait"])
+});
+static STAGE_METADATA_SERVE: LazyLock<Histogram> =
+    LazyLock::new(|| metrics::TSO_ALLOCATE_STAGE_LATENCY.with_label_values(&["metadata", "serve"]));
+
 enum ServeOutcome {
     Served(AllocateTimestampsResponse),
     Contended,
@@ -81,9 +154,41 @@ impl CachedTimelineChecks {
 
 impl TsoService {
     fn record_allocation_outcome(path: AllocationPath, outcome: &'static str) {
-        metrics::TSO_ALLOCATE_OUTCOMES_TOTAL
-            .with_label_values(&[path.as_label(), outcome])
-            .inc();
+        match (path, outcome) {
+            (AllocationPath::Cached, "metadata_retry") => OUTCOME_CACHED_METADATA_RETRY.inc(),
+            (AllocationPath::Cached, "served") => OUTCOME_CACHED_SERVED.inc(),
+            (AllocationPath::Cached, "contention_exhausted") => {
+                OUTCOME_CACHED_CONTENTION_EXHAUSTED.inc();
+            }
+            (AllocationPath::Cached, "contention_wait") => OUTCOME_CACHED_CONTENTION_WAIT.inc(),
+            (AllocationPath::Cached, "lease_refresh_retry") => {
+                OUTCOME_CACHED_LEASE_REFRESH_RETRY.inc();
+            }
+            (AllocationPath::Cached, "lease_retry") => OUTCOME_CACHED_LEASE_RETRY.inc(),
+            (AllocationPath::Cached, "not_ready") => OUTCOME_CACHED_NOT_READY.inc(),
+            (AllocationPath::Cached, "quota_wait") => OUTCOME_CACHED_QUOTA_WAIT.inc(),
+            (AllocationPath::Cached, "future_borrow_wait") => {
+                OUTCOME_CACHED_FUTURE_BORROW_WAIT.inc();
+            }
+            (AllocationPath::Metadata, "metadata_retry") => OUTCOME_METADATA_METADATA_RETRY.inc(),
+            (AllocationPath::Metadata, "served") => OUTCOME_METADATA_SERVED.inc(),
+            (AllocationPath::Metadata, "contention_exhausted") => {
+                OUTCOME_METADATA_CONTENTION_EXHAUSTED.inc();
+            }
+            (AllocationPath::Metadata, "contention_wait") => {
+                OUTCOME_METADATA_CONTENTION_WAIT.inc();
+            }
+            (AllocationPath::Metadata, "lease_refresh_retry") => {
+                OUTCOME_METADATA_LEASE_REFRESH_RETRY.inc();
+            }
+            (AllocationPath::Metadata, "quota_wait") => OUTCOME_METADATA_QUOTA_WAIT.inc(),
+            (AllocationPath::Metadata, "future_borrow_wait") => {
+                OUTCOME_METADATA_FUTURE_BORROW_WAIT.inc();
+            }
+            _ => metrics::TSO_ALLOCATE_OUTCOMES_TOTAL
+                .with_label_values(&[path.as_label(), outcome])
+                .inc(),
+        }
     }
 
     fn record_allocation_ranges(ranges: &[crate::TimestampRange]) {
@@ -98,9 +203,30 @@ impl TsoService {
         stage: &'static str,
         started_at: Instant,
     ) {
-        metrics::TSO_ALLOCATE_STAGE_LATENCY
-            .with_label_values(&[path.as_label(), stage])
-            .observe(started_at.elapsed().as_secs_f64());
+        let elapsed = started_at.elapsed().as_secs_f64();
+        match (path, stage) {
+            (AllocationPath::Cached, "cached_check") => STAGE_CACHED_CACHED_CHECK.observe(elapsed),
+            (AllocationPath::Cached, "admission_wait") => {
+                STAGE_CACHED_ADMISSION_WAIT.observe(elapsed);
+            }
+            (AllocationPath::Cached, "serve") => STAGE_CACHED_SERVE.observe(elapsed),
+            (AllocationPath::Metadata, "metadata_load") => {
+                STAGE_METADATA_METADATA_LOAD.observe(elapsed);
+            }
+            (AllocationPath::Metadata, "activate_local") => {
+                STAGE_METADATA_ACTIVATE_LOCAL.observe(elapsed);
+            }
+            (AllocationPath::Metadata, "lease_ensure") => {
+                STAGE_METADATA_LEASE_ENSURE.observe(elapsed);
+            }
+            (AllocationPath::Metadata, "admission_wait") => {
+                STAGE_METADATA_ADMISSION_WAIT.observe(elapsed);
+            }
+            (AllocationPath::Metadata, "serve") => STAGE_METADATA_SERVE.observe(elapsed),
+            _ => metrics::TSO_ALLOCATE_STAGE_LATENCY
+                .with_label_values(&[path.as_label(), stage])
+                .observe(elapsed),
+        }
     }
 
     pub(super) async fn try_allocate_from_cached_timeline(
@@ -258,20 +384,28 @@ impl TsoService {
         request: &AllocateTimestampsRequest,
         timeline_state_handle: Arc<Mutex<TimelineState>>,
         generator_id: u32,
-        now_ms: u64,
+        _now_ms: u64,
         issued_upper_bound: Option<u64>,
         options: AllocationServeOptions,
     ) -> Result<Option<AllocateTimestampsResponse>, TsoError> {
         let generator = self.lookup_generator(generator_id)?;
         let mut contention_retries = 0u32;
         let serve_started = Instant::now();
-        let charged_quota = {
-            let mut timeline_state = timeline_state_handle.lock().await;
-            self.charge_timeline_quota(&mut timeline_state, request.count, now_ms)?
-        };
+        let charged_quota = self
+            .charge_timeline_quota_for_allocation(
+                &timeline_state_handle,
+                request.count,
+                options.cancellation.as_ref(),
+                options.path,
+            )
+            .await?;
 
         loop {
-            Self::check_request_cancellation(options.cancellation.as_ref())?;
+            if let Err(error) = Self::check_request_cancellation(options.cancellation.as_ref()) {
+                let mut timeline_state = timeline_state_handle.lock().await;
+                self.refund_timeline_quota(&mut timeline_state, charged_quota);
+                return Err(error);
+            }
             let (resource_tier, timeline_state) = {
                 let timeline_state = timeline_state_handle.lock().await;
                 (timeline_state.route.resource_tier, timeline_state)
@@ -279,7 +413,7 @@ impl TsoService {
             drop(timeline_state);
 
             let admission_wait_started = Instant::now();
-            let _admission_permit = match self
+            let admission_permit = match self
                 .acquire_generator_admission(
                     generator_id,
                     resource_tier,
@@ -302,6 +436,7 @@ impl TsoService {
             );
 
             let mut timeline_state = timeline_state_handle.lock().await;
+            let now_ms = self.clock.now_ms();
             let outcome = match generator.allocate_after(
                 request.count,
                 timeline_state.last_issued_tso,
@@ -342,12 +477,9 @@ impl TsoService {
                 }
             };
 
-            self.release_generator_admission_turn(
-                generator_id,
-                resource_tier,
-                &request.timeline_key,
-            )
-            .await;
+            if let Some(admission_permit) = admission_permit {
+                admission_permit.release();
+            }
 
             match outcome {
                 ServeOutcome::Served(response) => {
@@ -356,6 +488,19 @@ impl TsoService {
                 ServeOutcome::Contended => {
                     contention_retries = contention_retries.saturating_add(1);
                     if contention_retries >= MAX_ALLOCATION_CONTENTION_RETRIES {
+                        if let Some(cancellation) = options.cancellation.as_ref() {
+                            Self::record_allocation_outcome(options.path, "contention_wait");
+                            tokio::select! {
+                                _ = sleep(Duration::from_millis(1)) => {}
+                                _ = cancellation.cancelled() => {
+                                    let mut timeline_state = timeline_state_handle.lock().await;
+                                    self.refund_timeline_quota(&mut timeline_state, charged_quota);
+                                    return Err(TsoError::RequestCancelled);
+                                }
+                            }
+                            contention_retries = 0;
+                            continue;
+                        }
                         Self::record_allocation_outcome(options.path, "contention_exhausted");
                         Self::record_allocation_stage_latency(options.path, "serve", serve_started);
                         let mut timeline_state = timeline_state_handle.lock().await;
@@ -379,11 +524,67 @@ impl TsoService {
                     return Ok(None);
                 }
                 ServeOutcome::Error(error) => {
+                    if let (
+                        TsoError::FutureBorrowExceeded {
+                            requested_physical_ms,
+                            allowed_physical_ms,
+                        },
+                        Some(cancellation),
+                    ) = (&error, options.cancellation.as_ref())
+                    {
+                        let wait_ms = (*requested_physical_ms)
+                            .saturating_sub(*allowed_physical_ms)
+                            .max(1);
+                        Self::record_allocation_outcome(options.path, "future_borrow_wait");
+                        tokio::select! {
+                            _ = sleep(Duration::from_millis(wait_ms)) => {}
+                            _ = cancellation.cancelled() => {
+                                Self::record_allocation_stage_latency(options.path, "serve", serve_started);
+                                let mut timeline_state = timeline_state_handle.lock().await;
+                                self.refund_timeline_quota(&mut timeline_state, charged_quota);
+                                return Err(TsoError::RequestCancelled);
+                            }
+                        }
+                        continue;
+                    }
                     Self::record_allocation_stage_latency(options.path, "serve", serve_started);
                     let mut timeline_state = timeline_state_handle.lock().await;
                     self.refund_timeline_quota(&mut timeline_state, charged_quota);
                     return Err(error);
                 }
+            }
+        }
+    }
+
+    async fn charge_timeline_quota_for_allocation(
+        &self,
+        timeline_state_handle: &Arc<Mutex<TimelineState>>,
+        count: u32,
+        cancellation: Option<&RequestCancellation>,
+        path: AllocationPath,
+    ) -> Result<Option<f64>, TsoError> {
+        loop {
+            let wait_ms = {
+                let mut timeline_state = timeline_state_handle.lock().await;
+                match self.charge_timeline_quota(&mut timeline_state, count, self.clock.now_ms()) {
+                    Ok(charged) => return Ok(charged),
+                    Err(TsoError::FutureBorrowExceeded {
+                        requested_physical_ms,
+                        allowed_physical_ms,
+                    }) if cancellation.is_some() => requested_physical_ms
+                        .saturating_sub(allowed_physical_ms)
+                        .max(1),
+                    Err(error) => return Err(error),
+                }
+            };
+
+            Self::record_allocation_outcome(path, "quota_wait");
+            let Some(cancellation) = cancellation else {
+                return Err(TsoError::RequestCancelled);
+            };
+            tokio::select! {
+                _ = sleep(Duration::from_millis(wait_ms)) => {}
+                _ = cancellation.cancelled() => return Err(TsoError::RequestCancelled),
             }
         }
     }

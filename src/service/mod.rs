@@ -8,17 +8,18 @@ mod transfer;
 mod worker_readiness;
 
 use std::cmp::max;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard};
 
-use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
 
 use crate::metadata::{ControlPlaneStore, GeneratorRecord};
 use crate::plane::RequestCancellation;
 use crate::planning::{generator_recovery_floor_tso, pick_owned_generator_by_hash};
+use crate::recovery::record_recovery_event;
 use crate::runtime::Generator;
 use crate::{decode_tso, next_cursor_after, Clock, TsoConfig, TsoError, MAX_GENERATORS};
 
@@ -38,12 +39,13 @@ pub struct TsoService {
     pub(super) generator_runtime: GeneratorRuntimeState,
     pub(super) timeline_runtime: TimelineRuntimeState,
     pub(super) generator_admission_gates: Vec<Arc<Semaphore>>,
-    pub(super) generator_fairness_trackers: Vec<Arc<Mutex<GeneratorFairnessState>>>,
+    pub(super) generator_fairness_trackers: Vec<Arc<StdMutex<GeneratorFairnessState>>>,
     pub(super) generator_fairness_notifiers: Vec<Arc<Notify>>,
     timeline_load_coordinator: TimelineLoadCoordinator,
     timeline_load_limiter: Arc<Semaphore>,
     generator_lease_coordinator: GeneratorLeaseCoordinator,
     metadata_contention: MetadataContentionCoordinator,
+    auto_failover_scan: StdMutex<AutoFailoverScanState>,
     background: BackgroundCoordinator,
     ownership_drift: OwnershipDriftTracker,
     shutdown_gate: AtomicBool,
@@ -52,44 +54,171 @@ pub struct TsoService {
 #[derive(Default)]
 pub(super) struct GeneratorFairnessState {
     active_timeline_key: Option<String>,
-    waiting_timeline_keys: HashSet<String>,
-    wait_queue: VecDeque<String>,
+    wait_queue: VecDeque<GeneratorWaitQueueEntry>,
+    next_waiter_id: u64,
 }
 
-impl TsoService {
-    async fn remove_generator_waiter(&self, generator_id: u32, timeline_key: &str) {
-        let mut fairness = self.generator_fairness_trackers[generator_id as usize]
-            .lock()
-            .await;
-        if fairness.waiting_timeline_keys.remove(timeline_key) {
-            fairness.wait_queue.retain(|queued| queued != timeline_key);
+pub(super) struct GeneratorWaitQueueEntry {
+    timeline_key: String,
+    waiter_id: u64,
+}
+
+#[derive(Default)]
+pub(super) struct AutoFailoverScanState {
+    owner_cursor_index: usize,
+    owner_cursors: HashMap<String, Option<String>>,
+    owner_endpoints: Vec<String>,
+    owner_endpoints_refresh_after_ms: u64,
+}
+
+pub(super) struct GeneratorAdmissionPermit {
+    _permit: OwnedSemaphorePermit,
+    turn: Option<GeneratorAdmissionTurnGuard>,
+}
+
+struct GeneratorAdmissionTurnGuard {
+    fairness: Arc<StdMutex<GeneratorFairnessState>>,
+    notifier: Arc<Notify>,
+    timeline_key: String,
+    released: bool,
+}
+
+struct GeneratorAdmissionWaiterGuard {
+    fairness: Arc<StdMutex<GeneratorFairnessState>>,
+    notifier: Arc<Notify>,
+    waiter_id: u64,
+    queued: bool,
+}
+
+impl GeneratorAdmissionTurnGuard {
+    fn new(
+        fairness: Arc<StdMutex<GeneratorFairnessState>>,
+        notifier: Arc<Notify>,
+        timeline_key: String,
+    ) -> Self {
+        Self {
+            fairness,
+            notifier,
+            timeline_key,
+            released: false,
         }
     }
 
-    pub(super) async fn release_generator_admission_turn(
-        &self,
-        generator_id: u32,
-        resource_tier: crate::ResourceTier,
-        timeline_key: &str,
-    ) {
-        if !matches!(
-            resource_tier,
-            crate::ResourceTier::Shared | crate::ResourceTier::Warm
-        ) {
+    fn release_inner(&mut self) {
+        if self.released {
+            return;
+        }
+        self.released = true;
+        let mut fairness = lock_generator_fairness(&self.fairness);
+        if fairness.active_timeline_key.as_deref() == Some(&self.timeline_key) {
+            fairness.active_timeline_key = None;
+            drop(fairness);
+            self.notifier.notify_waiters();
+        }
+    }
+
+    fn release(mut self) {
+        self.release_inner();
+    }
+}
+
+impl GeneratorAdmissionWaiterGuard {
+    fn new(
+        fairness: Arc<StdMutex<GeneratorFairnessState>>,
+        notifier: Arc<Notify>,
+        waiter_id: u64,
+    ) -> Self {
+        Self {
+            fairness,
+            notifier,
+            waiter_id,
+            queued: true,
+        }
+    }
+
+    fn disarm(mut self) {
+        self.queued = false;
+    }
+}
+
+impl Drop for GeneratorAdmissionWaiterGuard {
+    fn drop(&mut self) {
+        if !self.queued {
             return;
         }
 
-        let notifier = self.generator_fairness_notifiers[generator_id as usize].clone();
-        let mut fairness = self.generator_fairness_trackers[generator_id as usize]
-            .lock()
-            .await;
-        if fairness.active_timeline_key.as_deref() == Some(timeline_key) {
-            fairness.active_timeline_key = None;
+        let mut fairness = lock_generator_fairness(&self.fairness);
+        let was_front = fairness
+            .wait_queue
+            .front()
+            .is_some_and(|queued| queued.waiter_id == self.waiter_id);
+        let original_len = fairness.wait_queue.len();
+        fairness
+            .wait_queue
+            .retain(|queued| queued.waiter_id != self.waiter_id);
+        let removed = fairness.wait_queue.len() != original_len;
+        if removed {
             drop(fairness);
-            notifier.notify_waiters();
+            if was_front {
+                self.notifier.notify_waiters();
+            }
         }
     }
+}
 
+impl Drop for GeneratorAdmissionTurnGuard {
+    fn drop(&mut self) {
+        self.release_inner();
+    }
+}
+
+impl GeneratorAdmissionPermit {
+    pub(super) fn release(mut self) {
+        if let Some(turn) = self.turn.take() {
+            turn.release();
+        }
+    }
+}
+
+fn lock_generator_fairness(
+    fairness: &StdMutex<GeneratorFairnessState>,
+) -> StdMutexGuard<'_, GeneratorFairnessState> {
+    match fairness.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            record_recovery_event("service", "generator_fairness_lock", "mutex_poisoned");
+            poisoned.into_inner()
+        }
+    }
+}
+
+fn queue_generator_waiter_if_needed(
+    fairness_state: &mut GeneratorFairnessState,
+    fairness: &Arc<StdMutex<GeneratorFairnessState>>,
+    notifier: &Arc<Notify>,
+    timeline_key: &str,
+    waiter_guard: &mut Option<GeneratorAdmissionWaiterGuard>,
+) {
+    if waiter_guard.is_some() {
+        return;
+    }
+
+    let waiter_id = fairness_state.next_waiter_id;
+    fairness_state.next_waiter_id = fairness_state.next_waiter_id.wrapping_add(1);
+    fairness_state
+        .wait_queue
+        .push_back(GeneratorWaitQueueEntry {
+            timeline_key: timeline_key.to_owned(),
+            waiter_id,
+        });
+    *waiter_guard = Some(GeneratorAdmissionWaiterGuard::new(
+        fairness.clone(),
+        notifier.clone(),
+        waiter_id,
+    ));
+}
+
+impl TsoService {
     pub(super) async fn backoff_after_metadata_contention(
         &self,
         retries: u32,
@@ -128,7 +257,7 @@ impl TsoService {
         resource_tier: crate::ResourceTier,
         timeline_key: &str,
         cancellation: Option<RequestCancellation>,
-    ) -> Result<Option<OwnedSemaphorePermit>, TsoError> {
+    ) -> Result<Option<GeneratorAdmissionPermit>, TsoError> {
         if !matches!(
             resource_tier,
             crate::ResourceTier::Shared | crate::ResourceTier::Warm
@@ -138,65 +267,81 @@ impl TsoService {
 
         let fairness = self.generator_fairness_trackers[generator_id as usize].clone();
         let notifier = self.generator_fairness_notifiers[generator_id as usize].clone();
+        let timeline_key_owned = timeline_key.to_owned();
+        let mut waiter_guard: Option<GeneratorAdmissionWaiterGuard> = None;
 
-        loop {
+        let turn_guard = loop {
             Self::check_request_cancellation(cancellation.as_ref())?;
+            let notified = notifier.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
 
             let grant_turn = {
-                let mut fairness_state = fairness.lock().await;
+                let mut fairness_state = lock_generator_fairness(&fairness);
                 if fairness_state.active_timeline_key.is_none() {
                     match fairness_state.wait_queue.front() {
-                        Some(front) if front == timeline_key => {
-                            fairness_state.wait_queue.pop_front();
-                            fairness_state.waiting_timeline_keys.remove(timeline_key);
-                            fairness_state.active_timeline_key = Some(timeline_key.to_string());
+                        Some(front)
+                            if waiter_guard
+                                .as_ref()
+                                .is_some_and(|guard| guard.waiter_id == front.waiter_id) =>
+                        {
+                            let queued = fairness_state
+                                .wait_queue
+                                .pop_front()
+                                .expect("front queue entry must exist");
+                            fairness_state.active_timeline_key = Some(queued.timeline_key);
+                            if let Some(waiter_guard) = waiter_guard.take() {
+                                waiter_guard.disarm();
+                            }
                             true
                         }
                         Some(_) => {
-                            if fairness_state
-                                .waiting_timeline_keys
-                                .insert(timeline_key.to_string())
-                            {
-                                fairness_state
-                                    .wait_queue
-                                    .push_back(timeline_key.to_string());
-                            }
+                            queue_generator_waiter_if_needed(
+                                &mut fairness_state,
+                                &fairness,
+                                &notifier,
+                                &timeline_key_owned,
+                                &mut waiter_guard,
+                            );
                             false
                         }
                         None => {
-                            fairness_state.active_timeline_key = Some(timeline_key.to_string());
+                            if let Some(waiter_guard) = waiter_guard.take() {
+                                waiter_guard.disarm();
+                            }
+                            fairness_state.active_timeline_key = Some(timeline_key_owned.clone());
                             true
                         }
                     }
                 } else {
-                    if fairness_state
-                        .waiting_timeline_keys
-                        .insert(timeline_key.to_string())
-                    {
-                        fairness_state
-                            .wait_queue
-                            .push_back(timeline_key.to_string());
-                    }
+                    queue_generator_waiter_if_needed(
+                        &mut fairness_state,
+                        &fairness,
+                        &notifier,
+                        &timeline_key_owned,
+                        &mut waiter_guard,
+                    );
                     false
                 }
             };
 
             if grant_turn {
-                break;
+                break GeneratorAdmissionTurnGuard::new(
+                    fairness.clone(),
+                    notifier.clone(),
+                    timeline_key_owned.clone(),
+                );
             }
 
             if let Some(cancellation) = cancellation.as_ref() {
                 tokio::select! {
-                    _ = notifier.notified() => continue,
-                    _ = cancellation.cancelled() => {
-                        self.remove_generator_waiter(generator_id, timeline_key).await;
-                        return Err(TsoError::RequestCancelled);
-                    }
+                    _ = &mut notified => continue,
+                    _ = cancellation.cancelled() => return Err(TsoError::RequestCancelled),
                 }
             } else {
-                notifier.notified().await;
+                notified.await;
             }
-        }
+        };
 
         let permit = self.generator_admission_gates[generator_id as usize]
             .clone()
@@ -204,22 +349,23 @@ impl TsoService {
         let permit_result = if let Some(cancellation) = cancellation {
             tokio::select! {
                 permit = permit => permit
-                    .map(Some)
                     .map_err(|_| TsoError::ServiceShuttingDown),
                 _ = cancellation.cancelled() => Err(TsoError::RequestCancelled),
             }
         } else {
-            permit
-                .await
-                .map(Some)
-                .map_err(|_| TsoError::ServiceShuttingDown)
+            permit.await.map_err(|_| TsoError::ServiceShuttingDown)
         };
 
-        if permit_result.is_err() {
-            self.release_generator_admission_turn(generator_id, resource_tier, timeline_key)
-                .await;
+        match permit_result {
+            Ok(permit) => Ok(Some(GeneratorAdmissionPermit {
+                _permit: permit,
+                turn: Some(turn_guard),
+            })),
+            Err(error) => {
+                turn_guard.release();
+                Err(error)
+            }
         }
-        permit_result
     }
 
     pub(super) fn check_request_cancellation(

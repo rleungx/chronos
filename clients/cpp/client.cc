@@ -2,6 +2,10 @@
 
 #include <grpc/grpc_security_constants.h>
 
+#include <chrono>
+#include <random>
+#include <sstream>
+
 using chronos::tso::v1::AllocateTimestampsRequest;
 using chronos::tso::v1::AllocateTimestampsResponse;
 using chronos::tso::v1::EnsureTimelineRequest;
@@ -13,6 +17,21 @@ using chronos::tso::v1::TimelineRoute;
 using chronos::tso::v1::TimelineRouteService;
 using chronos::tso::v1::TimestampService;
 
+namespace {
+
+std::atomic<uint64_t> g_client_scope_counter{1};
+
+std::string MakeIdempotencyScope() {
+  auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+  auto counter = g_client_scope_counter.fetch_add(1);
+  std::random_device random;
+  std::ostringstream out;
+  out << std::hex << now << "-" << counter << "-" << random() << "-" << random();
+  return out.str();
+}
+
+}  // namespace
+
 Client::Client(const std::string& addr, const std::string& timeline_key)
     : Client(addr, timeline_key, TransportConfig{}) {}
 
@@ -20,10 +39,19 @@ Client::Client(
     const std::string& addr,
     const std::string& timeline_key,
     TransportConfig transport_config)
+    : Client(addr, timeline_key, std::move(transport_config), false) {}
+
+Client::Client(
+    const std::string& addr,
+    const std::string& timeline_key,
+    TransportConfig transport_config,
+    bool idempotency_enabled)
     : route_channel_(nullptr),
       route_stub_(nullptr),
       timeline_key_(timeline_key),
-      transport_config_(std::move(transport_config)) {
+      transport_config_(std::move(transport_config)),
+      idempotency_enabled_(idempotency_enabled),
+      idempotency_scope_(MakeIdempotencyScope()) {
   route_channel_ = CreateChannel(addr);
   route_stub_ = TimelineRouteService::NewStub(route_channel_);
   EnsureRoute();
@@ -76,6 +104,13 @@ TimelineRoute Client::EnsureRouteLocked() {
   if (!status.ok()) {
     throw std::runtime_error(status.error_message());
   }
+  if (!response.has_route()) {
+    throw std::runtime_error("chronos returned no route from EnsureTimeline");
+  }
+  if (response.route().owner_worker_endpoint().empty()) {
+    throw std::runtime_error(
+        "chronos returned route with empty owner endpoint from EnsureTimeline");
+  }
   return RefreshRouteLocked();
 }
 
@@ -88,7 +123,14 @@ TimelineRoute Client::RefreshRouteLocked() {
   if (!status.ok()) {
     throw std::runtime_error(status.error_message());
   }
+  if (!response.has_route()) {
+    throw std::runtime_error("chronos returned no route from GetTimelineRoute");
+  }
   auto route = response.route();
+  if (route.owner_worker_endpoint().empty()) {
+    throw std::runtime_error(
+        "chronos returned route with empty owner endpoint from GetTimelineRoute");
+  }
   tso_channel_ = CreateChannel(route.owner_worker_endpoint());
   tso_stub_ = std::shared_ptr<TimestampService::Stub>(TimestampService::NewStub(tso_channel_).release());
   cache_[timeline_key_] = route;
@@ -112,7 +154,10 @@ grpc::Status Client::AllocateOnce(
 }
 
 std::string Client::NextClientRequestId(const std::string& timeline_key) {
-  return timeline_key + "-" + std::to_string(request_id_++);
+  if (!idempotency_enabled_) {
+    return "";
+  }
+  return timeline_key + "-" + idempotency_scope_ + "-" + std::to_string(request_id_++);
 }
 
 bool Client::IsStaleRouteError(const grpc::Status& status) {

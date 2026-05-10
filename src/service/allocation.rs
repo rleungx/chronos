@@ -335,7 +335,12 @@ impl TsoService {
 
             let activate_local_started = Instant::now();
             let (timeline_record, activated_revision) = match self
-                .activate_local_timeline_record(&request.timeline_key, timeline_record, revision)
+                .activate_local_timeline_record_with_cancellation(
+                    &request.timeline_key,
+                    timeline_record,
+                    revision,
+                    cancellation.clone(),
+                )
                 .await
             {
                 Ok(value) => value,
@@ -2703,6 +2708,71 @@ mod tests {
         assert_eq!(response.timeline_key, route.timeline_key);
     }
 
+    #[tokio::test]
+    async fn cancelled_shared_allocation_refunds_timeline_quota() {
+        let service = TsoService::new(
+            with_worker(
+                TsoConfig {
+                    shared_generators: 1,
+                    warm_generators: 0,
+                    max_batch_per_request: 8,
+                    max_future_borrow_ms: 2_000,
+                    ..TsoConfig::default()
+                },
+                "worker-a",
+            ),
+            Arc::new(ManualClock::new(52_500)),
+            Arc::new(MemoryMetadataStore::new()),
+        )
+        .unwrap();
+
+        let route = service
+            .ensure_timeline("shared.cancel.refund")
+            .await
+            .unwrap();
+        let permit = service.generator_admission_gates[route.generator_id as usize]
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+        let cancellation = RequestCancellation::new();
+        let service_clone = service.clone();
+        let route_clone = route.clone();
+        let cancellation_clone = cancellation.clone();
+        let allocate_task = tokio::spawn(async move {
+            service_clone
+                .allocate_timestamps_with_cancellation(
+                    AllocateTimestampsRequest {
+                        timeline_key: route_clone.timeline_key.clone(),
+                        count: 8,
+                        expected_epoch: route_clone.epoch,
+                        expected_route_version: route_clone.route_version,
+                        client_request_id: "shared-cancel-refund-cancelled".into(),
+                    },
+                    Some(cancellation_clone),
+                )
+                .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        cancellation.cancel();
+        let error = allocate_task.await.unwrap().unwrap_err();
+        assert_eq!(error, TsoError::RequestCancelled);
+        drop(permit);
+
+        let response = service
+            .allocate_timestamps(AllocateTimestampsRequest {
+                timeline_key: route.timeline_key.clone(),
+                count: 8,
+                expected_epoch: route.epoch,
+                expected_route_version: route.route_version,
+                client_request_id: "shared-cancel-refund-after".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(response.timeline_key, route.timeline_key);
+    }
+
     async fn ensure_shared_timeline_on_generator(
         service: &TsoService,
         generator_id: u32,
@@ -2718,6 +2788,228 @@ mod tests {
             }
         }
         panic!("failed to find shared timeline for generator {generator_id}");
+    }
+
+    #[tokio::test]
+    async fn dropped_shared_allocation_releases_generator_admission_turn() {
+        let service = TsoService::new(
+            with_worker(
+                TsoConfig {
+                    shared_generators: 1,
+                    warm_generators: 0,
+                    max_batch_per_request: 8,
+                    ..TsoConfig::default()
+                },
+                "worker-a",
+            ),
+            Arc::new(ManualClock::new(53_500)),
+            Arc::new(MemoryMetadataStore::new()),
+        )
+        .unwrap();
+
+        let route_a = service.ensure_timeline("shared.drop-turn.a").await.unwrap();
+        let route_b = ensure_shared_timeline_on_generator(
+            &service,
+            route_a.generator_id,
+            "shared.drop-turn.b",
+        )
+        .await;
+        let permit = service.generator_admission_gates[route_a.generator_id as usize]
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+
+        let service_clone = service.clone();
+        let route_a_clone = route_a.clone();
+        let blocked_task = tokio::spawn(async move {
+            service_clone
+                .allocate_timestamps(AllocateTimestampsRequest {
+                    timeline_key: route_a_clone.timeline_key.clone(),
+                    count: 1,
+                    expected_epoch: route_a_clone.epoch,
+                    expected_route_version: route_a_clone.route_version,
+                    client_request_id: "shared-drop-turn-aborted".into(),
+                })
+                .await
+        });
+
+        for _ in 0..20 {
+            let active = service.generator_fairness_trackers[route_a.generator_id as usize]
+                .lock()
+                .unwrap()
+                .active_timeline_key
+                .clone();
+            if active.as_deref() == Some(route_a.timeline_key.as_str()) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            service.generator_fairness_trackers[route_a.generator_id as usize]
+                .lock()
+                .unwrap()
+                .active_timeline_key
+                .as_deref(),
+            Some(route_a.timeline_key.as_str())
+        );
+
+        blocked_task.abort();
+        let _ = blocked_task.await;
+        drop(permit);
+
+        timeout(
+            Duration::from_millis(100),
+            service.allocate_timestamps(AllocateTimestampsRequest {
+                timeline_key: route_b.timeline_key.clone(),
+                count: 1,
+                expected_epoch: route_b.epoch,
+                expected_route_version: route_b.route_version,
+                client_request_id: "shared-drop-turn-next".into(),
+            }),
+        )
+        .await
+        .expect("next timeline should not be blocked by aborted admission turn")
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn dropped_shared_allocation_removes_queued_generator_waiter() {
+        let service = TsoService::new(
+            with_worker(
+                TsoConfig {
+                    shared_generators: 1,
+                    warm_generators: 0,
+                    max_batch_per_request: 8,
+                    ..TsoConfig::default()
+                },
+                "worker-a",
+            ),
+            Arc::new(ManualClock::new(53_750)),
+            Arc::new(MemoryMetadataStore::new()),
+        )
+        .unwrap();
+
+        let route_a = service
+            .ensure_timeline("shared.drop-queued.a")
+            .await
+            .unwrap();
+        let route_b = ensure_shared_timeline_on_generator(
+            &service,
+            route_a.generator_id,
+            "shared.drop-queued.b",
+        )
+        .await;
+        let route_c = ensure_shared_timeline_on_generator(
+            &service,
+            route_a.generator_id,
+            "shared.drop-queued.c",
+        )
+        .await;
+        let permit = service.generator_admission_gates[route_a.generator_id as usize]
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+
+        let service_clone = service.clone();
+        let route_a_clone = route_a.clone();
+        let active_task = tokio::spawn(async move {
+            service_clone
+                .allocate_timestamps(AllocateTimestampsRequest {
+                    timeline_key: route_a_clone.timeline_key.clone(),
+                    count: 1,
+                    expected_epoch: route_a_clone.epoch,
+                    expected_route_version: route_a_clone.route_version,
+                    client_request_id: "shared-drop-queued-active".into(),
+                })
+                .await
+        });
+
+        for _ in 0..20 {
+            let active = service.generator_fairness_trackers[route_a.generator_id as usize]
+                .lock()
+                .unwrap()
+                .active_timeline_key
+                .clone();
+            if active.as_deref() == Some(route_a.timeline_key.as_str()) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            service.generator_fairness_trackers[route_a.generator_id as usize]
+                .lock()
+                .unwrap()
+                .active_timeline_key
+                .as_deref(),
+            Some(route_a.timeline_key.as_str())
+        );
+
+        let service_clone = service.clone();
+        let route_b_clone = route_b.clone();
+        let queued_task = tokio::spawn(async move {
+            service_clone
+                .allocate_timestamps(AllocateTimestampsRequest {
+                    timeline_key: route_b_clone.timeline_key.clone(),
+                    count: 1,
+                    expected_epoch: route_b_clone.epoch,
+                    expected_route_version: route_b_clone.route_version,
+                    client_request_id: "shared-drop-queued-aborted".into(),
+                })
+                .await
+        });
+
+        for _ in 0..20 {
+            let queued = service.generator_fairness_trackers[route_a.generator_id as usize]
+                .lock()
+                .unwrap()
+                .wait_queue
+                .iter()
+                .any(|queued| queued.timeline_key == route_b.timeline_key);
+            if queued {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            service.generator_fairness_trackers[route_a.generator_id as usize]
+                .lock()
+                .unwrap()
+                .wait_queue
+                .iter()
+                .any(|queued| queued.timeline_key == route_b.timeline_key),
+            "route_b should be queued behind the active route"
+        );
+
+        queued_task.abort();
+        let _ = queued_task.await;
+        assert!(
+            !service.generator_fairness_trackers[route_a.generator_id as usize]
+                .lock()
+                .unwrap()
+                .wait_queue
+                .iter()
+                .any(|queued| queued.timeline_key == route_b.timeline_key),
+            "aborted queued waiter should be removed from generator fairness queue"
+        );
+
+        drop(permit);
+        active_task.await.unwrap().unwrap();
+
+        timeout(
+            Duration::from_millis(100),
+            service.allocate_timestamps(AllocateTimestampsRequest {
+                timeline_key: route_c.timeline_key.clone(),
+                count: 1,
+                expected_epoch: route_c.epoch,
+                expected_route_version: route_c.route_version,
+                client_request_id: "shared-drop-queued-next".into(),
+            }),
+        )
+        .await
+        .expect("next timeline should not be blocked by aborted queued waiter")
+        .unwrap();
     }
 
     #[tokio::test]

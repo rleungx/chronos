@@ -121,3 +121,11 @@ pub(super) fn request_cleanup_index_cutoff(prefix: &str, older_than_ms: u64) -> 
 pub(super) fn instance_identity_key(prefix: &str, instance_id: &str) -> String {
     namespace(prefix, &format!("identity/instances/{instance_id}"))
 }
+
+pub(super) fn instance_identity_prefix(prefix: &str) -> String {
+    namespace(prefix, "identity/instances/")
+}
+
+pub(super) fn ownership_plan_key(prefix: &str) -> String {
+    namespace(prefix, "cluster/ownership_plan")
+}

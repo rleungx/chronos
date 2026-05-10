@@ -26,12 +26,17 @@ WAIT_INTERVAL_SECS="${CHRONOS_SOAK_WAIT_INTERVAL_SECS:-1}"
 SOAK_REQ_PER_SEC_MIN="${CHRONOS_SOAK_REQ_PER_SEC_MIN:-50}"
 SOAK_LATENCY_P95_US_MAX="${CHRONOS_SOAK_LATENCY_P95_US_MAX:-200000}"
 SOAK_LATENCY_P99_US_MAX="${CHRONOS_SOAK_LATENCY_P99_US_MAX:-500000}"
+SOAK_LATENCY_P999_US_MAX="${CHRONOS_SOAK_LATENCY_P999_US_MAX:-1000000}"
 CONTROL_REQ_PER_SEC_MIN="${CHRONOS_SOAK_CONTROL_REQ_PER_SEC_MIN:-10}"
 CONTROL_RPC_P95_US_MAX="${CHRONOS_SOAK_CONTROL_RPC_P95_US_MAX:-500000}"
+CONTROL_RPC_P999_US_MAX="${CHRONOS_SOAK_CONTROL_RPC_P999_US_MAX:-1000000}"
 CONTROL_SCAN_P95_US_MAX="${CHRONOS_SOAK_CONTROL_SCAN_P95_US_MAX:-1000000}"
+CONTROL_SCAN_P999_US_MAX="${CHRONOS_SOAK_CONTROL_SCAN_P999_US_MAX:-2000000}"
 FILTERED_REQ_PER_SEC_MIN="${CHRONOS_SOAK_FILTERED_REQ_PER_SEC_MIN:-10}"
 FILTERED_RPC_P95_US_MAX="${CHRONOS_SOAK_FILTERED_RPC_P95_US_MAX:-500000}"
+FILTERED_RPC_P999_US_MAX="${CHRONOS_SOAK_FILTERED_RPC_P999_US_MAX:-1000000}"
 FILTERED_SCAN_P95_US_MAX="${CHRONOS_SOAK_FILTERED_SCAN_P95_US_MAX:-1500000}"
+FILTERED_SCAN_P999_US_MAX="${CHRONOS_SOAK_FILTERED_SCAN_P999_US_MAX:-3000000}"
 UNIQUE_SUFFIX="$(date +%s)-$$"
 ETCD_PREFIX="${CHRONOS_SOAK_ETCD_PREFIX:-/chronos-soak-${UNIQUE_SUFFIX}}"
 WORKER_ID="${CHRONOS_SOAK_WORKER_ID:-worker-soak}"
@@ -96,12 +101,17 @@ filtered_concurrency=${FILTERED_CONCURRENCY}
 soak_req_per_sec_min=${SOAK_REQ_PER_SEC_MIN}
 soak_latency_p95_us_max=${SOAK_LATENCY_P95_US_MAX}
 soak_latency_p99_us_max=${SOAK_LATENCY_P99_US_MAX}
+soak_latency_p999_us_max=${SOAK_LATENCY_P999_US_MAX}
 control_req_per_sec_min=${CONTROL_REQ_PER_SEC_MIN}
 control_rpc_p95_us_max=${CONTROL_RPC_P95_US_MAX}
+control_rpc_p999_us_max=${CONTROL_RPC_P999_US_MAX}
 control_scan_p95_us_max=${CONTROL_SCAN_P95_US_MAX}
+control_scan_p999_us_max=${CONTROL_SCAN_P999_US_MAX}
 filtered_req_per_sec_min=${FILTERED_REQ_PER_SEC_MIN}
 filtered_rpc_p95_us_max=${FILTERED_RPC_P95_US_MAX}
+filtered_rpc_p999_us_max=${FILTERED_RPC_P999_US_MAX}
 filtered_scan_p95_us_max=${FILTERED_SCAN_P95_US_MAX}
+filtered_scan_p999_us_max=${FILTERED_SCAN_P999_US_MAX}
 etcd_prefix=${ETCD_PREFIX}
 worker_id=${WORKER_ID}
 safety_gap_ms=${SAFETY_GAP_MS}
@@ -214,12 +224,19 @@ assert_http_metric_present "http://${METRICS_ENDPOINT}/metrics" '^tso_allocate_t
 assert_metric_at_least "req_per_sec" "${BENCH_LOG}" "${SOAK_REQ_PER_SEC_MIN}"
 assert_metric_at_most "latency_p95_us" "${BENCH_LOG}" "${SOAK_LATENCY_P95_US_MAX}"
 assert_metric_at_most "latency_p99_us" "${BENCH_LOG}" "${SOAK_LATENCY_P99_US_MAX}"
+assert_metric_at_most "latency_p999_us" "${BENCH_LOG}" "${SOAK_LATENCY_P999_US_MAX}"
+assert_zero_metric "allocation_failed_total" "${BENCH_LOG}"
+assert_zero_metric "allocation_measured_failed_total" "${BENCH_LOG}"
 assert_metric_at_least "req_per_sec" "${CONTROL_STATUS_LOG}" "${CONTROL_REQ_PER_SEC_MIN}"
 assert_metric_at_most "rpc_latency_p95_us" "${CONTROL_STATUS_LOG}" "${CONTROL_RPC_P95_US_MAX}"
+assert_metric_at_most "rpc_latency_p999_us" "${CONTROL_STATUS_LOG}" "${CONTROL_RPC_P999_US_MAX}"
 assert_metric_at_most "scan_latency_p95_us" "${CONTROL_STATUS_LOG}" "${CONTROL_SCAN_P95_US_MAX}"
+assert_metric_at_most "scan_latency_p999_us" "${CONTROL_STATUS_LOG}" "${CONTROL_SCAN_P999_US_MAX}"
 assert_metric_at_least "req_per_sec" "${CONTROL_FILTERED_LOG}" "${FILTERED_REQ_PER_SEC_MIN}"
 assert_metric_at_most "rpc_latency_p95_us" "${CONTROL_FILTERED_LOG}" "${FILTERED_RPC_P95_US_MAX}"
+assert_metric_at_most "rpc_latency_p999_us" "${CONTROL_FILTERED_LOG}" "${FILTERED_RPC_P999_US_MAX}"
 assert_metric_at_most "scan_latency_p95_us" "${CONTROL_FILTERED_LOG}" "${FILTERED_SCAN_P95_US_MAX}"
+assert_metric_at_most "scan_latency_p999_us" "${CONTROL_FILTERED_LOG}" "${FILTERED_SCAN_P999_US_MAX}"
 
 RESULT="success"
 write_summary

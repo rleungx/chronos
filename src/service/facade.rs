@@ -81,7 +81,7 @@ impl TsoService {
                 .collect(),
             generator_fairness_trackers: (0..MAX_GENERATORS)
                 .map(|_| {
-                    Arc::new(tokio::sync::Mutex::new(
+                    Arc::new(std::sync::Mutex::new(
                         super::GeneratorFairnessState::default(),
                     ))
                 })
@@ -93,6 +93,7 @@ impl TsoService {
             timeline_load_limiter: Arc::new(Semaphore::new(max_concurrent_timeline_loads)),
             generator_lease_coordinator: GeneratorLeaseCoordinator::default(),
             metadata_contention: MetadataContentionCoordinator::new(contention_jitter_seed),
+            auto_failover_scan: std::sync::Mutex::new(super::AutoFailoverScanState::default()),
             background,
             ownership_drift: super::worker_readiness::OwnershipDriftTracker::default(),
             shutdown_gate: AtomicBool::new(false),

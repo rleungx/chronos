@@ -1,4 +1,5 @@
 #include <atomic>
+#include <iostream>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -112,6 +113,45 @@ struct TimestampServiceImpl final : TimestampService::Service {
   std::vector<std::string> request_ids;
 };
 
+struct MissingEnsureRouteServiceImpl final : TimelineRouteService::Service {
+  grpc::Status EnsureTimeline(
+      grpc::ServerContext*,
+      const EnsureTimelineRequest*,
+      EnsureTimelineResponse*) override {
+    return grpc::Status::OK;
+  }
+
+  grpc::Status GetTimelineRoute(
+      grpc::ServerContext*,
+      const GetTimelineRouteRequest*,
+      GetTimelineRouteResponse*) override {
+    return grpc::Status::OK;
+  }
+};
+
+struct MissingGetRouteServiceImpl final : TimelineRouteService::Service {
+  grpc::Status EnsureTimeline(
+      grpc::ServerContext*,
+      const EnsureTimelineRequest* request,
+      EnsureTimelineResponse* response) override {
+    auto* route = response->mutable_route();
+    route->set_timeline_key(request->timeline_key());
+    route->set_generator_id(7);
+    route->set_owner_worker_endpoint("127.0.0.1:1");
+    route->set_epoch(3);
+    route->set_route_version(11);
+    route->set_resource_tier(ResourceTier::RESOURCE_TIER_SHARED);
+    return grpc::Status::OK;
+  }
+
+  grpc::Status GetTimelineRoute(
+      grpc::ServerContext*,
+      const GetTimelineRouteRequest*,
+      GetTimelineRouteResponse*) override {
+    return grpc::Status::OK;
+  }
+};
+
 struct RunningServer {
   std::unique_ptr<grpc::Server> server;
   int port;
@@ -157,6 +197,12 @@ void TestAllocateAgainstOwnerEndpoint() {
   if (owner_service.allocate_calls.load() != 1) {
     throw std::runtime_error("owner endpoint was not used for allocation");
   }
+  {
+    std::lock_guard<std::mutex> lock(owner_service.request_ids_mu);
+    if (owner_service.request_ids.size() != 1 || !owner_service.request_ids[0].empty()) {
+      throw std::runtime_error("default allocation should omit client request id");
+    }
+  }
 }
 
 void TestRefreshesStaleRouteAndRetries() {
@@ -171,7 +217,8 @@ void TestRefreshesStaleRouteAndRetries() {
   Client client(
       "127.0.0.1:" + std::to_string(route_server.port),
       "orders.primary",
-      InsecureTransport());
+      InsecureTransport(),
+      true);
   auto ranges = client.AllocateTimestamps(1);
   if (ranges.size() != 1 || ranges.front().start_tso() != 100) {
     throw std::runtime_error("stale route retry failed");
@@ -182,8 +229,44 @@ void TestRefreshesStaleRouteAndRetries() {
   {
     std::lock_guard<std::mutex> lock(owner_service.request_ids_mu);
     if (owner_service.request_ids.size() != 2 ||
+        owner_service.request_ids[0].empty() ||
         owner_service.request_ids[0] != owner_service.request_ids[1]) {
       throw std::runtime_error("retry did not reuse logical request id");
+    }
+  }
+}
+
+void TestIdempotentClientsUseDistinctRequestIds() {
+  auto route = std::make_shared<TimelineRoute>(MakeRoute("unused"));
+  auto owner_service = TimestampServiceImpl(route, false);
+  auto owner_server = StartServer(&owner_service);
+  route->set_owner_worker_endpoint("127.0.0.1:" + std::to_string(owner_server.port));
+
+  auto route_service = RouteServiceImpl(route);
+  auto route_server = StartServer(&route_service);
+
+  Client first(
+      "127.0.0.1:" + std::to_string(route_server.port),
+      "orders.primary",
+      InsecureTransport(),
+      true);
+  Client second(
+      "127.0.0.1:" + std::to_string(route_server.port),
+      "orders.primary",
+      InsecureTransport(),
+      true);
+  auto first_ranges = first.AllocateTimestamps(1);
+  auto second_ranges = second.AllocateTimestamps(1);
+  if (first_ranges.size() != 1 || second_ranges.size() != 1) {
+    throw std::runtime_error("idempotent client allocation failed");
+  }
+  {
+    std::lock_guard<std::mutex> lock(owner_service.request_ids_mu);
+    if (owner_service.request_ids.size() != 2 ||
+        owner_service.request_ids[0].empty() ||
+        owner_service.request_ids[1].empty() ||
+        owner_service.request_ids[0] == owner_service.request_ids[1]) {
+      throw std::runtime_error("independent clients reused a request id");
     }
   }
 }
@@ -201,13 +284,50 @@ void TestRejectsPartialClientIdentity() {
   }
 }
 
+void TestRejectsMissingEnsureRoute() {
+  auto service = MissingEnsureRouteServiceImpl();
+  auto server = StartServer(&service);
+
+  try {
+    Client client(
+        "127.0.0.1:" + std::to_string(server.port),
+        "orders.primary",
+        InsecureTransport());
+    throw std::runtime_error("expected missing ensure route to be rejected");
+  } catch (const std::runtime_error& ex) {
+    if (std::string(ex.what()).find("no route from EnsureTimeline") == std::string::npos) {
+      throw;
+    }
+  }
+}
+
+void TestRejectsMissingRefreshedRoute() {
+  auto service = MissingGetRouteServiceImpl();
+  auto server = StartServer(&service);
+
+  try {
+    Client client(
+        "127.0.0.1:" + std::to_string(server.port),
+        "orders.primary",
+        InsecureTransport());
+    throw std::runtime_error("expected missing refreshed route to be rejected");
+  } catch (const std::runtime_error& ex) {
+    if (std::string(ex.what()).find("no route from GetTimelineRoute") == std::string::npos) {
+      throw;
+    }
+  }
+}
+
 }  // namespace
 
 int main() {
   try {
     TestAllocateAgainstOwnerEndpoint();
     TestRefreshesStaleRouteAndRetries();
+    TestIdempotentClientsUseDistinctRequestIds();
     TestRejectsPartialClientIdentity();
+    TestRejectsMissingEnsureRoute();
+    TestRejectsMissingRefreshedRoute();
     return 0;
   } catch (const std::exception& ex) {
     std::cerr << ex.what() << std::endl;

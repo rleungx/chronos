@@ -24,7 +24,7 @@ wait_for_http() {
   local wait_attempts=$3
   local wait_interval_secs=$4
   for _attempt in $(seq 1 "${wait_attempts}"); do
-    if curl --max-time 2 -fsS "${url}" >/dev/null; then
+    if curl --max-time 2 -fsS "${url}" >/dev/null 2>&1; then
       return 0
     fi
     sleep "${wait_interval_secs}"
@@ -90,6 +90,36 @@ assert_http_metric_present() {
   rm -f "${snapshot}"
 }
 
+assert_http_metric_absent_or_zero() {
+  local url=$1
+  local metric=$2
+  local snapshot
+  snapshot="$(mktemp "${TMPDIR:-/tmp}/chronos-metrics.XXXXXX")" || {
+    echo "failed to create temporary metrics snapshot" >&2
+    return 1
+  }
+  if ! curl -fsS "${url}" >"${snapshot}"; then
+    rm -f "${snapshot}"
+    echo "failed to fetch metrics from ${url}" >&2
+    return 1
+  fi
+  if ! awk -v metric="${metric}" '
+    $0 !~ /^#/ {
+      name = $1
+      if ((name == metric || index(name, metric "{") == 1) && ($2 + 0) != 0) {
+        print
+        bad = 1
+      }
+    }
+    END { exit bad ? 1 : 0 }
+  ' "${snapshot}"; then
+    rm -f "${snapshot}"
+    echo "metric ${metric} must be absent or zero in ${url}" >&2
+    return 1
+  fi
+  rm -f "${snapshot}"
+}
+
 wait_for_etcd() {
   local wait_attempts=$1
   local wait_interval_secs=$2
@@ -138,7 +168,21 @@ derive_local_advertise_endpoint() {
     return 1
   fi
 
-  printf '%s.localhost:%s\n' "${alias}" "${port}"
+  local host
+  if [[ "${service_endpoint}" == \[*\]:* ]]; then
+    host="${service_endpoint%%]:*}]"
+  else
+    host="${service_endpoint%:*}"
+  fi
+
+  case "${host}" in
+    0.0.0.0 | "[::]" | "::")
+      printf '127.0.0.1:%s\n' "${port}"
+      ;;
+    *)
+      printf '%s\n' "${service_endpoint}"
+      ;;
+  esac
 }
 
 extract_metric() {

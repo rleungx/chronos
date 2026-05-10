@@ -1,5 +1,6 @@
 use crate::lifecycle::{TimelineLifecycleContract, TimelineServingReadiness};
 use crate::metadata::TimelineRecord;
+use crate::plane::RequestCancellation;
 use crate::planning::recovered_timeline_floor_tso;
 use crate::{TimelineLifecycleState, TsoError};
 use tokio::time::Instant;
@@ -10,12 +11,24 @@ impl TsoService {
     pub(in crate::service) async fn activate_local_timeline_record(
         &self,
         timeline_key: &str,
+        record: TimelineRecord,
+        revision: u64,
+    ) -> Result<(TimelineRecord, u64), TsoError> {
+        self.activate_local_timeline_record_with_cancellation(timeline_key, record, revision, None)
+            .await
+    }
+
+    pub(in crate::service) async fn activate_local_timeline_record_with_cancellation(
+        &self,
+        timeline_key: &str,
         mut record: TimelineRecord,
         mut revision: u64,
+        cancellation: Option<RequestCancellation>,
     ) -> Result<(TimelineRecord, u64), TsoError> {
         let deadline = Instant::now() + self.metadata_contention_retry_budget();
         let mut contention_retries: u32 = 0;
         loop {
+            Self::check_request_cancellation(cancellation.as_ref())?;
             if !self.is_local_endpoint(&record.route.owner_worker_endpoint) {
                 return Ok((record, revision));
             }
@@ -23,8 +36,11 @@ impl TsoService {
             match lifecycle.serving_readiness() {
                 TimelineServingReadiness::NotReady => return Ok((record, revision)),
                 TimelineServingReadiness::Serving => {
-                    self.ensure_generator_lease(record.route.generator_id)
-                        .await?;
+                    self.ensure_generator_lease_with_cancellation(
+                        record.route.generator_id,
+                        cancellation.clone(),
+                    )
+                    .await?;
                     return Ok((record, revision));
                 }
                 TimelineServingReadiness::RequiresActivation => {
@@ -39,8 +55,11 @@ impl TsoService {
                             return Ok((record, revision));
                         }
                     }
-                    self.ensure_generator_lease(record.route.generator_id)
-                        .await?;
+                    self.ensure_generator_lease_with_cancellation(
+                        record.route.generator_id,
+                        cancellation.clone(),
+                    )
+                    .await?;
                 }
             }
 
@@ -58,7 +77,10 @@ impl TsoService {
                     self.backoff_after_metadata_contention(contention_retries, deadline)
                         .await?;
                     let (latest, latest_revision) = self
-                        .load_timeline_with_singleflight(timeline_key)
+                        .load_timeline_with_singleflight_and_cancellation(
+                            timeline_key,
+                            cancellation.clone(),
+                        )
                         .await?
                         .ok_or_else(|| TsoError::TimelineNotFound {
                             timeline_key: timeline_key.to_owned(),
@@ -84,6 +106,7 @@ mod tests {
         ControlPlaneStore, GeneratorBatchOp, GeneratorLeaseAuthority, GeneratorRecord,
         RouteUpdateSource, TimelineAuthority, TimelineBatchOp, TimelineRecord,
     };
+    use crate::plane::RequestCancellation;
     use crate::{ManualClock, ResourceTier, TimelineRoute, TsoConfig, TsoService};
 
     use super::*;
@@ -241,5 +264,48 @@ mod tests {
         .expect("activation should stop retrying within the request budget")
         .expect_err("contention exhaustion should surface as CasFailed");
         assert!(matches!(result, TsoError::CasFailed));
+    }
+
+    #[tokio::test]
+    async fn activate_local_timeline_record_respects_request_cancellation() {
+        let route = TimelineRoute {
+            timeline_key: "activation.cancelled.timeline".into(),
+            generator_id: 0,
+            owner_worker_endpoint: "127.0.0.1:50052".into(),
+            epoch: 1,
+            route_version: 1,
+            resource_tier: ResourceTier::Shared,
+        };
+        let record = TimelineRecord {
+            schema_version: 1,
+            route: route.clone(),
+            state: TimelineLifecycleState::Recovering,
+            recovery_floor_tso: None,
+            issued_upper_bound: None,
+            last_graceful_issued: None,
+            lease_expire_at_ms: None,
+            updated_at_ms: 0,
+        };
+        let service = TsoService::new(
+            required_test_config(TsoConfig::default()),
+            Arc::new(ManualClock::new(60_000)),
+            Arc::new(AlwaysCasFailActivationStore {
+                record: record.clone(),
+            }),
+        )
+        .unwrap();
+        let cancellation = RequestCancellation::new();
+        cancellation.cancel();
+
+        let result = service
+            .activate_local_timeline_record_with_cancellation(
+                &route.timeline_key,
+                record,
+                1,
+                Some(cancellation),
+            )
+            .await
+            .expect_err("cancelled activation should fail");
+        assert!(matches!(result, TsoError::RequestCancelled));
     }
 }

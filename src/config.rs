@@ -13,6 +13,7 @@ use crate::{ResourceTier, MAX_GENERATORS};
 
 pub const DEFAULT_WORKER_ID: &str = "default-worker";
 pub const DEFAULT_ADVERTISE_ENDPOINT: &str = "default-endpoint:50051";
+pub const DEFAULT_OWNERSHIP_PLAN_ID: &str = "default";
 pub const DEFAULT_BIND_ADDR: &str = "[::1]:50051";
 pub const DEFAULT_METRICS_BIND_ADDR: &str = "127.0.0.1:9898";
 pub const DEFAULT_METADATA_KIND: &str = "memory";
@@ -113,7 +114,7 @@ pub(crate) fn advertise_endpoint_rejected_for_authoritative_metadata(endpoint: &
     let normalized = host
         .trim_matches(|ch| ch == '[' || ch == ']')
         .to_ascii_lowercase();
-    if normalized == "localhost" {
+    if normalized == "localhost" || normalized.ends_with(".localhost") {
         return true;
     }
 
@@ -150,6 +151,7 @@ pub struct TsoConfig {
     pub generator_maintenance_interval_ms: u64,
     pub generator_ownership_modulo: u32,
     pub generator_ownership_remainder: u32,
+    pub ownership_plan_id: String,
     pub worker_id: String,
     pub instance_id: String,
     pub advertise_endpoint: String,
@@ -207,6 +209,7 @@ impl Default for TsoConfig {
             generator_maintenance_interval_ms: 200,
             generator_ownership_modulo: 1,
             generator_ownership_remainder: 0,
+            ownership_plan_id: DEFAULT_OWNERSHIP_PLAN_ID.to_owned(),
             worker_id: DEFAULT_WORKER_ID.to_owned(),
             instance_id: String::new(),
             advertise_endpoint: DEFAULT_ADVERTISE_ENDPOINT.to_owned(),
@@ -349,9 +352,15 @@ impl TsoConfig {
     pub fn validate_authoritative_metadata_runtime_contract(
         &self,
     ) -> Result<(), TsoConfigValidationError> {
-        if self.metadata_kind != "etcd" {
+        if !self.metadata_kind.trim().eq_ignore_ascii_case("etcd") {
             return Ok(());
         }
+        self.validate_authoritative_metadata_runtime_contract_for_etcd()
+    }
+
+    pub fn validate_authoritative_metadata_runtime_contract_for_etcd(
+        &self,
+    ) -> Result<(), TsoConfigValidationError> {
         if self.worker_id == DEFAULT_WORKER_ID {
             return Err(TsoConfigValidationError::Security(
                 "CHRONOS_WORKER_ID must be explicitly set when metadata=etcd".into(),
@@ -362,15 +371,30 @@ impl TsoConfig {
                 "CHRONOS_ADVERTISE_ENDPOINT must be explicitly set when metadata=etcd".into(),
             ));
         }
-        if advertise_endpoint_rejected_for_authoritative_metadata(&self.advertise_endpoint) {
+        let local_authoritative_metadata_allowed =
+            self.security_mode == Some(TsoSecurityMode::DevInsecure) && !self.production_profile;
+        if !local_authoritative_metadata_allowed
+            && advertise_endpoint_rejected_for_authoritative_metadata(&self.advertise_endpoint)
+        {
             return Err(TsoConfigValidationError::Security(
-                "CHRONOS_ADVERTISE_ENDPOINT must not use localhost, a loopback IP, or a wildcard address when metadata=etcd"
+                "CHRONOS_ADVERTISE_ENDPOINT must not use localhost, .localhost, a loopback IP, or a wildcard address when metadata=etcd"
                     .into(),
             ));
         }
         if self.safety_gap_ms == 0 {
             return Err(TsoConfigValidationError::Security(
                 "CHRONOS_SAFETY_GAP_MS must be greater than 0 when metadata=etcd".into(),
+            ));
+        }
+        if self.generator_ownership_modulo > 1
+            && self
+                .ownership_plan_id
+                .trim()
+                .eq_ignore_ascii_case(DEFAULT_OWNERSHIP_PLAN_ID)
+        {
+            return Err(TsoConfigValidationError::Security(
+                "CHRONOS_OWNERSHIP_PLAN_ID must be explicitly set when metadata=etcd and generator ownership is partitioned"
+                    .into(),
             ));
         }
         Ok(())
@@ -458,6 +482,11 @@ impl TsoConfig {
                 modulo: self.generator_ownership_modulo,
                 remainder: self.generator_ownership_remainder,
             });
+        }
+        if self.ownership_plan_id.trim().is_empty() {
+            return Err(TsoConfigValidationError::Security(
+                "ownership_plan_id must not be blank".into(),
+            ));
         }
         if self.max_batch_per_request == 0 {
             return Err(TsoConfigValidationError::ZeroMaxBatchPerRequest);
@@ -1217,6 +1246,17 @@ mod tests {
     }
 
     #[test]
+    fn validate_for_startup_rejects_blank_ownership_plan_id() {
+        let mut config = valid_config();
+        config.ownership_plan_id = "  ".into();
+        assert!(matches!(
+            config.validate_for_startup(),
+            Err(TsoConfigValidationError::Security(message))
+                if message.contains("ownership_plan_id")
+        ));
+    }
+
+    #[test]
     fn validate_for_startup_rejects_zero_runtime_capacity() {
         let mut config = valid_config();
         config.max_timeline_runtime_entries = 0;
@@ -1621,6 +1661,7 @@ mod tests {
             metadata_kind: "etcd".into(),
             worker_id: "worker-a".into(),
             advertise_endpoint: "localhost:50051".into(),
+            security_mode: Some(TsoSecurityMode::Required),
             safety_gap_ms: 1,
             ..valid_config()
         };
@@ -1638,6 +1679,7 @@ mod tests {
                 metadata_kind: "etcd".into(),
                 worker_id: "worker-a".into(),
                 advertise_endpoint: advertise_endpoint.into(),
+                security_mode: Some(TsoSecurityMode::Required),
                 safety_gap_ms: 1,
                 ..valid_config()
             };
@@ -1647,6 +1689,37 @@ mod tests {
                     if message.contains("loopback IP")
             ));
         }
+    }
+
+    #[test]
+    fn authoritative_metadata_runtime_contract_rejects_localhost_subdomain() {
+        let config = TsoConfig {
+            metadata_kind: "etcd".into(),
+            worker_id: "worker-a".into(),
+            advertise_endpoint: "chronos-a.localhost:50051".into(),
+            security_mode: Some(TsoSecurityMode::Required),
+            safety_gap_ms: 1,
+            ..valid_config()
+        };
+        assert!(matches!(
+            config.validate_authoritative_metadata_runtime_contract(),
+            Err(TsoConfigValidationError::Security(message))
+                if message.contains(".localhost")
+        ));
+    }
+
+    #[test]
+    fn authoritative_metadata_runtime_contract_accepts_dev_insecure_loopback_for_local_tests() {
+        let config = TsoConfig {
+            metadata_kind: "etcd".into(),
+            worker_id: "worker-a".into(),
+            advertise_endpoint: "127.0.0.1:50051".into(),
+            safety_gap_ms: 1,
+            ..valid_config()
+        };
+        assert!(config
+            .validate_authoritative_metadata_runtime_contract()
+            .is_ok());
     }
 
     #[test]
@@ -1663,6 +1736,42 @@ mod tests {
             Err(TsoConfigValidationError::Security(message))
                 if message.contains("CHRONOS_SAFETY_GAP_MS")
         ));
+    }
+
+    #[test]
+    fn authoritative_metadata_runtime_contract_rejects_default_partitioned_ownership_plan() {
+        let config = TsoConfig {
+            metadata_kind: "etcd".into(),
+            worker_id: "worker-a".into(),
+            advertise_endpoint: "10.0.0.10:50051".into(),
+            safety_gap_ms: 1,
+            generator_ownership_modulo: 2,
+            generator_ownership_remainder: 0,
+            ownership_plan_id: " Default ".into(),
+            ..valid_config()
+        };
+        assert!(matches!(
+            config.validate_authoritative_metadata_runtime_contract(),
+            Err(TsoConfigValidationError::Security(message))
+                if message.contains("CHRONOS_OWNERSHIP_PLAN_ID")
+        ));
+    }
+
+    #[test]
+    fn authoritative_metadata_runtime_contract_accepts_explicit_partitioned_ownership_plan() {
+        let config = TsoConfig {
+            metadata_kind: "etcd".into(),
+            worker_id: "worker-a".into(),
+            advertise_endpoint: "10.0.0.10:50051".into(),
+            safety_gap_ms: 1,
+            generator_ownership_modulo: 2,
+            generator_ownership_remainder: 0,
+            ownership_plan_id: "prod-2026-05-10".into(),
+            ..valid_config()
+        };
+        assert!(config
+            .validate_authoritative_metadata_runtime_contract()
+            .is_ok());
     }
 
     #[test]

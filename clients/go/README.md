@@ -11,7 +11,7 @@ Support level: Primary.
 - `client.AllocateTimestamps(ctx, count)`
 
 Advanced configuration should use `NewWithOptions(...)` and package options such as
-`WithDesiredResourceTier(...)` and `WithRequestTimeoutMs(...)`.
+`WithDesiredResourceTier(...)`, `WithRequestTimeoutMs(...)`, and `WithIdempotency(...)`.
 
 ## Build and test
 
@@ -35,7 +35,7 @@ import (
 func main() {
     ctx := context.Background()
 
-    client, err := chronos.New(ctx, "127.0.0.1:50051", "orders.primary")
+    client, err := chronos.NewWithOptions(ctx, "127.0.0.1:50051", "orders.primary", chronos.WithInsecureTransport())
     if err != nil {
         log.Fatal(err)
     }
@@ -56,4 +56,6 @@ func main() {
 - The client fetches and caches the current route internally
 - Stale-route errors are handled with one refresh-and-retry cycle
 - Route refresh reconnects allocation traffic to the current owner endpoint
+- Allocation request-record idempotency is disabled by default; use `WithIdempotency(true)`
+  when callers need replay protection for ambiguous retries
 - Other RPC failures are returned to the caller

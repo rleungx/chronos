@@ -2,9 +2,10 @@ use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::Arc;
-use std::sync::{Mutex as StdMutex, MutexGuard as StdMutexGuard};
+use std::sync::{LazyLock, Mutex as StdMutex, MutexGuard as StdMutexGuard};
 
 use dashmap::DashMap;
+use prometheus::IntCounter;
 use tokio::sync::Mutex;
 
 use crate::recovery::record_recovery_event;
@@ -14,6 +15,18 @@ use super::TimelineState;
 
 const TIMELINE_RUNTIME_SHARD_AMOUNT: usize = 64;
 const EVICTION_CANDIDATE_BATCH_LIMIT: usize = 128;
+const ACCESS_TICK_SAMPLE_MASK: usize = 0x0f;
+
+static CACHE_EVENT_HIT: LazyLock<IntCounter> =
+    LazyLock::new(|| metrics::TSO_TIMELINE_RUNTIME_CACHE_EVENTS_TOTAL.with_label_values(&["hit"]));
+static CACHE_EVENT_MISS: LazyLock<IntCounter> =
+    LazyLock::new(|| metrics::TSO_TIMELINE_RUNTIME_CACHE_EVENTS_TOTAL.with_label_values(&["miss"]));
+static CACHE_EVENT_SATURATED: LazyLock<IntCounter> = LazyLock::new(|| {
+    metrics::TSO_TIMELINE_RUNTIME_CACHE_EVENTS_TOTAL.with_label_values(&["saturated"])
+});
+static CACHE_EVENT_EVICTED_IDLE: LazyLock<IntCounter> = LazyLock::new(|| {
+    metrics::TSO_TIMELINE_RUNTIME_CACHE_EVENTS_TOTAL.with_label_values(&["evicted_idle"])
+});
 
 pub(super) struct TimelineCacheStore {
     timelines: DashMap<String, TimelineCacheEntry>,
@@ -27,6 +40,7 @@ pub(super) struct TimelineCacheStore {
 struct TimelineCacheEntry {
     timeline: Arc<Mutex<TimelineState>>,
     last_access_tick: AtomicU64,
+    access_samples: AtomicUsize,
 }
 
 struct CapacityState {
@@ -56,19 +70,12 @@ impl TimelineCacheStore {
     pub(super) fn timeline_handle(&self, timeline_key: &str) -> Option<Arc<Mutex<TimelineState>>> {
         match self.timelines.get(timeline_key) {
             Some(entry) => {
-                let access_tick = self.next_access_tick();
-                metrics::TSO_TIMELINE_RUNTIME_CACHE_EVENTS_TOTAL
-                    .with_label_values(&["hit"])
-                    .inc();
-                entry
-                    .last_access_tick
-                    .store(access_tick, AtomicOrdering::Release);
+                CACHE_EVENT_HIT.inc();
+                self.touch_entry(&entry, false);
                 Some(entry.timeline.clone())
             }
             None => {
-                metrics::TSO_TIMELINE_RUNTIME_CACHE_EVENTS_TOTAL
-                    .with_label_values(&["miss"])
-                    .inc();
+                CACHE_EVENT_MISS.inc();
                 None
             }
         }
@@ -83,33 +90,21 @@ impl TimelineCacheStore {
         F: FnOnce() -> Arc<Mutex<TimelineState>>,
     {
         if let Some(existing) = self.timelines.get(timeline_key) {
-            let access_tick = self.next_access_tick();
-            metrics::TSO_TIMELINE_RUNTIME_CACHE_EVENTS_TOTAL
-                .with_label_values(&["hit"])
-                .inc();
-            existing
-                .last_access_tick
-                .store(access_tick, AtomicOrdering::Release);
+            CACHE_EVENT_HIT.inc();
+            self.touch_entry(&existing, false);
             return Ok(existing.timeline.clone());
         }
 
-        metrics::TSO_TIMELINE_RUNTIME_CACHE_EVENTS_TOTAL
-            .with_label_values(&["miss"])
-            .inc();
+        CACHE_EVENT_MISS.inc();
 
         let mut capacity = self.capacity_lock();
         if let Some(existing) = self.timelines.get(timeline_key) {
-            let access_tick = self.next_access_tick();
-            existing
-                .last_access_tick
-                .store(access_tick, AtomicOrdering::Release);
+            self.touch_entry(&existing, false);
             return Ok(existing.timeline.clone());
         }
 
         if self.timeline_count() >= self.max_entries && !self.evict_one_idle_entry(&mut capacity) {
-            metrics::TSO_TIMELINE_RUNTIME_CACHE_EVENTS_TOTAL
-                .with_label_values(&["saturated"])
-                .inc();
+            CACHE_EVENT_SATURATED.inc();
             return Err(TsoError::TimelineRuntimeCacheSaturated {
                 timeline_key: timeline_key.to_owned(),
                 max_entries: self.max_entries,
@@ -130,6 +125,7 @@ impl TimelineCacheStore {
                 entry.insert(TimelineCacheEntry {
                     timeline: timeline.clone(),
                     last_access_tick: AtomicU64::new(access_tick),
+                    access_samples: AtomicUsize::new(1),
                 });
                 self.entry_count.fetch_add(1, AtomicOrdering::AcqRel);
                 self.set_entry_count_metric();
@@ -146,13 +142,12 @@ impl TimelineCacheStore {
     ) -> Result<(), TsoError> {
         if let Some(mut existing) = self.timelines.get_mut(&timeline_key) {
             let access_tick = self.next_access_tick();
-            metrics::TSO_TIMELINE_RUNTIME_CACHE_EVENTS_TOTAL
-                .with_label_values(&["hit"])
-                .inc();
+            CACHE_EVENT_HIT.inc();
             existing.timeline = timeline;
             existing
                 .last_access_tick
                 .store(access_tick, AtomicOrdering::Release);
+            existing.access_samples.store(1, AtomicOrdering::Release);
             return Ok(());
         }
 
@@ -163,13 +158,12 @@ impl TimelineCacheStore {
             existing
                 .last_access_tick
                 .store(access_tick, AtomicOrdering::Release);
+            existing.access_samples.store(1, AtomicOrdering::Release);
             return Ok(());
         }
 
         if self.timeline_count() >= self.max_entries && !self.evict_one_idle_entry(&mut capacity) {
-            metrics::TSO_TIMELINE_RUNTIME_CACHE_EVENTS_TOTAL
-                .with_label_values(&["saturated"])
-                .inc();
+            CACHE_EVENT_SATURATED.inc();
             return Err(TsoError::TimelineRuntimeCacheSaturated {
                 timeline_key,
                 max_entries: self.max_entries,
@@ -184,16 +178,16 @@ impl TimelineCacheStore {
                     .get()
                     .last_access_tick
                     .store(access_tick, AtomicOrdering::Release);
+                entry.get().access_samples.store(1, AtomicOrdering::Release);
             }
             dashmap::mapref::entry::Entry::Vacant(entry) => {
-                metrics::TSO_TIMELINE_RUNTIME_CACHE_EVENTS_TOTAL
-                    .with_label_values(&["miss"])
-                    .inc();
+                CACHE_EVENT_MISS.inc();
                 let access_tick = self.next_access_tick();
                 let timeline_key = entry.key().clone();
                 entry.insert(TimelineCacheEntry {
                     timeline,
                     last_access_tick: AtomicU64::new(access_tick),
+                    access_samples: AtomicUsize::new(1),
                 });
                 self.entry_count.fetch_add(1, AtomicOrdering::AcqRel);
                 self.set_entry_count_metric();
@@ -224,6 +218,20 @@ impl TimelineCacheStore {
 
     fn next_access_tick(&self) -> u64 {
         self.access_counter.fetch_add(1, AtomicOrdering::Relaxed)
+    }
+
+    fn touch_entry(&self, entry: &TimelineCacheEntry, force: bool) {
+        if !force
+            && entry.access_samples.fetch_add(1, AtomicOrdering::Relaxed) & ACCESS_TICK_SAMPLE_MASK
+                != 0
+        {
+            return;
+        }
+
+        let access_tick = self.next_access_tick();
+        entry
+            .last_access_tick
+            .store(access_tick, AtomicOrdering::Release);
     }
 
     fn set_entry_count_metric(&self) {
@@ -344,9 +352,7 @@ impl TimelineCacheStore {
             if removed {
                 capacity.eviction_candidates.extend(deferred.drain(..));
                 self.entry_count.fetch_sub(1, AtomicOrdering::AcqRel);
-                metrics::TSO_TIMELINE_RUNTIME_CACHE_EVENTS_TOTAL
-                    .with_label_values(&["evicted_idle"])
-                    .inc();
+                CACHE_EVENT_EVICTED_IDLE.inc();
                 self.set_entry_count_metric();
                 return true;
             }

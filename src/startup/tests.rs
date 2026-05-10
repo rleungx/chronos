@@ -642,7 +642,7 @@ fn startup_preflight_accepts_explicit_routable_advertise_endpoint_for_etcd_metad
 }
 
 #[test]
-fn startup_preflight_accepts_localhost_subdomain_advertise_endpoint_for_etcd_metadata() {
+fn startup_preflight_rejects_localhost_subdomain_advertise_endpoint_for_etcd_metadata() {
     let _guard = ENV_LOCK.lock().unwrap();
     clear_tso_env();
     let config = TsoConfig {
@@ -651,6 +651,22 @@ fn startup_preflight_accepts_localhost_subdomain_advertise_endpoint_for_etcd_met
         worker_id: "worker-a".into(),
         advertise_endpoint: "chronos-soak.localhost:50051".into(),
         ..explicit_required_config()
+    };
+    let error = validate_startup_preflight(&etcd_startup_config(config, "/chronos")).unwrap_err();
+    assert!(error.to_string().contains(".localhost"));
+}
+
+#[test]
+fn startup_preflight_accepts_loopback_advertise_endpoint_for_dev_insecure_local_etcd_metadata() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    clear_tso_env();
+    let bind_addr: SocketAddr = "127.0.0.1:50051".parse().unwrap();
+    let config = TsoConfig {
+        metadata_kind: "etcd".into(),
+        etcd_endpoints: vec!["127.0.0.1:2379".into()],
+        worker_id: "worker-a".into(),
+        safety_gap_ms: 1,
+        ..explicit_dev_insecure_local_config(bind_addr)
     };
     validate_startup_preflight(&etcd_startup_config(config, "/chronos")).unwrap();
 }
@@ -1281,6 +1297,9 @@ fn load_tso_config_reads_security_mode_and_surface_inputs() {
         env::set_var("CHRONOS_AUTO_FAILOVER_ENABLED", "true");
         env::set_var("CHRONOS_AUTO_FAILOVER_INTERVAL_MS", "2500");
         env::set_var("CHRONOS_AUTO_FAILOVER_BATCH_SIZE", "7");
+        env::set_var("CHRONOS_MAX_TIMELINE_PROXY_LANES", "8192");
+        env::set_var("CHRONOS_MAX_TIMELINE_RUNTIME_ENTRIES", "16384");
+        env::set_var("CHRONOS_MAX_CONCURRENT_TIMELINE_LOADS", "128");
         env::set_var(
             "CHRONOS_GRPC_CONTROL_CERT_ALLOWLIST",
             "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
@@ -1328,6 +1347,9 @@ fn load_tso_config_reads_security_mode_and_surface_inputs() {
     assert!(config.auto_failover_enabled);
     assert_eq!(config.auto_failover_interval_ms, 2500);
     assert_eq!(config.auto_failover_batch_size, 7);
+    assert_eq!(config.max_timeline_proxy_lanes, 8192);
+    assert_eq!(config.max_timeline_runtime_entries, 16384);
+    assert_eq!(config.max_concurrent_timeline_loads, 128);
 }
 
 #[test]
@@ -1473,7 +1495,7 @@ fn startup_preflight_logger_uses_validated_plan_instead_of_rederiving_state() {
 }
 
 #[test]
-fn load_tso_config_applies_production_profile_without_exposing_internal_overrides() {
+fn load_tso_config_applies_production_profile_capacity_defaults() {
     let _guard = ENV_LOCK.lock().unwrap();
     clear_tso_env();
     unsafe { env::set_var("CHRONOS_PROFILE", "production") };
@@ -1504,6 +1526,40 @@ fn load_tso_config_applies_production_profile_without_exposing_internal_override
 }
 
 #[test]
+fn load_tso_config_accepts_production_capacity_env_overrides() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    clear_tso_env();
+    unsafe {
+        env::set_var("CHRONOS_PROFILE", "production");
+        env::set_var("CHRONOS_MAX_TIMELINE_PROXY_LANES", "12288");
+        env::set_var("CHRONOS_MAX_TIMELINE_RUNTIME_ENTRIES", "24576");
+        env::set_var("CHRONOS_MAX_CONCURRENT_TIMELINE_LOADS", "192");
+    }
+
+    let config = load_tso_config().unwrap();
+    assert_eq!(config.max_timeline_proxy_lanes, 12288);
+    assert_eq!(config.max_timeline_runtime_entries, 24576);
+    assert_eq!(config.max_concurrent_timeline_loads, 192);
+}
+
+#[test]
+fn load_tso_config_accepts_generator_ownership_partition_env() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    clear_tso_env();
+
+    unsafe {
+        env::set_var("CHRONOS_OWNERSHIP_PLAN_ID", "scale-2026-05-10");
+        env::set_var("CHRONOS_GENERATOR_OWNERSHIP_MODULO", "4");
+        env::set_var("CHRONOS_GENERATOR_OWNERSHIP_REMAINDER", "2");
+    }
+
+    let config = load_tso_config().unwrap();
+    assert_eq!(config.ownership_plan_id, "scale-2026-05-10");
+    assert_eq!(config.generator_ownership_modulo, 4);
+    assert_eq!(config.generator_ownership_remainder, 2);
+}
+
+#[test]
 fn load_tso_config_rejects_removed_internal_tuning_env_vars() {
     let _guard = ENV_LOCK.lock().unwrap();
 
@@ -1524,15 +1580,19 @@ fn load_tso_config_rejects_removed_internal_tuning_env_vars() {
 }
 
 #[test]
-fn load_startup_config_rejects_removed_internal_tuning_env_vars() {
+fn load_startup_config_accepts_production_capacity_env_vars() {
     let _guard = ENV_LOCK.lock().unwrap();
     clear_tso_env();
-    unsafe { env::set_var("CHRONOS_MAX_TIMELINE_RUNTIME_ENTRIES", "123") };
+    unsafe {
+        env::set_var("CHRONOS_MAX_TIMELINE_PROXY_LANES", "8192");
+        env::set_var("CHRONOS_MAX_TIMELINE_RUNTIME_ENTRIES", "16384");
+        env::set_var("CHRONOS_MAX_CONCURRENT_TIMELINE_LOADS", "128");
+    }
 
-    let error = load_startup_config().unwrap_err();
-    let message = error.to_string();
-    assert!(message.contains("unsupported startup tuning env var(s)"));
-    assert!(message.contains("CHRONOS_MAX_TIMELINE_RUNTIME_ENTRIES"));
+    let startup = load_startup_config().unwrap();
+    assert_eq!(startup.config.max_timeline_proxy_lanes, 8192);
+    assert_eq!(startup.config.max_timeline_runtime_entries, 16384);
+    assert_eq!(startup.config.max_concurrent_timeline_loads, 128);
 }
 
 #[tokio::test]
@@ -2356,6 +2416,23 @@ fn startup_preflight_validates_etcd_endpoints_from_typed_metadata() {
     );
 
     validate_startup_preflight(&startup).unwrap();
+}
+
+#[test]
+fn startup_preflight_enforces_etcd_runtime_contract_from_typed_metadata() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    clear_tso_env();
+    let startup = super::config::LoadedStartupConfig::new(
+        explicit_required_config(),
+        super::config::StartupMetadata::Etcd(super::config::EtcdStartupConfig::new(
+            vec!["127.0.0.1:2379".into()],
+            "/chronos",
+        )),
+        super::config::StartupLoggingConfig::default(),
+    );
+
+    let error = validate_startup_preflight(&startup).unwrap_err();
+    assert!(error.to_string().contains("CHRONOS_WORKER_ID"));
 }
 
 #[test]

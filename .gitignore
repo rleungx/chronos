@@ -1,5 +1,6 @@
 target/
 .cache/
+artifacts/
 clients/java/.gradle/
 clients/java/build/
 clients/java/.project

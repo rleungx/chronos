@@ -12,10 +12,11 @@ pub use identity::InstanceIdentityLease;
 pub use memory::MemoryMetadataStore;
 pub use types::{
     AllocationRequestFingerprint, AllocationResponseRecord, ControlPlaneStore, GeneratorBatchOp,
-    GeneratorLeaseAuthority, GeneratorRecord, RequestRecord, RequestRecordAuthority,
-    RequestRecordState, RouteUpdateSignal, RouteUpdateSource, TimelineAuthority, TimelineBatchOp,
-    TimelineFilterRecord, TimelineFilterRecordListPage, TimelineRecord, TimelineRecordListPage,
-    TimelineRouteRecord, CURRENT_METADATA_SCHEMA_VERSION,
+    GeneratorLeaseAuthority, GeneratorRecord, OwnershipPlanMember, OwnershipPlanRecord,
+    RequestRecord, RequestRecordAuthority, RequestRecordState, RouteUpdateSignal,
+    RouteUpdateSource, TimelineAuthority, TimelineBatchOp, TimelineFilterRecord,
+    TimelineFilterRecordListPage, TimelineRecord, TimelineRecordListPage, TimelineRouteRecord,
+    CURRENT_METADATA_SCHEMA_VERSION,
 };
 
 #[async_trait]

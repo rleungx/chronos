@@ -7,6 +7,7 @@ Support level: Repository-local implementation.
 ## Public shape
 
 - `client = new Client(addr, timelineKey)`
+- `client = new Client(addr, timelineKey, transportConfig, idempotencyEnabled)`
 - `client.allocateTimestamps(count)`
 - `client.close()`
 
@@ -24,6 +25,9 @@ gradle test
 - The client fetches and caches the current route internally
 - Stale-route errors are handled with one refresh-and-retry cycle
 - Route refresh reconnects allocation traffic to the current owner endpoint
+- Allocation request-record idempotency is disabled by default; use the constructor overload with
+  `idempotencyEnabled=true` when callers need replay protection
+- Normal allocation calls are safe to run concurrently on one client instance
 - Other RPC failures are returned to the caller
 
 ## Files
@@ -34,7 +38,11 @@ gradle test
 ## Minimal usage
 
 ```java
-try (Client client = new Client("127.0.0.1:50051", "orders.primary")) {
+try (Client client =
+    new Client(
+        "127.0.0.1:50051",
+        "orders.primary",
+        Client.TransportConfig.secure().withPlaintext(true))) {
   var ranges = client.allocateTimestamps(1);
   System.out.println("tso=" + ranges.get(0).getStartTso());
 }

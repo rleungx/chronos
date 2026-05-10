@@ -103,8 +103,8 @@ fn free_loopback_addr() -> SocketAddr {
     addr
 }
 
-fn local_advertise_endpoint(alias: &str, bind_addr: SocketAddr) -> String {
-    format!("{alias}.localhost:{}", bind_addr.port())
+fn local_advertise_endpoint(_alias: &str, bind_addr: SocketAddr) -> String {
+    bind_addr.to_string()
 }
 
 fn timeline_key(config: &BenchConfig) -> String {
@@ -858,6 +858,10 @@ async fn main() -> AppResult<()> {
             "allocate_latency_p99_us={}",
             percentile(&allocate_latencies, 0.99)
         );
+        println!(
+            "allocate_latency_p999_us={}",
+            percentile(&allocate_latencies, 0.999)
+        );
         println!("route_refresh_total={}", stats.route_refresh_total);
         println!(
             "route_refresh_p50_us={}",
@@ -866,6 +870,14 @@ async fn main() -> AppResult<()> {
         println!(
             "route_refresh_p95_us={}",
             percentile(&refresh_latencies, 0.95)
+        );
+        println!(
+            "route_refresh_p99_us={}",
+            percentile(&refresh_latencies, 0.99)
+        );
+        println!(
+            "route_refresh_p999_us={}",
+            percentile(&refresh_latencies, 0.999)
         );
         println!("failover_attempts_total={}", stats.failover_attempts_total);
         println!("failover_success_total={}", stats.failover_success_total);
@@ -881,6 +893,14 @@ async fn main() -> AppResult<()> {
         println!(
             "failover_latency_p95_us={}",
             percentile(&failover_latencies, 0.95)
+        );
+        println!(
+            "failover_latency_p99_us={}",
+            percentile(&failover_latencies, 0.99)
+        );
+        println!(
+            "failover_latency_p999_us={}",
+            percentile(&failover_latencies, 0.999)
         );
         println!(
             "first_success_after_kill_ms={}",

@@ -4,6 +4,11 @@ use prometheus::{
 };
 use std::sync::LazyLock;
 
+const LATENCY_BUCKETS_SECONDS: &[f64] = &[
+    0.000001, 0.0000025, 0.000005, 0.00001, 0.000025, 0.00005, 0.0001, 0.00025, 0.0005, 0.001,
+    0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+];
+
 fn create_metric<T>(result: Result<T, prometheus::Error>, metric_name: &str) -> T {
     result.unwrap_or_else(|error| panic!("failed to create metric {metric_name}: {error}"))
 }
@@ -34,7 +39,12 @@ fn register_int_gauge_metric(name: &'static str, help: &'static str) -> IntGauge
 
 fn register_histogram_metric(name: &'static str, help: &'static str) -> Histogram {
     register_metric(
-        create_metric(Histogram::with_opts(HistogramOpts::new(name, help)), name),
+        create_metric(
+            Histogram::with_opts(
+                HistogramOpts::new(name, help).buckets(LATENCY_BUCKETS_SECONDS.to_vec()),
+            ),
+            name,
+        ),
         name,
     )
 }
@@ -68,7 +78,10 @@ fn register_histogram_vec_metric(
 ) -> HistogramVec {
     register_metric(
         create_metric(
-            HistogramVec::new(HistogramOpts::new(name, help), labels),
+            HistogramVec::new(
+                HistogramOpts::new(name, help).buckets(LATENCY_BUCKETS_SECONDS.to_vec()),
+                labels,
+            ),
             name,
         ),
         name,
@@ -175,6 +188,13 @@ pub static TSO_METADATA_ERRORS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(||
         "tso_metadata_errors_total",
         "Metadata store request errors",
         &["op"],
+    )
+});
+pub static TSO_METADATA_CONFLICTS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec_metric(
+        "tso_metadata_conflicts_total",
+        "Metadata compare-and-swap or create-if-absent conflicts",
+        &["op", "kind"],
     )
 });
 pub static TSO_MAINTENANCE_TRACKED_TIMELINES: LazyLock<IntGauge> = LazyLock::new(|| {

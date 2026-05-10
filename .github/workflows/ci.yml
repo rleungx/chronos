@@ -273,6 +273,54 @@ jobs:
         if: always()
         run: make etcd-reset
 
+  scale-real-etcd:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    if: github.event_name == 'pull_request' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    env:
+      CHRONOS_BUILD_COMMIT: ${{ github.sha }}
+      RUST_BACKTRACE: 1
+      CHRONOS_ARTIFACT_DIR: ${{ github.workspace }}/artifacts
+      CHRONOS_KEEP_ARTIFACTS_ON_SUCCESS: 1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.94.0
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+      - name: Run etcd-backed scale benchmark
+        run: make test-scale-bench
+      - name: Publish scale summary
+        if: always()
+        run: |
+          if [ -f artifacts/scale/summary.txt ]; then
+            {
+              echo '## Scale benchmark summary'
+              echo ''
+              cat artifacts/scale/summary.txt
+              echo ''
+              echo '### Scale artifact files'
+              ls -1 artifacts/scale
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Upload scale artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chronos-scale-artifacts
+          path: artifacts/scale/
+          if-no-files-found: error
+          retention-days: ${{ env.CHRONOS_ARTIFACT_RETENTION_DAYS }}
+      - name: Verify scale evidence
+        if: always()
+        run: bash hack/verify-evidence.sh artifacts scale
+      - name: Reset etcd after scale job
+        if: always()
+        run: make etcd-reset
+
   rebalance-real-etcd:
     runs-on: ubuntu-latest
     timeout-minutes: 45

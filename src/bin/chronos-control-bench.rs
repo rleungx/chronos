@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::env;
 use std::error::Error;
 use std::sync::Arc;
@@ -8,8 +8,7 @@ use dashmap::DashMap;
 use prost::Message;
 use tokio::sync::Barrier;
 use tonic::transport::Channel;
-use tonic::Request;
-use tonic::Status;
+use tonic::{Code, Request, Status};
 
 use chronos::proto::v1::{
     timeline_control_service_client::TimelineControlServiceClient,
@@ -23,7 +22,7 @@ use chronos::proto::v1::{
 
 type AppResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
-const REBALANCE_ALLOCATE_RETRY_ATTEMPTS: usize = 4;
+const REBALANCE_ALLOCATE_RETRY_ATTEMPTS: usize = 8;
 const REBALANCE_ALLOCATE_RETRY_BACKOFF_MS: u64 = 25;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -49,6 +48,7 @@ struct RouteSnapshot {
     generator_id: u32,
     epoch: u64,
     route_version: u64,
+    owner_worker_endpoint: String,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -74,6 +74,10 @@ struct BenchConfig {
     allocate_batch: u32,
     transfer_interval_ms: u64,
     transfer_target_generators: Vec<u32>,
+    transfer_target_owner_endpoints: Vec<String>,
+    route_to_owners: bool,
+    allocate_request_timeout_ms: u64,
+    idempotency_enabled: bool,
 }
 
 #[derive(Default)]
@@ -134,6 +138,33 @@ where
 
 fn env_or_string(key: &str, default: &str) -> String {
     env::var(key).unwrap_or_else(|_| default.to_owned())
+}
+
+fn normalize_endpoint(endpoint: &str) -> String {
+    let endpoint = endpoint.trim();
+    if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
+        endpoint.to_owned()
+    } else {
+        format!("http://{endpoint}")
+    }
+}
+
+fn normalize_endpoint_or_fallback(endpoint: &str, fallback_endpoint: &str) -> String {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        fallback_endpoint.to_owned()
+    } else {
+        normalize_endpoint(endpoint)
+    }
+}
+
+fn parse_csv_string_list(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
 }
 
 fn parse_boolish(value: &str) -> AppResult<bool> {
@@ -204,7 +235,10 @@ fn parse_csv_u32_list(value: &str) -> AppResult<Vec<u32>> {
 }
 
 fn load_config() -> AppResult<BenchConfig> {
-    let endpoint = env_or_string("CHRONOS_CONTROL_BENCH_ENDPOINT", "http://[::1]:50051");
+    let endpoint = normalize_endpoint(&env_or_string(
+        "CHRONOS_CONTROL_BENCH_ENDPOINT",
+        "http://[::1]:50051",
+    ));
     let timeline_namespace = env_or_string("CHRONOS_CONTROL_BENCH_NAMESPACE", "controlbench");
     let scenario = parse_scenario(&env_or_string(
         "CHRONOS_CONTROL_BENCH_SCENARIO",
@@ -229,6 +263,18 @@ fn load_config() -> AppResult<BenchConfig> {
         "CHRONOS_CONTROL_BENCH_TRANSFER_TARGET_GENERATORS",
         "0,1,2,3",
     ))?;
+    let transfer_target_owner_endpoints = parse_csv_string_list(&env_or_string(
+        "CHRONOS_CONTROL_BENCH_TRANSFER_TARGET_OWNER_ENDPOINTS",
+        "",
+    ));
+    let route_to_owners =
+        parse_boolish(&env_or_string("CHRONOS_CONTROL_BENCH_ROUTE_TO_OWNERS", "0"))?;
+    let allocate_request_timeout_ms = env_or(
+        "CHRONOS_CONTROL_BENCH_ALLOCATE_REQUEST_TIMEOUT_MS",
+        10000u64,
+    );
+    let idempotency_enabled =
+        parse_boolish(&env_or_string("CHRONOS_CONTROL_BENCH_IDEMPOTENCY", "0"))?;
 
     Ok(BenchConfig {
         endpoint,
@@ -250,6 +296,10 @@ fn load_config() -> AppResult<BenchConfig> {
         allocate_batch,
         transfer_interval_ms,
         transfer_target_generators,
+        transfer_target_owner_endpoints,
+        route_to_owners,
+        allocate_request_timeout_ms,
+        idempotency_enabled,
     })
 }
 
@@ -259,6 +309,7 @@ fn route_snapshot_from_proto(route: TimelineRoute) -> RouteSnapshot {
         generator_id: route.generator_id,
         epoch: route.epoch,
         route_version: route.route_version,
+        owner_worker_endpoint: route.owner_worker_endpoint,
     }
 }
 
@@ -298,6 +349,115 @@ async fn connect_channel(endpoint: String) -> AppResult<Channel> {
         .map_err(|error| format!("failed to connect bench endpoint {endpoint}: {error}").into())
 }
 
+async fn ensure_timestamp_client(
+    clients: &mut BTreeMap<String, TimestampServiceClient<Channel>>,
+    endpoint: &str,
+) -> AppResult<()> {
+    if !clients.contains_key(endpoint) {
+        let channel = connect_channel(endpoint.to_owned()).await?;
+        clients.insert(endpoint.to_owned(), TimestampServiceClient::new(channel));
+    }
+    Ok(())
+}
+
+async fn ensure_control_client(
+    clients: &mut BTreeMap<String, TimelineControlServiceClient<Channel>>,
+    endpoint: &str,
+) -> AppResult<()> {
+    if !clients.contains_key(endpoint) {
+        let channel = connect_channel(endpoint.to_owned()).await?;
+        clients.insert(
+            endpoint.to_owned(),
+            TimelineControlServiceClient::new(channel),
+        );
+    }
+    Ok(())
+}
+
+fn allocation_endpoint(
+    route: &RouteSnapshot,
+    fallback_endpoint: &str,
+    route_to_owners: bool,
+) -> String {
+    if route_to_owners {
+        normalize_endpoint_or_fallback(&route.owner_worker_endpoint, fallback_endpoint)
+    } else {
+        fallback_endpoint.to_owned()
+    }
+}
+
+fn target_control_endpoint(
+    target_owner_endpoint: Option<&str>,
+    fallback_endpoint: &str,
+    route_to_owners: bool,
+) -> String {
+    if route_to_owners {
+        target_owner_endpoint
+            .map(|endpoint| normalize_endpoint_or_fallback(endpoint, fallback_endpoint))
+            .unwrap_or_else(|| fallback_endpoint.to_owned())
+    } else {
+        fallback_endpoint.to_owned()
+    }
+}
+
+fn configured_allocation_endpoints(config: &BenchConfig, routes: &[RouteSnapshot]) -> Vec<String> {
+    let mut endpoints = BTreeSet::new();
+    for route in routes {
+        endpoints.insert(allocation_endpoint(
+            route,
+            &config.endpoint,
+            config.route_to_owners,
+        ));
+    }
+    if config.route_to_owners {
+        for endpoint in &config.transfer_target_owner_endpoints {
+            endpoints.insert(normalize_endpoint(endpoint));
+        }
+    }
+    endpoints.into_iter().collect()
+}
+
+fn route_owner_endpoint_for_generator(
+    transfer_target_owner_endpoints: &[String],
+    generator_id: u32,
+) -> Option<String> {
+    if transfer_target_owner_endpoints.is_empty() {
+        None
+    } else {
+        let index = generator_id as usize % transfer_target_owner_endpoints.len();
+        Some(transfer_target_owner_endpoints[index].clone())
+    }
+}
+
+fn endpoint_key(endpoint: &str) -> String {
+    normalize_endpoint(endpoint)
+        .trim_end_matches('/')
+        .to_ascii_lowercase()
+}
+
+fn next_target_owner_endpoint(
+    current_owner_endpoint: &str,
+    transfer_target_owner_endpoints: &[String],
+) -> Option<String> {
+    if transfer_target_owner_endpoints.is_empty() {
+        return None;
+    }
+
+    let current_key = endpoint_key(current_owner_endpoint);
+    let next_index = transfer_target_owner_endpoints
+        .iter()
+        .position(|endpoint| endpoint_key(endpoint) == current_key)
+        .map(|index| {
+            if transfer_target_owner_endpoints.len() == 1 {
+                index
+            } else {
+                (index + 1) % transfer_target_owner_endpoints.len()
+            }
+        })
+        .unwrap_or(0);
+    Some(transfer_target_owner_endpoints[next_index].clone())
+}
+
 async fn list_timeline_statuses_page(
     client: &mut TimelineStatusServiceClient<Channel>,
     filters: &StatusFilters,
@@ -335,7 +495,7 @@ async fn run_status_scan_bench(config: &BenchConfig) -> AppResult<StatusWorkerSt
         let page_size = config.page_size;
         let filters = config.status_filters.clone();
         handles.push(tokio::spawn(async move {
-            let channel = connect_channel(endpoint).await?;
+            let channel = connect_channel(endpoint.clone()).await?;
             let mut client = TimelineStatusServiceClient::new(channel);
             let mut stats = StatusWorkerStats::default();
 
@@ -400,23 +560,51 @@ fn record_error_count(counts: &mut HashMap<String, u64>, label: &str) {
     *counts.entry(label.to_string()).or_insert(0) += 1;
 }
 
-fn error_code_label(error_code: i32) -> &'static str {
+fn error_code_label(error_code: i32) -> Option<&'static str> {
     match ErrorCode::try_from(error_code).ok() {
-        Some(ErrorCode::NotTimelineOwner) => "not_timeline_owner",
-        Some(ErrorCode::RouteVersionMismatch) => "route_version_mismatch",
-        Some(ErrorCode::EpochMismatch) => "epoch_mismatch",
-        Some(ErrorCode::LeaseExpired) => "lease_expired",
-        Some(ErrorCode::RateLimited) => "rate_limited",
-        Some(ErrorCode::TemporarilyUnavailable) => "temporarily_unavailable",
-        Some(ErrorCode::TimelineNotFound) => "timeline_not_found",
-        Some(ErrorCode::InvalidArgument) => "invalid_argument",
-        Some(ErrorCode::Internal) => "internal",
-        _ => "unknown",
+        Some(ErrorCode::NotTimelineOwner) => Some("not_timeline_owner"),
+        Some(ErrorCode::RouteVersionMismatch) => Some("route_version_mismatch"),
+        Some(ErrorCode::EpochMismatch) => Some("epoch_mismatch"),
+        Some(ErrorCode::LeaseExpired) => Some("lease_expired"),
+        Some(ErrorCode::RateLimited) => Some("rate_limited"),
+        Some(ErrorCode::TemporarilyUnavailable) => Some("temporarily_unavailable"),
+        Some(ErrorCode::TimelineNotFound) => Some("timeline_not_found"),
+        Some(ErrorCode::InvalidArgument) => Some("invalid_argument"),
+        Some(ErrorCode::Internal) => Some("internal"),
+        Some(ErrorCode::Unspecified) | None => None,
     }
 }
 
-fn is_transient_rebalance_error(detail: Option<&ErrorDetail>) -> bool {
-    matches!(
+fn status_code_label(code: Code) -> &'static str {
+    match code {
+        Code::Cancelled => "cancelled",
+        Code::Unknown => "unknown",
+        Code::InvalidArgument => "invalid_argument",
+        Code::DeadlineExceeded => "deadline_exceeded",
+        Code::NotFound => "not_found",
+        Code::AlreadyExists => "already_exists",
+        Code::PermissionDenied => "permission_denied",
+        Code::ResourceExhausted => "resource_exhausted",
+        Code::FailedPrecondition => "failed_precondition",
+        Code::Aborted => "aborted",
+        Code::OutOfRange => "out_of_range",
+        Code::Unimplemented => "unimplemented",
+        Code::Internal => "internal",
+        Code::Unavailable => "transport_unavailable",
+        Code::DataLoss => "data_loss",
+        Code::Unauthenticated => "unauthenticated",
+        Code::Ok => "ok",
+    }
+}
+
+fn allocation_error_label(status: &Status, detail: Option<&ErrorDetail>) -> &'static str {
+    detail
+        .and_then(|detail| error_code_label(detail.code))
+        .unwrap_or_else(|| status_code_label(status.code()))
+}
+
+fn is_transient_rebalance_error(status: &Status, detail: Option<&ErrorDetail>) -> bool {
+    if matches!(
         detail.and_then(|detail| ErrorCode::try_from(detail.code).ok()),
         Some(ErrorCode::LeaseExpired)
             | Some(ErrorCode::TemporarilyUnavailable)
@@ -424,29 +612,49 @@ fn is_transient_rebalance_error(detail: Option<&ErrorDetail>) -> bool {
             | Some(ErrorCode::EpochMismatch)
             | Some(ErrorCode::NotTimelineOwner)
             | Some(ErrorCode::RateLimited)
+    ) {
+        return true;
+    }
+
+    matches!(
+        status.code(),
+        Code::Unavailable | Code::DeadlineExceeded | Code::ResourceExhausted | Code::Aborted
     )
 }
 
-fn should_refresh_route_after_rebalance_error(detail: Option<&ErrorDetail>) -> bool {
-    matches!(
+fn should_refresh_route_after_rebalance_error(
+    status: &Status,
+    detail: Option<&ErrorDetail>,
+) -> bool {
+    if matches!(
         detail.and_then(|detail| ErrorCode::try_from(detail.code).ok()),
         Some(ErrorCode::LeaseExpired)
             | Some(ErrorCode::TemporarilyUnavailable)
             | Some(ErrorCode::RouteVersionMismatch)
             | Some(ErrorCode::EpochMismatch)
             | Some(ErrorCode::NotTimelineOwner)
-    )
+    ) {
+        return true;
+    }
+
+    matches!(status.code(), Code::Unavailable | Code::DeadlineExceeded)
 }
 
-fn rebalance_retry_backoff_ms(detail: Option<&ErrorDetail>) -> u64 {
+fn rebalance_retry_backoff_ms(status: &Status, detail: Option<&ErrorDetail>) -> u64 {
     match detail.and_then(|detail| ErrorCode::try_from(detail.code).ok()) {
         Some(ErrorCode::RateLimited) => 5,
+        _ if status.code() == Code::ResourceExhausted => 5,
         _ => REBALANCE_ALLOCATE_RETRY_BACKOFF_MS,
     }
 }
 
 fn decode_error_detail(status: &Status) -> Option<ErrorDetail> {
-    ErrorDetail::decode(status.details()).ok()
+    if status.details().is_empty() {
+        return None;
+    }
+    ErrorDetail::decode(status.details())
+        .ok()
+        .filter(|detail| detail.code != ErrorCode::Unspecified as i32)
 }
 
 fn count_tsos(response: &chronos::proto::v1::AllocateTimestampsResponse) -> u64 {
@@ -518,8 +726,12 @@ async fn run_allocate_during_rebalance_bench(
     if seeded_routes.is_empty() {
         return Err("allocate_during_rebalance requires seeded timelines".into());
     }
-    if config.transfer_target_generators.is_empty() {
-        return Err("allocate_during_rebalance requires at least one target generator".into());
+    if config.transfer_target_generators.is_empty()
+        && config.transfer_target_owner_endpoints.is_empty()
+    {
+        return Err(
+            "allocate_during_rebalance requires target generators or target owner endpoints".into(),
+        );
     }
 
     let allocator_workers = config.concurrency.min(seeded_routes.len());
@@ -542,14 +754,20 @@ async fn run_allocate_during_rebalance_bench(
     for worker_idx in 0..allocator_workers {
         let barrier = barrier.clone();
         let endpoint = config.endpoint.clone();
+        let route_to_owners = config.route_to_owners;
+        let allocation_endpoints = configured_allocation_endpoints(config, seeded_routes);
         let allocate_batch = config.allocate_batch;
+        let allocate_request_timeout_ms = config.allocate_request_timeout_ms;
+        let idempotency_enabled = config.idempotency_enabled;
         let route_snapshots = route_snapshots.clone();
         let route_keys = route_keys.clone();
         worker_handles.push(tokio::spawn(async move {
-            barrier.wait().await;
-            let channel = connect_channel(endpoint).await?;
-            let mut timestamp_client = TimestampServiceClient::new(channel.clone());
+            let channel = connect_channel(endpoint.clone()).await?;
             let mut route_client = TimelineRouteServiceClient::new(channel);
+            let mut timestamp_clients = BTreeMap::new();
+            for allocation_endpoint in allocation_endpoints {
+                ensure_timestamp_client(&mut timestamp_clients, &allocation_endpoint).await?;
+            }
             let mut stats = RebalanceWorkerStats::default();
             let mut last_end_by_timeline = HashMap::new();
             let worker_keys = route_keys
@@ -561,6 +779,7 @@ async fn run_allocate_during_rebalance_bench(
             let mut route_idx = 0usize;
             let mut request_ordinal = 0u64;
 
+            barrier.wait().await;
             loop {
                 let request_start = Instant::now();
                 if request_start >= measure_until {
@@ -585,11 +804,23 @@ async fn run_allocate_during_rebalance_bench(
                                 count: allocate_batch,
                                 expected_epoch: current_route.epoch,
                                 expected_route_version: current_route.route_version,
-                                client_request_id: format!(
-                                    "rebalance-{worker_idx}-{request_ordinal}-{attempt}"
-                                ),
-                                request_timeout_ms: 0,
+                                client_request_id: if idempotency_enabled {
+                                    format!("rebalance-{worker_idx}-{request_ordinal}-{attempt}")
+                                } else {
+                                    String::new()
+                                },
+                                request_timeout_ms: allocate_request_timeout_ms.min(u32::MAX as u64)
+                                    as u32,
                             };
+                            let allocation_endpoint =
+                                allocation_endpoint(&current_route, &endpoint, route_to_owners);
+                            ensure_timestamp_client(&mut timestamp_clients, &allocation_endpoint)
+                                .await
+                                .map_err(|_| ())?;
+                            let timestamp_client = timestamp_clients
+                                .get_mut(&allocation_endpoint)
+                                .ok_or(())
+                                .map_err(|_| ())?;
 
                             match timestamp_client
                                 .allocate_timestamps(Request::new(request))
@@ -600,19 +831,19 @@ async fn run_allocate_during_rebalance_bench(
                                     let detail = decode_error_detail(&status);
                                     record_error_count(
                                         &mut stats.error_counts,
-                                        detail
-                                            .as_ref()
-                                            .map(|detail| error_code_label(detail.code))
-                                            .unwrap_or("transport_error"),
+                                        allocation_error_label(&status, detail.as_ref()),
                                     );
 
-                                    if !is_transient_rebalance_error(detail.as_ref())
+                                    if !is_transient_rebalance_error(&status, detail.as_ref())
                                         || attempt == REBALANCE_ALLOCATE_RETRY_ATTEMPTS
                                     {
                                         return Err(());
                                     }
 
-                                    if should_refresh_route_after_rebalance_error(detail.as_ref()) {
+                                    if should_refresh_route_after_rebalance_error(
+                                        &status,
+                                        detail.as_ref(),
+                                    ) {
                                         let refresh_start = Instant::now();
                                         let refreshed = match refresh_route(
                                             &mut route_client,
@@ -643,7 +874,7 @@ async fn run_allocate_during_rebalance_bench(
                                         }
                                     }
                                     tokio::time::sleep(Duration::from_millis(
-                                        rebalance_retry_backoff_ms(detail.as_ref()),
+                                        rebalance_retry_backoff_ms(&status, detail.as_ref()),
                                     ))
                                     .await;
                                 }
@@ -684,7 +915,9 @@ async fn run_allocate_during_rebalance_bench(
     let endpoint = config.endpoint.clone();
     let route_keys_for_driver = route_keys.clone();
     let transfer_targets = config.transfer_target_generators.clone();
+    let transfer_target_owner_endpoints = config.transfer_target_owner_endpoints.clone();
     let transfer_interval_ms = config.transfer_interval_ms;
+    let route_to_owners = config.route_to_owners;
     let driver_handle = tokio::spawn(async move {
         let mut driver_routes = seeded_routes_for_driver
             .iter()
@@ -694,8 +927,8 @@ async fn run_allocate_during_rebalance_bench(
         let mut transfer_idx = 0usize;
 
         barrier_driver.wait().await;
-        let channel = connect_channel(endpoint).await?;
-        let mut control_client = TimelineControlServiceClient::new(channel);
+        let mut control_clients = BTreeMap::new();
+        ensure_control_client(&mut control_clients, &endpoint).await?;
         let mut next_tick = Instant::now();
         loop {
             next_tick += Duration::from_millis(transfer_interval_ms);
@@ -711,17 +944,41 @@ async fn run_allocate_during_rebalance_bench(
                 .get(timeline_key)
                 .ok_or("missing driver route snapshot")?
                 .clone();
-            let Some(target_generator_id) =
-                next_target_generator(current.generator_id, &transfer_targets)
-            else {
-                continue;
-            };
+            let (target_generator_id, target_worker_id) =
+                if transfer_targets.is_empty() && !transfer_target_owner_endpoints.is_empty() {
+                    (
+                        None,
+                        next_target_owner_endpoint(
+                            &current.owner_worker_endpoint,
+                            &transfer_target_owner_endpoints,
+                        ),
+                    )
+                } else {
+                    let Some(target_generator_id) =
+                        next_target_generator(current.generator_id, &transfer_targets)
+                    else {
+                        continue;
+                    };
+                    (
+                        Some(target_generator_id),
+                        route_owner_endpoint_for_generator(
+                            &transfer_target_owner_endpoints,
+                            target_generator_id,
+                        ),
+                    )
+                };
+            let control_endpoint =
+                target_control_endpoint(target_worker_id.as_deref(), &endpoint, route_to_owners);
+            ensure_control_client(&mut control_clients, &control_endpoint).await?;
+            let control_client = control_clients
+                .get_mut(&control_endpoint)
+                .ok_or("missing control client")?;
 
             let result = control_client
                 .transfer_timeline(Request::new(TransferTimelineRequest {
                     timeline_key: timeline_key.clone(),
-                    target_generator_id: Some(target_generator_id),
-                    target_worker_id: None,
+                    target_generator_id,
+                    target_worker_id,
                     reason: TimelineTransferReason::Rebalance as i32,
                 }))
                 .await;
@@ -804,6 +1061,12 @@ fn print_rebalance_summary(config: &BenchConfig, stats: RebalanceBenchStats) {
     println!("duration_secs={}", config.duration_secs);
     println!("warmup_secs={}", config.warmup_secs);
     println!("allocate_batch={}", config.allocate_batch);
+    println!(
+        "allocate_request_timeout_ms={}",
+        config.allocate_request_timeout_ms
+    );
+    println!("idempotency_enabled={}", config.idempotency_enabled);
+    println!("route_to_owners={}", config.route_to_owners);
     println!("transfer_interval_ms={}", config.transfer_interval_ms);
     println!(
         "transfer_target_generators={}",
@@ -813,6 +1076,10 @@ fn print_rebalance_summary(config: &BenchConfig, stats: RebalanceBenchStats) {
             .map(ToString::to_string)
             .collect::<Vec<_>>()
             .join(",")
+    );
+    println!(
+        "transfer_target_owner_endpoints={}",
+        config.transfer_target_owner_endpoints.join(",")
     );
     println!("allocate_requests_total={}", stats.allocate_requests_total);
     println!("allocate_success_total={}", stats.allocate_success_total);
@@ -848,6 +1115,10 @@ fn print_rebalance_summary(config: &BenchConfig, stats: RebalanceBenchStats) {
         percentile(&allocate_latencies, 0.99)
     );
     println!(
+        "allocate_latency_p999_us={}",
+        percentile(&allocate_latencies, 0.999)
+    );
+    println!(
         "allocate_latency_max_us={}",
         allocate_latencies.last().copied().unwrap_or(0)
     );
@@ -863,6 +1134,10 @@ fn print_rebalance_summary(config: &BenchConfig, stats: RebalanceBenchStats) {
     println!(
         "route_refresh_p99_us={}",
         percentile(&refresh_latencies, 0.99)
+    );
+    println!(
+        "route_refresh_p999_us={}",
+        percentile(&refresh_latencies, 0.999)
     );
     println!(
         "route_refresh_max_us={}",
@@ -882,6 +1157,10 @@ fn print_rebalance_summary(config: &BenchConfig, stats: RebalanceBenchStats) {
     println!(
         "transfer_latency_p99_us={}",
         percentile(&transfer_latencies, 0.99)
+    );
+    println!(
+        "transfer_latency_p999_us={}",
+        percentile(&transfer_latencies, 0.999)
     );
     println!(
         "transfer_latency_max_us={}",
@@ -931,6 +1210,7 @@ fn print_status_summary(config: &BenchConfig, stats: StatusWorkerStats) {
     println!("rpc_latency_p50_us={}", percentile(&rpc_latencies, 0.50));
     println!("rpc_latency_p95_us={}", percentile(&rpc_latencies, 0.95));
     println!("rpc_latency_p99_us={}", percentile(&rpc_latencies, 0.99));
+    println!("rpc_latency_p999_us={}", percentile(&rpc_latencies, 0.999));
     println!(
         "rpc_latency_max_us={}",
         rpc_latencies.last().copied().unwrap_or(0)
@@ -938,6 +1218,10 @@ fn print_status_summary(config: &BenchConfig, stats: StatusWorkerStats) {
     println!("scan_latency_p50_us={}", percentile(&scan_latencies, 0.50));
     println!("scan_latency_p95_us={}", percentile(&scan_latencies, 0.95));
     println!("scan_latency_p99_us={}", percentile(&scan_latencies, 0.99));
+    println!(
+        "scan_latency_p999_us={}",
+        percentile(&scan_latencies, 0.999)
+    );
     println!(
         "scan_latency_max_us={}",
         scan_latencies.last().copied().unwrap_or(0)
@@ -1019,10 +1303,32 @@ mod tests {
             action_blocker: 0,
             next_step: 0,
         };
+        let status = Status::resource_exhausted("backpressure");
 
-        assert!(is_transient_rebalance_error(Some(&detail)));
-        assert!(!should_refresh_route_after_rebalance_error(Some(&detail)));
-        assert_eq!(rebalance_retry_backoff_ms(Some(&detail)), 5);
+        assert_eq!(
+            allocation_error_label(&status, Some(&detail)),
+            "rate_limited"
+        );
+        assert!(is_transient_rebalance_error(&status, Some(&detail)));
+        assert!(!should_refresh_route_after_rebalance_error(
+            &status,
+            Some(&detail)
+        ));
+        assert_eq!(rebalance_retry_backoff_ms(&status, Some(&detail)), 5);
+    }
+
+    #[test]
+    fn rebalance_retry_classifier_treats_deadline_without_detail_as_transient() {
+        let status = Status::deadline_exceeded("AllocateTimestamps timed out");
+
+        assert!(decode_error_detail(&status).is_none());
+        assert_eq!(allocation_error_label(&status, None), "deadline_exceeded");
+        assert!(is_transient_rebalance_error(&status, None));
+        assert!(should_refresh_route_after_rebalance_error(&status, None));
+        assert_eq!(
+            rebalance_retry_backoff_ms(&status, None),
+            REBALANCE_ALLOCATE_RETRY_BACKOFF_MS
+        );
     }
 
     #[test]

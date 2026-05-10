@@ -73,6 +73,34 @@ async fn finalize_etcd_startup(
         return Err(error);
     }
 
+    if config.generator_ownership_modulo > 1 {
+        if let Err(error) = metadata.admit_ownership_plan_member(&config).await {
+            identity_lease.shutdown().await;
+            return Err(Box::new(error));
+        }
+        info!(
+            component = "startup",
+            event = "ownership_plan_admitted",
+            result = "success",
+            reason = "member_accepted",
+            ownership_plan_id = %config.ownership_plan_id,
+            generator_ownership_modulo = config.generator_ownership_modulo,
+            generator_ownership_remainder = config.generator_ownership_remainder,
+            worker_id = %config.worker_id,
+            advertise_endpoint = %config.advertise_endpoint
+        );
+    } else {
+        info!(
+            component = "startup",
+            event = "ownership_plan_skipped",
+            result = "success",
+            reason = "unpartitioned_generator_ownership",
+            generator_ownership_modulo = config.generator_ownership_modulo,
+            worker_id = %config.worker_id,
+            advertise_endpoint = %config.advertise_endpoint
+        );
+    }
+
     match TsoService::new(config, clock, metadata) {
         Ok(service) => Ok((service, Some(identity_lease))),
         Err(error) => {

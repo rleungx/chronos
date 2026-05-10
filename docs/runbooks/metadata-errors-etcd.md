@@ -10,6 +10,9 @@
 1. Inspect `tso_metadata_errors_total` by operation label.
 2. Inspect etcd health and recent latency.
 3. Check `chronos.log` and `etcd.log` together.
+4. Compare with `tso_metadata_conflicts_total`; CAS/create conflicts are expected under
+   contention and should not trigger `ChronosMetadataErrors` unless they exhaust retries or appear
+   with real etcd errors.
 
 ## Actions
 

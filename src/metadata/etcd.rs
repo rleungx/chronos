@@ -9,6 +9,7 @@ use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Mutex as StdMutex;
 use std::sync::MutexGuard;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{broadcast, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, Duration, Instant};
@@ -21,7 +22,6 @@ use crate::{metrics, TimelineLifecycleState, TimelineRoute, TsoConfig, TsoError}
 const REQUEST_RECORD_PRUNE_MIN_FETCH_LIMIT: usize = 128;
 const REQUEST_RECORD_PRUNE_MAX_FETCH_LIMIT: usize = 4096;
 const STATUS_INDEX_REBUILD_BATCH_RECORDS: usize = 32;
-const GENERATOR_BATCH_RANGE_SCAN_THRESHOLD: usize = 32;
 const GENERATOR_BATCH_GET_CHUNK_SIZE: usize = 64;
 const IDENTITY_KEEPALIVE_RECONNECT_MIN_BACKOFF_MS: u64 = 100;
 const IDENTITY_KEEPALIVE_RECONNECT_MAX_BACKOFF_MS: u64 = 500;
@@ -35,9 +35,10 @@ use super::{
         timeline_route_update_from_routes, RouteUpdateSignal, CURRENT_METADATA_SCHEMA_VERSION,
     },
     GeneratorBatchOp, GeneratorLeaseAuthority, GeneratorRecord, IdentityLeaseAuthority,
-    InstanceIdentityLease, RequestRecord, RequestRecordAuthority, RequestRecordState,
-    RouteUpdateSource, TimelineAuthority, TimelineBatchOp, TimelineFilterRecord,
-    TimelineFilterRecordListPage, TimelineRecord, TimelineRecordListPage, TimelineRouteRecord,
+    InstanceIdentityLease, OwnershipPlanMember, OwnershipPlanRecord, RequestRecord,
+    RequestRecordAuthority, RequestRecordState, RouteUpdateSource, TimelineAuthority,
+    TimelineBatchOp, TimelineFilterRecord, TimelineFilterRecordListPage, TimelineRecord,
+    TimelineRecordListPage, TimelineRouteRecord,
 };
 
 pub struct EtcdMetadataStore {
@@ -273,6 +274,12 @@ fn request_record_is_prunable_candidate(record: &RequestRecord) -> bool {
     record.state == RequestRecordState::Completed
 }
 
+fn record_metadata_conflict(op_label: &'static str, kind: &'static str) {
+    metrics::TSO_METADATA_CONFLICTS_TOTAL
+        .with_label_values(&[op_label, kind])
+        .inc();
+}
+
 impl EtcdMetadataStore {
     async fn probe_metadata_runtime(&self) -> Result<(), TsoError> {
         self.load_timeline_route("__chronos_startup_probe__")
@@ -444,6 +451,162 @@ impl EtcdMetadataStore {
 
     fn instance_identity_key(&self, instance_id: &str) -> String {
         keys::instance_identity_key(&self.prefix, instance_id)
+    }
+
+    fn instance_identity_prefix(&self) -> String {
+        keys::instance_identity_prefix(&self.prefix)
+    }
+
+    fn ownership_plan_key(&self) -> String {
+        keys::ownership_plan_key(&self.prefix)
+    }
+
+    fn ownership_plan_timestamp_ms() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+            .unwrap_or(0)
+    }
+
+    async fn active_identity_member_counts(
+        &self,
+    ) -> Result<HashMap<(String, String), usize>, TsoError> {
+        let mut client = self.client.clone();
+        let prefix = self.instance_identity_prefix();
+        let response = client
+            .get(prefix, Some(GetOptions::new().with_prefix()))
+            .await
+            .map_err(|error| {
+                metrics::TSO_METADATA_ERRORS_TOTAL
+                    .with_label_values(&["list_identity_leases"])
+                    .inc();
+                TsoError::Internal(format!("Etcd list_identity_leases failed: {}", error))
+            })?;
+
+        let mut counts = HashMap::new();
+        for kv in response.kvs() {
+            if kv.lease() == 0 {
+                continue;
+            }
+            let record: InstanceIdentityLeaseRecord =
+                serde_json::from_slice(kv.value()).map_err(|error| {
+                    metrics::TSO_METADATA_ERRORS_TOTAL
+                        .with_label_values(&["list_identity_leases"])
+                        .inc();
+                    TsoError::Internal(format!(
+                        "Identity lease record deserialization failed: {}",
+                        error
+                    ))
+                })?;
+            *counts
+                .entry((record.worker_id, record.advertise_endpoint))
+                .or_default() += 1;
+        }
+        Ok(counts)
+    }
+
+    pub async fn admit_ownership_plan_member(&self, config: &TsoConfig) -> Result<(), TsoError> {
+        if config.generator_ownership_modulo <= 1 {
+            return Ok(());
+        }
+
+        let member = OwnershipPlanMember {
+            remainder: config.generator_ownership_remainder,
+            worker_id: config.worker_id.clone(),
+            advertise_endpoint: config.advertise_endpoint.clone(),
+        };
+        let member_key = (member.worker_id.clone(), member.advertise_endpoint.clone());
+        let expected_plan_id = config.ownership_plan_id.trim();
+        let expected_modulo = config.generator_ownership_modulo;
+        let key = self.ownership_plan_key();
+
+        for _attempt in 0..8 {
+            let now_ms = Self::ownership_plan_timestamp_ms();
+            let active_member_counts = self.active_identity_member_counts().await?;
+            if active_member_counts.get(&member_key).copied().unwrap_or(0) > 1 {
+                return Err(TsoError::Internal(format!(
+                    "ownership plan worker_id={} advertise_endpoint={} has multiple active identity leases",
+                    member.worker_id, member.advertise_endpoint
+                )));
+            }
+            let active_members = active_member_counts.keys().cloned().collect::<HashSet<_>>();
+            match self
+                .get_json_record::<OwnershipPlanRecord>(
+                    key.clone(),
+                    "get_ownership_plan",
+                    "Ownership plan record deserialization",
+                )
+                .await?
+            {
+                Some((mut record, revision)) => {
+                    let pruned = record.prune_inactive_members(&active_members, now_ms)?;
+                    if pruned > 0 {
+                        info!(
+                            component = "metadata",
+                            event = "ownership_plan_pruned",
+                            result = "success",
+                            reason = "inactive_identity",
+                            pruned_members = pruned,
+                            ownership_plan_id = %expected_plan_id
+                        );
+                    }
+                    let admitted = record.admit_member(
+                        expected_plan_id,
+                        expected_modulo,
+                        member.clone(),
+                        now_ms,
+                    )?;
+                    if pruned == 0 && !admitted {
+                        return Ok(());
+                    }
+                    match self
+                        .cas_json_record(
+                            key.clone(),
+                            revision,
+                            &record,
+                            JsonTxnContext {
+                                op_label: "cas_ownership_plan",
+                                serialize_context: "Ownership plan record serialization",
+                                txn_context: "Etcd ownership plan CAS txn failed",
+                                invalid_response_context: "invalid ownership plan CAS response",
+                            },
+                        )
+                        .await
+                    {
+                        Ok(_) => return Ok(()),
+                        Err(TsoError::CasFailed) => continue,
+                        Err(error) => return Err(error),
+                    }
+                }
+                None => {
+                    let record = OwnershipPlanRecord::new(
+                        expected_plan_id.to_owned(),
+                        expected_modulo,
+                        member.clone(),
+                        now_ms,
+                    );
+                    match self
+                        .create_json_record(
+                            key.clone(),
+                            &record,
+                            JsonTxnContext {
+                                op_label: "create_ownership_plan",
+                                serialize_context: "Ownership plan record serialization",
+                                txn_context: "Etcd ownership plan create txn failed",
+                                invalid_response_context: "invalid ownership plan create response",
+                            },
+                        )
+                        .await
+                    {
+                        Ok(_) => return Ok(()),
+                        Err(TsoError::MetadataAlreadyExists) => continue,
+                        Err(error) => return Err(error),
+                    }
+                }
+            }
+        }
+
+        Err(TsoError::CasFailed)
     }
 
     async fn acquire_identity_lease_internal(
@@ -1030,9 +1193,7 @@ impl EtcdMetadataStore {
         })?;
 
         if !response.succeeded() {
-            metrics::TSO_METADATA_ERRORS_TOTAL
-                .with_label_values(&[context.op_label])
-                .inc();
+            record_metadata_conflict(context.op_label, "already_exists");
             return Err(TsoError::MetadataAlreadyExists);
         }
 
@@ -1067,9 +1228,7 @@ impl EtcdMetadataStore {
         })?;
 
         if !response.succeeded() {
-            metrics::TSO_METADATA_ERRORS_TOTAL
-                .with_label_values(&[context.op_label])
-                .inc();
+            record_metadata_conflict(context.op_label, "cas_failed");
             return Err(TsoError::CasFailed);
         }
 
@@ -1113,9 +1272,7 @@ impl EtcdMetadataStore {
         })?;
 
         if !response.succeeded() {
-            metrics::TSO_METADATA_ERRORS_TOTAL
-                .with_label_values(&[context.op_label])
-                .inc();
+            record_metadata_conflict(context.op_label, "cas_failed");
             return Err(TsoError::CasFailed);
         }
 
@@ -1154,9 +1311,7 @@ impl EtcdMetadataStore {
         })?;
 
         if !response.succeeded() {
-            metrics::TSO_METADATA_ERRORS_TOTAL
-                .with_label_values(&[context.op_label])
-                .inc();
+            record_metadata_conflict(context.op_label, "cas_failed");
             return Err(TsoError::CasFailed);
         }
 
@@ -1335,9 +1490,7 @@ impl EtcdMetadataStore {
             })?;
 
         if !response.succeeded() {
-            metrics::TSO_METADATA_ERRORS_TOTAL
-                .with_label_values(&["create"])
-                .inc();
+            record_metadata_conflict("create", "already_exists");
             return Err(TsoError::MetadataAlreadyExists);
         }
 
@@ -1352,17 +1505,13 @@ impl EtcdMetadataStore {
     ) -> Result<u64, TsoError> {
         let Some((previous_record, previous_revision)) = self.load_timeline(timeline_key).await?
         else {
-            metrics::TSO_METADATA_ERRORS_TOTAL
-                .with_label_values(&["cas"])
-                .inc();
+            record_metadata_conflict("cas", "not_found");
             return Err(TsoError::TimelineNotFound {
                 timeline_key: timeline_key.to_owned(),
             });
         };
         if previous_revision != expected_revision {
-            metrics::TSO_METADATA_ERRORS_TOTAL
-                .with_label_values(&["cas"])
-                .inc();
+            record_metadata_conflict("cas", "revision_mismatch");
             return Err(TsoError::CasFailed);
         }
 
@@ -1395,9 +1544,7 @@ impl EtcdMetadataStore {
             })?;
 
         if !response.succeeded() {
-            metrics::TSO_METADATA_ERRORS_TOTAL
-                .with_label_values(&["cas"])
-                .inc();
+            record_metadata_conflict("cas", "cas_failed");
             return Err(TsoError::CasFailed);
         }
 
@@ -1416,25 +1563,19 @@ impl EtcdMetadataStore {
         let mut previous_records = Vec::with_capacity(operations.len());
         for operation in operations {
             if !seen_timeline_keys.insert(operation.timeline_key.as_str()) {
-                metrics::TSO_METADATA_ERRORS_TOTAL
-                    .with_label_values(&["cas_batch"])
-                    .inc();
+                record_metadata_conflict("cas_batch", "duplicate_key");
                 return Err(TsoError::CasFailed);
             }
             let Some((previous_record, previous_revision)) =
                 self.load_timeline(&operation.timeline_key).await?
             else {
-                metrics::TSO_METADATA_ERRORS_TOTAL
-                    .with_label_values(&["cas_batch"])
-                    .inc();
+                record_metadata_conflict("cas_batch", "not_found");
                 return Err(TsoError::TimelineNotFound {
                     timeline_key: operation.timeline_key.clone(),
                 });
             };
             if previous_revision != operation.previous_revision {
-                metrics::TSO_METADATA_ERRORS_TOTAL
-                    .with_label_values(&["cas_batch"])
-                    .inc();
+                record_metadata_conflict("cas_batch", "revision_mismatch");
                 return Err(TsoError::CasFailed);
             }
             previous_records.push(previous_record);
@@ -1477,9 +1618,7 @@ impl EtcdMetadataStore {
             })?;
 
         if !response.succeeded() {
-            metrics::TSO_METADATA_ERRORS_TOTAL
-                .with_label_values(&["cas_batch"])
-                .inc();
+            record_metadata_conflict("cas_batch", "cas_failed");
             return Err(TsoError::CasFailed);
         }
 
@@ -1676,9 +1815,7 @@ impl EtcdMetadataStore {
             })?;
 
         if !response.succeeded() {
-            metrics::TSO_METADATA_ERRORS_TOTAL
-                .with_label_values(&["create_request"])
-                .inc();
+            record_metadata_conflict("create_request", "already_exists");
             return Err(TsoError::MetadataAlreadyExists);
         }
 
@@ -1700,17 +1837,13 @@ impl EtcdMetadataStore {
             .load_request_record(timeline_key, client_request_id)
             .await?
         else {
-            metrics::TSO_METADATA_ERRORS_TOTAL
-                .with_label_values(&["cas_request"])
-                .inc();
+            record_metadata_conflict("cas_request", "not_found");
             return Err(TsoError::TimelineNotFound {
                 timeline_key: format!("request:{timeline_key}:{client_request_id}"),
             });
         };
         if previous_revision != expected_revision {
-            metrics::TSO_METADATA_ERRORS_TOTAL
-                .with_label_values(&["cas_request"])
-                .inc();
+            record_metadata_conflict("cas_request", "revision_mismatch");
             return Err(TsoError::CasFailed);
         }
 
@@ -1748,9 +1881,7 @@ impl EtcdMetadataStore {
             })?;
 
         if !response.succeeded() {
-            metrics::TSO_METADATA_ERRORS_TOTAL
-                .with_label_values(&["cas_request"])
-                .inc();
+            record_metadata_conflict("cas_request", "cas_failed");
             return Err(TsoError::CasFailed);
         }
 
@@ -1767,17 +1898,13 @@ impl EtcdMetadataStore {
             .load_request_record(timeline_key, client_request_id)
             .await?
         else {
-            metrics::TSO_METADATA_ERRORS_TOTAL
-                .with_label_values(&["delete_request"])
-                .inc();
+            record_metadata_conflict("delete_request", "not_found");
             return Err(TsoError::TimelineNotFound {
                 timeline_key: format!("request:{timeline_key}:{client_request_id}"),
             });
         };
         if previous_revision != expected_revision {
-            metrics::TSO_METADATA_ERRORS_TOTAL
-                .with_label_values(&["delete_request"])
-                .inc();
+            record_metadata_conflict("delete_request", "revision_mismatch");
             return Err(TsoError::CasFailed);
         }
 
@@ -1818,9 +1945,7 @@ impl EtcdMetadataStore {
             })?;
 
         if !response.succeeded() {
-            metrics::TSO_METADATA_ERRORS_TOTAL
-                .with_label_values(&["delete_request"])
-                .inc();
+            record_metadata_conflict("delete_request", "cas_failed");
             return Err(TsoError::CasFailed);
         }
 
@@ -2199,40 +2324,6 @@ impl GeneratorLeaseAuthority for EtcdMetadataStore {
         }
 
         let requested_ids: Vec<_> = loaded.keys().copied().collect();
-        if requested_ids.len() >= GENERATOR_BATCH_RANGE_SCAN_THRESHOLD {
-            let mut client = self.client.clone();
-            let generator_prefix = self.generator_prefix();
-            let response = client
-                .get(
-                    generator_prefix.clone(),
-                    Some(GetOptions::new().with_range(prefix_range_end(&generator_prefix))),
-                )
-                .await
-                .map_err(|error| {
-                    metrics::TSO_METADATA_ERRORS_TOTAL
-                        .with_label_values(&["get_generator_batch"])
-                        .inc();
-                    TsoError::Internal(format!("Etcd get_generator_batch failed: {}", error))
-                })?;
-
-            for kv in response.kvs() {
-                let record: GeneratorRecord =
-                    serde_json::from_slice(kv.value()).map_err(|error| {
-                        metrics::TSO_METADATA_ERRORS_TOTAL
-                            .with_label_values(&["get_generator_batch"])
-                            .inc();
-                        TsoError::Internal(format!(
-                            "Generator record batch deserialization failed: {}",
-                            error
-                        ))
-                    })?;
-                record.validate_schema_version()?;
-                if loaded.contains_key(&record.generator_id) {
-                    loaded.insert(record.generator_id, Some(record));
-                }
-            }
-            return Ok(loaded);
-        }
 
         for chunk in requested_ids.chunks(GENERATOR_BATCH_GET_CHUNK_SIZE) {
             let mut client = self.client.clone();
@@ -2280,6 +2371,42 @@ impl GeneratorLeaseAuthority for EtcdMetadataStore {
         }
 
         Ok(loaded)
+    }
+
+    async fn scan_generators(&self) -> Result<Vec<GeneratorRecord>, TsoError> {
+        let _timer = metrics::TSO_METADATA_LATENCY
+            .with_label_values(&["scan_generators"])
+            .start_timer();
+        let mut client = self.client.clone();
+        let generator_prefix = self.generator_prefix();
+        let response = client
+            .get(
+                generator_prefix.clone(),
+                Some(GetOptions::new().with_range(prefix_range_end(&generator_prefix))),
+            )
+            .await
+            .map_err(|error| {
+                metrics::TSO_METADATA_ERRORS_TOTAL
+                    .with_label_values(&["scan_generators"])
+                    .inc();
+                TsoError::Internal(format!("Etcd scan_generators failed: {}", error))
+            })?;
+
+        let mut records = Vec::with_capacity(response.kvs().len());
+        for kv in response.kvs() {
+            let record: GeneratorRecord = serde_json::from_slice(kv.value()).map_err(|error| {
+                metrics::TSO_METADATA_ERRORS_TOTAL
+                    .with_label_values(&["scan_generators"])
+                    .inc();
+                TsoError::Internal(format!(
+                    "Generator record scan deserialization failed: {}",
+                    error
+                ))
+            })?;
+            record.validate_schema_version()?;
+            records.push(record);
+        }
+        Ok(records)
     }
 
     async fn create_generator(

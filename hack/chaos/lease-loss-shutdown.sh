@@ -24,6 +24,7 @@ BENCH_DURATION_SECS="${CHRONOS_CHAOS_BENCH_DURATION_SECS:-2}"
 SAFETY_GAP_MS="${CHRONOS_CHAOS_SAFETY_GAP_MS:-1}"
 RECOVERY_REQ_PER_SEC_MIN="${CHRONOS_CHAOS_RECOVERY_REQ_PER_SEC_MIN:-10}"
 RECOVERY_LATENCY_P95_US_MAX="${CHRONOS_CHAOS_RECOVERY_LATENCY_P95_US_MAX:-500000}"
+RECOVERY_LATENCY_P999_US_MAX="${CHRONOS_CHAOS_RECOVERY_LATENCY_P999_US_MAX:-1000000}"
 ARTIFACT_ROOT="${CHRONOS_CHAOS_ARTIFACT_DIR:-${CHRONOS_ARTIFACT_DIR:-}}"
 KEEP_ARTIFACTS_ON_SUCCESS="${CHRONOS_CHAOS_KEEP_ARTIFACTS_ON_SUCCESS:-${CHRONOS_KEEP_ARTIFACTS_ON_SUCCESS:-0}}"
 STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -77,6 +78,7 @@ instance_id=${INSTANCE_ID}
 safety_gap_ms=${SAFETY_GAP_MS}
 recovery_req_per_sec_min=${RECOVERY_REQ_PER_SEC_MIN}
 recovery_latency_p95_us_max=${RECOVERY_LATENCY_P95_US_MAX}
+recovery_latency_p999_us_max=${RECOVERY_LATENCY_P999_US_MAX}
 artifact_dir=${ARTIFACT_DIR}
 artifact_index=${INDEX_LOG}
 chronos_log=${CHRONOS_LOG}
@@ -220,6 +222,9 @@ assert_http_body_equals "http://${METRICS_ENDPOINT}/readyz" "ready"
 assert_http_metric_present "http://${METRICS_ENDPOINT}/metrics" '^tso_startup_ready'
 assert_metric_at_least "req_per_sec" "${RECOVERY_BENCH_LOG}" "${RECOVERY_REQ_PER_SEC_MIN}"
 assert_metric_at_most "latency_p95_us" "${RECOVERY_BENCH_LOG}" "${RECOVERY_LATENCY_P95_US_MAX}"
+assert_metric_at_most "latency_p999_us" "${RECOVERY_BENCH_LOG}" "${RECOVERY_LATENCY_P999_US_MAX}"
+assert_zero_metric "allocation_failed_total" "${RECOVERY_BENCH_LOG}"
+assert_zero_metric "allocation_measured_failed_total" "${RECOVERY_BENCH_LOG}"
 
 RESULT="success"
 write_summary

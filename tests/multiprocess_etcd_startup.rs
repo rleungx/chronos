@@ -67,8 +67,8 @@ fn free_loopback_addr() -> SocketAddr {
     addr
 }
 
-fn routable_test_advertise_endpoint(worker_id: &str, bind_addr: SocketAddr) -> String {
-    format!("{worker_id}.localhost:{}", bind_addr.port())
+fn routable_test_advertise_endpoint(_worker_id: &str, bind_addr: SocketAddr) -> String {
+    bind_addr.to_string()
 }
 
 fn next_stderr_path(worker_id: &str) -> PathBuf {
