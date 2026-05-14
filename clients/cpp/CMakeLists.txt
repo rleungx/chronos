@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.20)
 project(chronos_cpp_client LANGUAGES CXX)
 
+include(GNUInstallDirs)
+
 enable_testing()
 
 set(CMAKE_CXX_STANDARD 17)
@@ -32,11 +34,25 @@ add_custom_command(
 )
 
 add_library(chronos_proto "${PROTO_SRC}" "${GRPC_SRC}")
-target_include_directories(chronos_proto PUBLIC "${GENERATED_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}")
+set_target_properties(chronos_proto PROPERTIES EXPORT_NAME proto)
+target_include_directories(
+  chronos_proto
+  PUBLIC
+    "$<BUILD_INTERFACE:${GENERATED_DIR}>"
+    "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>"
+    "$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/chronos>"
+)
 target_link_libraries(chronos_proto PUBLIC protobuf::libprotobuf gRPC::grpc++)
 
 add_library(chronos_client_lib "client.cc")
-target_include_directories(chronos_client_lib PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
+add_library(chronos::client ALIAS chronos_client_lib)
+set_target_properties(chronos_client_lib PROPERTIES OUTPUT_NAME chronos_client EXPORT_NAME client)
+target_include_directories(
+  chronos_client_lib
+  PUBLIC
+    "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>"
+    "$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/chronos>"
+)
 target_link_libraries(chronos_client_lib PUBLIC chronos_proto)
 
 add_executable(client_test "client_test.cc")
@@ -48,3 +64,20 @@ target_include_directories(client_example PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}" 
 target_link_libraries(client_example PRIVATE chronos_client_lib)
 
 add_test(NAME client_test COMMAND client_test)
+
+install(
+  TARGETS chronos_client_lib chronos_proto
+  EXPORT chronosClientTargets
+  ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}"
+  LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}"
+  RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}"
+)
+install(
+  FILES "client.h" "${PROTO_HDR}" "${GRPC_HDR}"
+  DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/chronos"
+)
+install(
+  EXPORT chronosClientTargets
+  NAMESPACE chronos::
+  DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/chronos"
+)

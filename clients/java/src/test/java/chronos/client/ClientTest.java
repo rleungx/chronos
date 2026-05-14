@@ -43,6 +43,7 @@ final class ClientTest {
     var staleOnFirstAllocate = new AtomicBoolean(true);
     var routeVersion = new AtomicInteger(11);
     var allocateCalls = new AtomicInteger();
+    var getRouteCalls = new AtomicInteger();
     var firstRequestId = new AtomicReference<String>();
     var retryRequestId = new AtomicReference<String>();
     var ownerServerName = InProcessServerBuilder.generateName();
@@ -123,6 +124,7 @@ final class ClientTest {
                   public void getTimelineRoute(
                       GetTimelineRouteRequest request,
                       StreamObserver<GetTimelineRouteResponse> responseObserver) {
+                    getRouteCalls.incrementAndGet();
                     responseObserver.onNext(
                         GetTimelineRouteResponse.newBuilder()
                             .setRoute(
@@ -147,12 +149,13 @@ final class ClientTest {
     try (Client client = new Client(
         routeChannel,
         "orders.primary",
-        ignored -> InProcessChannelBuilder.forName(ownerServerName).directExecutor().build(),
+        inProcessOwnerChannelFactory(),
         true)) {
       List<TimestampRange> ranges = client.allocateTimestamps(1);
       assertEquals(1, ranges.size());
       assertEquals(100, ranges.get(0).getStartTso());
       assertEquals(2, allocateCalls.get());
+      assertEquals(1, getRouteCalls.get());
       assertFalse(firstRequestId.get().isBlank());
       assertEquals(firstRequestId.get(), retryRequestId.get());
       assertFalse(staleOnFirstAllocate.get());
@@ -201,9 +204,81 @@ final class ClientTest {
     try (Client client = new Client(
         routeChannel,
         "orders.primary",
-        ignored -> InProcessChannelBuilder.forName(ownerServerName).directExecutor().build())) {
+        inProcessOwnerChannelFactory())) {
       client.allocateTimestamps(1);
       assertEquals("", observedRequestId.get());
+    } finally {
+      routeChannel.shutdownNow();
+      ownerServer.shutdownNow();
+      routeServer.shutdownNow();
+    }
+  }
+
+  @Test
+  void failedPreconditionWithoutChronosRouteDetailIsNotRetried() throws Exception {
+    var getRouteCalls = new AtomicInteger();
+    var ownerServerName = InProcessServerBuilder.generateName();
+    var routeServerName = InProcessServerBuilder.generateName();
+
+    Server ownerServer =
+        InProcessServerBuilder.forName(ownerServerName)
+            .directExecutor()
+            .addService(
+                new TimestampServiceGrpc.TimestampServiceImplBase() {
+                  @Override
+                  public void allocateTimestamps(
+                      AllocateTimestampsRequest request,
+                      StreamObserver<AllocateTimestampsResponse> responseObserver) {
+                    responseObserver.onError(
+                        Status.FAILED_PRECONDITION
+                            .withDescription("non-route precondition failed")
+                            .asRuntimeException());
+                  }
+                })
+            .build()
+            .start();
+
+    Server routeServer =
+        InProcessServerBuilder.forName(routeServerName)
+            .directExecutor()
+            .addService(
+                new TimelineRouteServiceGrpc.TimelineRouteServiceImplBase() {
+                  @Override
+                  public void ensureTimeline(
+                      EnsureTimelineRequest request,
+                      StreamObserver<EnsureTimelineResponse> responseObserver) {
+                    responseObserver.onNext(
+                        EnsureTimelineResponse.newBuilder()
+                            .setRoute(route(request.getTimelineKey(), ownerServerName, 11))
+                            .build());
+                    responseObserver.onCompleted();
+                  }
+
+                  @Override
+                  public void getTimelineRoute(
+                      GetTimelineRouteRequest request,
+                      StreamObserver<GetTimelineRouteResponse> responseObserver) {
+                    getRouteCalls.incrementAndGet();
+                    responseObserver.onNext(
+                        GetTimelineRouteResponse.newBuilder()
+                            .setRoute(route(request.getTimelineKey(), ownerServerName, 11))
+                            .build());
+                    responseObserver.onCompleted();
+                  }
+                })
+            .build()
+            .start();
+
+    ManagedChannel routeChannel =
+        InProcessChannelBuilder.forName(routeServerName).directExecutor().build();
+
+    try (Client client = new Client(
+        routeChannel,
+        "orders.primary",
+        inProcessOwnerChannelFactory())) {
+      var err = assertThrows(RuntimeException.class, () -> client.allocateTimestamps(1));
+      assertTrue(err.getMessage().contains("non-route precondition failed"));
+      assertEquals(0, getRouteCalls.get());
     } finally {
       routeChannel.shutdownNow();
       ownerServer.shutdownNow();
@@ -216,6 +291,7 @@ final class ClientTest {
     var observedTier = new AtomicReference<ResourceTier>();
     var observedTimeoutMs = new AtomicInteger(-1);
     var observedRequestId = new AtomicReference<String>("");
+    var getRouteCalls = new AtomicInteger();
     var ownerServerName = InProcessServerBuilder.generateName();
     var routeServerName = InProcessServerBuilder.generateName();
 
@@ -266,6 +342,7 @@ final class ClientTest {
                   public void getTimelineRoute(
                       GetTimelineRouteRequest request,
                       StreamObserver<GetTimelineRouteResponse> responseObserver) {
+                    getRouteCalls.incrementAndGet();
                     responseObserver.onNext(
                         GetTimelineRouteResponse.newBuilder()
                             .setRoute(route(request.getTimelineKey(), ownerServerName, 11))
@@ -282,7 +359,7 @@ final class ClientTest {
     try (Client client = new Client(
         routeChannel,
         "orders.primary",
-        ignored -> InProcessChannelBuilder.forName(ownerServerName).directExecutor().build(),
+        inProcessOwnerChannelFactory(),
         Client.Config.defaults()
             .withDesiredResourceTier(ResourceTier.RESOURCE_TIER_WARM)
             .withRequestTimeoutMs(1500)
@@ -293,6 +370,7 @@ final class ClientTest {
       assertEquals(ResourceTier.RESOURCE_TIER_WARM, observedTier.get());
       assertEquals(1500, observedTimeoutMs.get());
       assertFalse(observedRequestId.get().isBlank());
+      assertEquals(0, getRouteCalls.get());
     } finally {
       routeChannel.shutdownNow();
       ownerServer.shutdownNow();
@@ -340,12 +418,12 @@ final class ClientTest {
     try (Client first = new Client(
             firstRouteChannel,
             "orders.primary",
-            ignored -> InProcessChannelBuilder.forName(ownerServerName).directExecutor().build(),
+            inProcessOwnerChannelFactory(),
             true);
         Client second = new Client(
             secondRouteChannel,
             "orders.primary",
-            ignored -> InProcessChannelBuilder.forName(ownerServerName).directExecutor().build(),
+            inProcessOwnerChannelFactory(),
             true)) {
       assertEquals(1, first.allocateTimestamps(1).size());
       assertEquals(1, second.allocateTimestamps(1).size());
@@ -415,7 +493,7 @@ final class ClientTest {
     try (Client client = new Client(
         routeChannel,
         "orders.primary",
-        ignored -> InProcessChannelBuilder.forName(ownerServerName).directExecutor().build())) {
+        inProcessOwnerChannelFactory())) {
       var first = executor.submit(() -> client.allocateTimestamps(1));
       assertTrue(firstEntered.await(2, TimeUnit.SECONDS));
       var second = executor.submit(() -> client.allocateTimestamps(1));
@@ -475,6 +553,11 @@ final class ClientTest {
         .build();
   }
 
+  private static Client.AllocationChannelFactory inProcessOwnerChannelFactory() {
+    return ownerWorkerEndpoint ->
+        InProcessChannelBuilder.forName(ownerWorkerEndpoint).directExecutor().build();
+  }
+
   @Test
   void transportConfigRequiresClientCertAndKeyTogether() {
     assertThrows(
@@ -483,7 +566,9 @@ final class ClientTest {
             new Client(
                 "dns:///chronos.internal:50051",
                 "orders.primary",
-                Client.TransportConfig.secure().withTrustedCaPem("ca".getBytes()).withClientIdentityPem("cert".getBytes(), null)));
+                Client.TransportConfig.secure()
+                    .withTrustedCaPem("ca".getBytes())
+                    .withClientIdentityPem("cert".getBytes(), null)));
   }
 
   @Test
@@ -515,7 +600,7 @@ final class ClientTest {
                   new Client(
                       routeChannel,
                       "orders.primary",
-                      ignored -> InProcessChannelBuilder.forName("unused").directExecutor().build()));
+                      inProcessOwnerChannelFactory()));
       assertTrue(err.getMessage().contains("Chronos returned no route from ensureTimeline"));
     } finally {
       routeChannel.shutdownNow();
@@ -524,8 +609,38 @@ final class ClientTest {
   }
 
   @Test
-  void constructorRejectsMissingRefreshedRoute() throws Exception {
+  void allocateRejectsMissingRefreshedRoute() throws Exception {
+    var staleOnFirstAllocate = new AtomicBoolean(true);
     var routeServerName = InProcessServerBuilder.generateName();
+    var ownerServerName = InProcessServerBuilder.generateName();
+    Server ownerServer =
+        InProcessServerBuilder.forName(ownerServerName)
+            .directExecutor()
+            .addService(
+                new TimestampServiceGrpc.TimestampServiceImplBase() {
+                  @Override
+                  public void allocateTimestamps(
+                      AllocateTimestampsRequest request,
+                      StreamObserver<AllocateTimestampsResponse> responseObserver) {
+                    if (staleOnFirstAllocate.getAndSet(false)) {
+                      var status =
+                          com.google.rpc.Status.newBuilder()
+                              .setCode(Status.Code.FAILED_PRECONDITION.value())
+                              .setMessage("stale route")
+                              .addDetails(
+                                  Any.pack(
+                                      ErrorDetail.newBuilder()
+                                          .setCode(ErrorCode.ERROR_CODE_ROUTE_VERSION_MISMATCH)
+                                          .build()))
+                              .build();
+                      responseObserver.onError(StatusProto.toStatusRuntimeException(status));
+                      return;
+                    }
+                    responseObserver.onError(Status.INTERNAL.asRuntimeException());
+                  }
+                })
+            .build()
+            .start();
     Server routeServer =
         InProcessServerBuilder.forName(routeServerName)
             .directExecutor()
@@ -541,7 +656,7 @@ final class ClientTest {
                                 TimelineRoute.newBuilder()
                                     .setTimelineKey(request.getTimelineKey())
                                     .setGeneratorId(7)
-                                    .setOwnerWorkerEndpoint("unused")
+                                    .setOwnerWorkerEndpoint(ownerServerName)
                                     .setEpoch(3)
                                     .setRouteVersion(11)
                                     .setResourceTier(ResourceTier.RESOURCE_TIER_SHARED)
@@ -564,17 +679,17 @@ final class ClientTest {
         InProcessChannelBuilder.forName(routeServerName).directExecutor().build();
 
     try {
-      var err =
-          assertThrows(
-              IllegalStateException.class,
-              () ->
-                  new Client(
-                      routeChannel,
-                      "orders.primary",
-                      ignored -> InProcessChannelBuilder.forName("unused").directExecutor().build()));
-      assertTrue(err.getMessage().contains("Chronos returned no route from getTimelineRoute"));
+      try (Client client =
+          new Client(
+              routeChannel,
+              "orders.primary",
+              inProcessOwnerChannelFactory())) {
+        var err = assertThrows(IllegalStateException.class, () -> client.allocateTimestamps(1));
+        assertTrue(err.getMessage().contains("Chronos returned no route from getTimelineRoute"));
+      }
     } finally {
       routeChannel.shutdownNow();
+      ownerServer.shutdownNow();
       routeServer.shutdownNow();
     }
   }

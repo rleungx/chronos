@@ -12,6 +12,7 @@ permissions:
 
 env:
   CHRONOS_ARTIFACT_RETENTION_DAYS: 14
+  DOCKER_BUILDKIT: 1
 
 jobs:
   layer-0-3-verify:
@@ -32,6 +33,10 @@ jobs:
           sudo apt-get install -y protobuf-compiler ruby
       - name: Run Layer 0 static
         run: make test-layer-0
+      - name: Verify client conformance contract
+        run: make client-conformance-check
+      - name: Verify Rust example
+        run: make client-example-check-rust
       - name: Run Layer 1 smoke
         run: make test-layer-1
       - name: Run Layer 2 binary startup and transport seam
@@ -40,8 +45,6 @@ jobs:
         run: make test-layer-3
       - name: Validate production-shape release config
         run: make release-shape-check
-      - name: Validate container delivery asset
-        run: make container-check
       - name: Validate observability rules
         run: make observability-check
       - name: Validate Kubernetes manifests
@@ -59,6 +62,8 @@ jobs:
           go-version-file: clients/go/go.mod
       - name: Verify Go client
         run: make client-check-go
+      - name: Verify Go example
+        run: make client-example-check-go
 
   client-java:
     runs-on: ubuntu-latest
@@ -74,6 +79,10 @@ jobs:
           gradle-version: '9.4.0'
       - name: Verify Java client
         run: make client-check-java
+      - name: Verify Java example
+        run: make client-example-check-java
+      - name: Verify Java package metadata
+        run: make client-package-check-java
 
   client-cpp:
     runs-on: ubuntu-latest
@@ -86,14 +95,92 @@ jobs:
           sudo apt-get install -y cmake libgrpc++-dev libprotobuf-dev protobuf-compiler protobuf-compiler-grpc
       - name: Verify C++ client
         run: make client-check-cpp
+      - name: Verify C++ example
+        run: make client-example-check-cpp
+      - name: Verify C++ install metadata
+        run: make client-package-check-cpp
+
+  container-image:
+    runs-on: ubuntu-latest
+    if: github.event_name != 'schedule'
+    env:
+      CHRONOS_BUILD_COMMIT: ${{ github.sha }}
+      RUST_BACKTRACE: 1
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build container image
+        run: make CONTAINER_CHECK_IMAGE=chronos:ci CONTAINER_CHECK_FORCE_BUILD=1 container-image-check
+      - name: Save container image
+        run: docker save chronos:ci -o chronos-ci-image.tar
+      - name: Upload container image
+        uses: actions/upload-artifact@v4
+        with:
+          name: chronos-ci-image
+          path: chronos-ci-image.tar
+          if-no-files-found: error
+          retention-days: 1
+
+  container-runtime-check:
+    runs-on: ubuntu-latest
+    needs: container-image
+    if: github.event_name != 'schedule'
+    env:
+      CHRONOS_BUILD_COMMIT: ${{ github.sha }}
+      RUST_BACKTRACE: 1
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download container image
+        uses: actions/download-artifact@v4
+        with:
+          name: chronos-ci-image
+      - name: Load container image
+        run: docker load -i chronos-ci-image.tar
+      - name: Validate container delivery asset
+        run: make CONTAINER_CHECK_IMAGE=chronos:ci CONTAINER_CHECK_FORCE_BUILD=0 container-check
 
   container-vulnerability-scan:
     runs-on: ubuntu-latest
+    needs: container-image
     if: github.event_name != 'schedule'
+    env:
+      CHRONOS_BUILD_COMMIT: ${{ github.sha }}
+      RUST_BACKTRACE: 1
     steps:
       - uses: actions/checkout@v4
+      - name: Download container image
+        uses: actions/download-artifact@v4
+        with:
+          name: chronos-ci-image
+      - name: Load container image
+        run: docker load -i chronos-ci-image.tar
       - name: Scan container image vulnerabilities
-        run: make CONTAINER_CHECK_IMAGE=chronos:vulnerability-scan container-vulnerability-scan
+        run: make CONTAINER_CHECK_IMAGE=chronos:ci CONTAINER_CHECK_FORCE_BUILD=0 container-vulnerability-scan
+
+  release-artifacts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: github.event_name == 'pull_request' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    env:
+      CHRONOS_BUILD_COMMIT: ${{ github.sha }}
+      RUST_BACKTRACE: 1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.94.0
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+      - name: Package reusable release artifacts
+        run: make release-package
+      - name: Upload reusable release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: chronos-ci-release-artifacts
+          path: artifacts/release/
+          if-no-files-found: error
+          retention-days: 1
 
   layer-4-clustered-etcd:
     runs-on: ubuntu-latest
@@ -133,11 +220,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    needs:
+      - release-artifacts
     env:
       CHRONOS_BUILD_COMMIT: ${{ github.sha }}
       RUST_BACKTRACE: 1
       CHRONOS_ARTIFACT_DIR: ${{ github.workspace }}/artifacts
       CHRONOS_KEEP_ARTIFACTS_ON_SUCCESS: 1
+      CHRONOS_SKIP_RELEASE_BUILD: 1
+      CHRONOS_RELEASE_BIN_DIR: ${{ github.workspace }}/artifacts/release
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
@@ -147,6 +238,13 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: chronos-ci-release-artifacts
+          path: artifacts/release
+      - name: Restore release executable bits
+        run: chmod +x artifacts/release/chronos artifacts/release/chronos-bench artifacts/release/chronos-control-bench artifacts/release/chronos-failover-bench
       - name: Run etcd-backed soak validation
         run: make test-soak
       - name: Publish soak summary
@@ -181,11 +279,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    needs:
+      - release-artifacts
     env:
       CHRONOS_BUILD_COMMIT: ${{ github.sha }}
       RUST_BACKTRACE: 1
       CHRONOS_ARTIFACT_DIR: ${{ github.workspace }}/artifacts
       CHRONOS_KEEP_ARTIFACTS_ON_SUCCESS: 1
+      CHRONOS_SKIP_RELEASE_BUILD: 1
+      CHRONOS_RELEASE_BIN_DIR: ${{ github.workspace }}/artifacts/release
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
@@ -195,6 +297,13 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: chronos-ci-release-artifacts
+          path: artifacts/release
+      - name: Restore release executable bits
+        run: chmod +x artifacts/release/chronos artifacts/release/chronos-bench artifacts/release/chronos-control-bench artifacts/release/chronos-failover-bench
       - name: Run etcd-backed chaos recovery validation
         run: make test-chaos
       - name: Publish chaos summary
@@ -229,11 +338,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     if: github.event_name == 'pull_request' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    needs:
+      - release-artifacts
     env:
       CHRONOS_BUILD_COMMIT: ${{ github.sha }}
       RUST_BACKTRACE: 1
       CHRONOS_ARTIFACT_DIR: ${{ github.workspace }}/artifacts
       CHRONOS_KEEP_ARTIFACTS_ON_SUCCESS: 1
+      CHRONOS_SKIP_RELEASE_BUILD: 1
+      CHRONOS_RELEASE_BIN_DIR: ${{ github.workspace }}/artifacts/release
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
@@ -243,6 +356,13 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: chronos-ci-release-artifacts
+          path: artifacts/release
+      - name: Restore release executable bits
+        run: chmod +x artifacts/release/chronos artifacts/release/chronos-bench artifacts/release/chronos-control-bench artifacts/release/chronos-failover-bench
       - name: Run etcd-backed failover benchmark
         run: make test-failover-bench
       - name: Publish failover summary
@@ -276,12 +396,16 @@ jobs:
   scale-real-etcd:
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    if: github.event_name == 'pull_request' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    if: github.event_name == 'pull_request'
+    needs:
+      - release-artifacts
     env:
       CHRONOS_BUILD_COMMIT: ${{ github.sha }}
       RUST_BACKTRACE: 1
       CHRONOS_ARTIFACT_DIR: ${{ github.workspace }}/artifacts
       CHRONOS_KEEP_ARTIFACTS_ON_SUCCESS: 1
+      CHRONOS_SKIP_RELEASE_BUILD: 1
+      CHRONOS_RELEASE_BIN_DIR: ${{ github.workspace }}/artifacts/release
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
@@ -291,6 +415,13 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: chronos-ci-release-artifacts
+          path: artifacts/release
+      - name: Restore release executable bits
+        run: chmod +x artifacts/release/chronos artifacts/release/chronos-bench artifacts/release/chronos-control-bench artifacts/release/chronos-failover-bench
       - name: Run etcd-backed scale benchmark
         run: make test-scale-bench
       - name: Publish scale summary
@@ -321,15 +452,19 @@ jobs:
         if: always()
         run: make etcd-reset
 
-  rebalance-real-etcd:
+  scale-matrix-real-etcd:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
-    if: github.event_name == 'pull_request' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    timeout-minutes: 60
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    needs:
+      - release-artifacts
     env:
       CHRONOS_BUILD_COMMIT: ${{ github.sha }}
       RUST_BACKTRACE: 1
       CHRONOS_ARTIFACT_DIR: ${{ github.workspace }}/artifacts
       CHRONOS_KEEP_ARTIFACTS_ON_SUCCESS: 1
+      CHRONOS_SKIP_RELEASE_BUILD: 1
+      CHRONOS_RELEASE_BIN_DIR: ${{ github.workspace }}/artifacts/release
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
@@ -339,6 +474,72 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: chronos-ci-release-artifacts
+          path: artifacts/release
+      - name: Restore release executable bits
+        run: chmod +x artifacts/release/chronos artifacts/release/chronos-bench artifacts/release/chronos-control-bench artifacts/release/chronos-failover-bench
+      - name: Run reduced etcd-backed scale matrix
+        run: make test-scale-matrix
+      - name: Publish scale matrix summary
+        if: always()
+        run: |
+          if [ -f artifacts/scale-matrix/summary.txt ]; then
+            {
+              echo '## Scale matrix summary'
+              echo ''
+              cat artifacts/scale-matrix/summary.txt
+              echo ''
+              echo '### Scale matrix artifact files'
+              find artifacts/scale-matrix -maxdepth 3 -type f | sort
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Upload scale matrix artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chronos-scale-matrix-artifacts
+          path: artifacts/scale-matrix/
+          if-no-files-found: error
+          retention-days: ${{ env.CHRONOS_ARTIFACT_RETENTION_DAYS }}
+      - name: Verify scale matrix evidence
+        if: always()
+        run: bash hack/verify-evidence.sh artifacts scale-matrix
+      - name: Reset etcd after scale matrix job
+        if: always()
+        run: make etcd-reset
+
+  rebalance-real-etcd:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    if: github.event_name == 'pull_request' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    needs:
+      - release-artifacts
+    env:
+      CHRONOS_BUILD_COMMIT: ${{ github.sha }}
+      RUST_BACKTRACE: 1
+      CHRONOS_ARTIFACT_DIR: ${{ github.workspace }}/artifacts
+      CHRONOS_KEEP_ARTIFACTS_ON_SUCCESS: 1
+      CHRONOS_SKIP_RELEASE_BUILD: 1
+      CHRONOS_RELEASE_BIN_DIR: ${{ github.workspace }}/artifacts/release
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.94.0
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: chronos-ci-release-artifacts
+          path: artifacts/release
+      - name: Restore release executable bits
+        run: chmod +x artifacts/release/chronos artifacts/release/chronos-bench artifacts/release/chronos-control-bench artifacts/release/chronos-failover-bench
       - name: Run etcd-backed rebalance benchmark
         run: make test-rebalance-bench
       - name: Publish rebalance summary
@@ -373,11 +574,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    needs:
+      - release-artifacts
     env:
       CHRONOS_BUILD_COMMIT: ${{ github.sha }}
       RUST_BACKTRACE: 1
       CHRONOS_ARTIFACT_DIR: ${{ github.workspace }}/artifacts
       CHRONOS_KEEP_ARTIFACTS_ON_SUCCESS: 1
+      CHRONOS_SKIP_RELEASE_BUILD: 1
+      CHRONOS_RELEASE_BIN_DIR: ${{ github.workspace }}/artifacts/release
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
@@ -387,6 +592,13 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: chronos-ci-release-artifacts
+          path: artifacts/release
+      - name: Restore release executable bits
+        run: chmod +x artifacts/release/chronos artifacts/release/chronos-bench artifacts/release/chronos-control-bench artifacts/release/chronos-failover-bench
       - name: Run restore DR validation
         run: make test-restore-dr
       - name: Upload restore artifacts

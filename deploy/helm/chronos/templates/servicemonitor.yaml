@@ -1,0 +1,34 @@
+{{- if .Values.serviceMonitor.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "chronos.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "chronos.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "chronos.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: tso
+  endpoints:
+    - port: metrics
+      path: /metrics
+      scheme: https
+      interval: {{ .Values.serviceMonitor.interval }}
+      scrapeTimeout: {{ .Values.serviceMonitor.scrapeTimeout }}
+      tlsConfig:
+        ca:
+          secret:
+            name: {{ .Values.serviceMonitor.tlsSecretName }}
+            key: ca.crt
+        cert:
+          secret:
+            name: {{ .Values.serviceMonitor.tlsSecretName }}
+            key: tls.crt
+        keySecret:
+          name: {{ .Values.serviceMonitor.tlsSecretName }}
+          key: tls.key
+        serverName: {{ .Values.serviceMonitor.serverName }}
+{{- end }}

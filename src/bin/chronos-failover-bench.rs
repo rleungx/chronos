@@ -8,7 +8,6 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use prost::Message;
 use tokio::sync::{Barrier, Mutex};
 use tokio::time::{sleep, timeout};
 use tonic::{transport::Channel, Code, Request, Status};
@@ -485,7 +484,7 @@ fn percentile(sorted: &[u64], pct: f64) -> u64 {
 }
 
 fn decode_error_detail(status: &Status) -> Option<ErrorDetail> {
-    ErrorDetail::decode(status.details()).ok()
+    chronos::rpc::decode_error_detail_from_status_details(status.details())
 }
 
 fn error_label(status: &Status) -> &'static str {
@@ -928,6 +927,7 @@ async fn main() -> AppResult<()> {
 mod tests {
     use super::*;
     use chronos::proto::v1::{OperatorActionBlocker, OperatorActionNextStep};
+    use prost::Message;
 
     #[test]
     fn parse_endpoints_csv_skips_empty_entries() {

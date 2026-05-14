@@ -225,6 +225,9 @@ if [[ -n "${ARTIFACT_ROOT}" ]]; then
   PROFILE_LOG="${ARTIFACT_DIR}/profile-summary.txt"
   ETCD_LOG="${ARTIFACT_DIR}/etcd.log"
   DOCKER_PS_LOG="${ARTIFACT_DIR}/docker-ps.txt"
+  HOST_INFO_LOG="${ARTIFACT_DIR}/host-info.txt"
+  HOST_LOAD_BEFORE_LOG="${ARTIFACT_DIR}/host-load-before.txt"
+  HOST_LOAD_AFTER_LOG="${ARTIFACT_DIR}/host-load-after.txt"
   SUMMARY_LOG="${ARTIFACT_DIR}/summary.txt"
   INDEX_LOG="${ARTIFACT_DIR}/artifact-index.txt"
 else
@@ -233,6 +236,9 @@ else
   PROFILE_LOG=""
   ETCD_LOG=""
   DOCKER_PS_LOG=""
+  HOST_INFO_LOG=""
+  HOST_LOAD_BEFORE_LOG=""
+  HOST_LOAD_AFTER_LOG=""
   SUMMARY_LOG=""
   INDEX_LOG=""
 fi
@@ -312,6 +318,9 @@ artifact_index=${INDEX_LOG}
 chronos_logs=$(join_by_comma "${CHRONOS_LOGS[@]}")
 scale_bench_log=${BENCH_LOG}
 scale_bench_client_logs=$(join_by_comma "${BENCH_CLIENT_LOGS[@]}")
+host_info=${HOST_INFO_LOG}
+host_load_before=${HOST_LOAD_BEFORE_LOG}
+host_load_after=${HOST_LOAD_AFTER_LOG}
 profile_summary=${PROFILE_LOG}
 EOF
 
@@ -322,12 +331,15 @@ EOF
       route_owner_endpoints \
       route_owner_min_timelines \
       route_owner_max_timelines \
+      route_owner_counts \
       allocation_failed_total \
       allocation_measured_failed_total \
       allocation_failure_reasons \
       allocation_measured_failure_reasons \
       connect_timeout_ms \
       connect_retry_interval_ms \
+      allocation_client_channels \
+      concurrency_per_allocation_channel \
       bench_client_processes \
       owner_affinity \
       req_per_sec \
@@ -356,6 +368,26 @@ prom_metric_lines() {
   local metric=$2
   [[ -f "${file}" ]] || return 0
   awk -v metric="${metric}" 'index($1, metric) == 1 { print }' "${file}"
+}
+
+prom_metric_average_us() {
+  local file=$1
+  local count_metric=$2
+  local sum_metric=$3
+  local count
+  local sum
+  count="$(prom_metric_value "${file}" "${count_metric}")"
+  sum="$(prom_metric_value "${file}" "${sum_metric}")"
+  [[ -n "${count}" && -n "${sum}" ]] || return 0
+  python3 - "${count}" "${sum}" <<'PY'
+import sys
+
+count = float(sys.argv[1])
+total_seconds = float(sys.argv[2])
+if count <= 0:
+    raise SystemExit(0)
+print(f"{(total_seconds / count) * 1_000_000:.2f}")
+PY
 }
 
 prom_histogram_quantile_upper_bound() {
@@ -394,6 +426,20 @@ prom_histogram_quantile_upper_bound() {
   ' "${file}"
 }
 
+prom_histogram_quantile_upper_bound_us() {
+  local file=$1
+  local prefix=$2
+  local quantile=$3
+  local upper_bound
+  upper_bound="$(prom_histogram_quantile_upper_bound "${file}" "${prefix}" "${quantile}")"
+  [[ -n "${upper_bound}" && "${upper_bound}" != "+Inf" ]] || return 0
+  python3 - "${upper_bound}" <<'PY'
+import sys
+
+print(f"{float(sys.argv[1]) * 1_000_000:.0f}")
+PY
+}
+
 write_profile_summary() {
   [[ -n "${PROFILE_LOG}" ]] || return 0
   mkdir -p "${ARTIFACT_DIR}"
@@ -401,6 +447,9 @@ write_profile_summary() {
     echo "result=${RESULT}"
     echo "worker_count=${WORKER_COUNT}"
     echo "bench_log=${BENCH_LOG}"
+    echo "host_info=${HOST_INFO_LOG}"
+    echo "host_load_before=${HOST_LOAD_BEFORE_LOG}"
+    echo "host_load_after=${HOST_LOAD_AFTER_LOG}"
     if [[ -f "${BENCH_LOG}" ]]; then
       local key
       local value
@@ -412,6 +461,8 @@ write_profile_summary() {
         connect_timeout_ms \
         connect_retry_interval_ms \
         allocation_connection_pool_size \
+        allocation_client_channels \
+        concurrency_per_allocation_channel \
         bench_client_processes \
         owner_affinity \
         req_per_sec \
@@ -430,14 +481,26 @@ write_profile_summary() {
       done
     fi
 
+    local -a worker_allocate_totals=()
+    local total_allocate=0
     local idx
     local metrics_file
+    local value
+    for ((idx = 0; idx < WORKER_COUNT; idx++)); do
+      metrics_file="${METRICS_LOGS[idx]}"
+      value="$(prom_metric_value "${metrics_file}" "tso_allocate_total")"
+      value="${value:-0}"
+      value="${value%.*}"
+      worker_allocate_totals[idx]="${value}"
+      total_allocate=$((total_allocate + value))
+    done
+    echo "cluster.tso_allocate_total=${total_allocate}"
+
     for ((idx = 0; idx < WORKER_COUNT; idx++)); do
       metrics_file="${METRICS_LOGS[idx]}"
       echo "worker.${idx}.metrics=${metrics_file}"
       [[ -f "${metrics_file}" ]] || continue
       local metric
-      local value
       for metric in \
         tso_allocate_total \
         tso_allocate_latency_seconds_count \
@@ -455,19 +518,100 @@ write_profile_summary() {
         value="$(prom_metric_value "${metrics_file}" "${metric}")"
         [[ -n "${value}" ]] && printf 'worker.%s.%s=%s\n' "${idx}" "${metric}" "${value}"
       done
-      for metric in \
-        'tso_allocate_latency_seconds_bucket' \
-        'tso_allocate_stage_latency_seconds_bucket{path="cached",stage="admission_wait",' \
-        'tso_allocate_stage_latency_seconds_bucket{path="cached",stage="serve",' \
-        'tso_timeline_proxy_wait_seconds_bucket'; do
-        value="$(prom_histogram_quantile_upper_bound "${metrics_file}" "${metric}" "0.999")"
-        [[ -n "${value}" ]] && printf 'worker.%s.%s_p999_upper_bound_seconds=%s\n' "${idx}" "${metric}" "${value}"
+      if [[ "${total_allocate}" -gt 0 ]]; then
+        python3 - "${worker_allocate_totals[idx]}" "${total_allocate}" <<'PY' | while IFS= read -r value; do
+import sys
+
+worker = float(sys.argv[1])
+total = float(sys.argv[2])
+print(f"{worker / total:.4f}")
+PY
+          [[ -n "${value}" ]] && printf 'worker.%s.tso_allocate_share=%s\n' "${idx}" "${value}"
+        done
+      fi
+      local metric_name
+      local metric_prefix
+      for quantile in 0.95 0.99 0.999; do
+        for metric_name in \
+          "tso_allocate_latency" \
+          "cached_admission_wait" \
+          "cached_serve" \
+          "timeline_proxy_wait"; do
+          case "${metric_name}" in
+            tso_allocate_latency)
+              metric_prefix='tso_allocate_latency_seconds_bucket'
+              ;;
+            cached_admission_wait)
+              metric_prefix='tso_allocate_stage_latency_seconds_bucket{path="cached",stage="admission_wait",'
+              ;;
+            cached_serve)
+              metric_prefix='tso_allocate_stage_latency_seconds_bucket{path="cached",stage="serve",'
+              ;;
+            timeline_proxy_wait)
+              metric_prefix='tso_timeline_proxy_wait_seconds_bucket'
+              ;;
+          esac
+          value="$(prom_histogram_quantile_upper_bound_us "${metrics_file}" "${metric_prefix}" "${quantile}")"
+          [[ -n "${value}" ]] && printf 'worker.%s.%s_p%s_upper_bound_us=%s\n' "${idx}" "${metric_name}" "${quantile#0.}" "${value}"
+        done
       done
+      value="$(prom_metric_average_us "${metrics_file}" "tso_allocate_latency_seconds_count" "tso_allocate_latency_seconds_sum")"
+      [[ -n "${value}" ]] && printf 'worker.%s.tso_allocate_latency_avg_us=%s\n' "${idx}" "${value}"
+      value="$(prom_metric_average_us "${metrics_file}" 'tso_allocate_stage_latency_seconds_count{path="cached",stage="admission_wait"}' 'tso_allocate_stage_latency_seconds_sum{path="cached",stage="admission_wait"}')"
+      [[ -n "${value}" ]] && printf 'worker.%s.cached_admission_wait_avg_us=%s\n' "${idx}" "${value}"
+      value="$(prom_metric_average_us "${metrics_file}" 'tso_allocate_stage_latency_seconds_count{path="cached",stage="serve"}' 'tso_allocate_stage_latency_seconds_sum{path="cached",stage="serve"}')"
+      [[ -n "${value}" ]] && printf 'worker.%s.cached_serve_avg_us=%s\n' "${idx}" "${value}"
+      value="$(prom_metric_average_us "${metrics_file}" "tso_timeline_proxy_wait_seconds_count" "tso_timeline_proxy_wait_seconds_sum")"
+      [[ -n "${value}" ]] && printf 'worker.%s.timeline_proxy_wait_avg_us=%s\n' "${idx}" "${value}"
       while IFS= read -r line; do
         [[ -n "${line}" ]] && printf 'worker.%s.%s\n' "${idx}" "${line}"
       done < <(prom_metric_lines "${metrics_file}" "tso_metadata_conflicts_total")
     done
   } >"${PROFILE_LOG}"
+}
+
+capture_host_snapshot() {
+  local label=$1
+  local file=$2
+  [[ -n "${file}" ]] || return 0
+  {
+    echo "label=${label}"
+    echo "captured_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "host=$(hostname)"
+    echo "worker_count=${WORKER_COUNT}"
+    echo "bench_concurrency=${BENCH_CONCURRENCY}"
+    echo "bench_client_processes=${BENCH_CLIENT_PROCESSES}"
+    if command -v uname >/dev/null 2>&1; then
+      echo "uname=$(uname -a)"
+    fi
+    if command -v sysctl >/dev/null 2>&1; then
+      logical_cpus="$(sysctl -n hw.logicalcpu 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || true)"
+      [[ -n "${logical_cpus}" ]] && echo "logical_cpus=${logical_cpus}"
+      physical_cpus="$(sysctl -n hw.physicalcpu 2>/dev/null || true)"
+      [[ -n "${physical_cpus}" ]] && echo "physical_cpus=${physical_cpus}"
+      memory_bytes="$(sysctl -n hw.memsize 2>/dev/null || true)"
+      [[ -n "${memory_bytes}" ]] && echo "memory_bytes=${memory_bytes}"
+    elif command -v nproc >/dev/null 2>&1; then
+      echo "logical_cpus=$(nproc)"
+    fi
+    if command -v uptime >/dev/null 2>&1; then
+      echo "uptime=$(uptime)"
+    fi
+    if command -v vm_stat >/dev/null 2>&1; then
+      echo "vm_stat_begin"
+      vm_stat || true
+      echo "vm_stat_end"
+    elif command -v free >/dev/null 2>&1; then
+      echo "free_begin"
+      free -m || true
+      echo "free_end"
+    fi
+    if [[ "${#CHRONOS_PIDS[@]}" -gt 0 ]]; then
+      echo "chronos_processes_begin"
+      ps -o pid,ppid,%cpu,%mem,rss,command -p "$(join_by_comma "${CHRONOS_PIDS[@]}")" 2>/dev/null || true
+      echo "chronos_processes_end"
+    fi
+  } >"${file}"
 }
 
 capture_diagnostics() {
@@ -614,6 +758,15 @@ for row in rows:
         cold_failure_counts[reason] += count
 
 route_values = list(route_counts.values())
+allocation_client_channels = (
+    len(route_counts)
+    * int(float(first("allocation_connection_pool_size", "0") or 0))
+    * len(rows)
+)
+concurrency = sum_int("concurrency")
+concurrency_per_channel = (
+    concurrency / allocation_client_channels if allocation_client_channels else 0.0
+)
 lines = [
     ("scenario", first("scenario")),
     ("endpoint", first("endpoint")),
@@ -623,7 +776,7 @@ lines = [
     ("route_owner_min_timelines", str(min(route_values) if route_values else 0)),
     ("route_owner_max_timelines", str(max(route_values) if route_values else 0)),
     ("route_owner_counts", format_counts(route_counts)),
-    ("concurrency", str(sum_int("concurrency"))),
+    ("concurrency", str(concurrency)),
     ("timelines", str(sum_int("timelines"))),
     ("batch", first("batch")),
     ("idempotency_enabled", first("idempotency_enabled")),
@@ -633,6 +786,8 @@ lines = [
     ("connect_timeout_ms", first("connect_timeout_ms")),
     ("connect_retry_interval_ms", first("connect_retry_interval_ms")),
     ("allocation_connection_pool_size", first("allocation_connection_pool_size")),
+    ("allocation_client_channels", str(allocation_client_channels)),
+    ("concurrency_per_allocation_channel", f"{concurrency_per_channel:.2f}"),
     ("bench_client_processes", str(len(rows))),
     ("cold_probe_enabled", first("cold_probe_enabled")),
     ("cold_probe_concurrency", str(sum_int("cold_probe_concurrency"))),
@@ -675,6 +830,7 @@ wait_for_etcd "${WAIT_ATTEMPTS}" "${WAIT_INTERVAL_SECS}"
 
 echo "[scale] preparing release binaries"
 ensure_release_binaries "${RELEASE_BIN_DIR}" chronos chronos-bench
+capture_host_snapshot "host_info" "${HOST_INFO_LOG}"
 
 echo "[scale] validating ${WORKER_COUNT}-worker ownership plan"
 for ((idx = 0; idx < WORKER_COUNT; idx++)); do
@@ -720,6 +876,7 @@ if [[ "${POST_READY_SLEEP_SECS}" -gt 0 ]]; then
   echo "[scale] waiting ${POST_READY_SLEEP_SECS}s for route watchers and leases to settle"
   sleep "${POST_READY_SLEEP_SECS}"
 fi
+capture_host_snapshot "before_bench" "${HOST_LOAD_BEFORE_LOG}"
 
 echo "[scale] running ${WORKER_COUNT}-worker route-aware allocation benchmark with ${BENCH_CLIENT_PROCESSES} client process(es)"
 : >"${BENCH_LOG}"
@@ -765,6 +922,7 @@ if [[ "${BENCH_CLIENT_FAILED}" -ne 0 ]]; then
   exit 1
 fi
 aggregate_bench_logs "${BENCH_LOG}" "${BENCH_CLIENT_LOGS[@]}"
+capture_host_snapshot "after_bench" "${HOST_LOAD_AFTER_LOG}"
 cat "${BENCH_LOG}"
 
 for ((idx = 0; idx < WORKER_COUNT; idx++)); do

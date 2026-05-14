@@ -332,7 +332,7 @@ public class Client implements AutoCloseable {
                   .build());
       requireRoute("ensureTimeline", ensureResponse.hasRoute(), ensureResponse.getRoute());
 
-      return refreshRouteLocked();
+      return installRouteLocked(ensureResponse.getRoute());
     }
   }
 
@@ -353,6 +353,10 @@ public class Client implements AutoCloseable {
             .getTimelineRoute(
                 GetTimelineRouteRequest.newBuilder().setTimelineKey(timelineKey).build());
     TimelineRoute route = requireRoute("getTimelineRoute", response.hasRoute(), response.getRoute());
+    return installRouteLocked(route);
+  }
+
+  private TimelineRoute installRouteLocked(TimelineRoute route) {
     ensureOwnerChannelLocked(route.getOwnerWorkerEndpoint());
     this.route.set(route);
     return route;
@@ -437,10 +441,11 @@ public class Client implements AutoCloseable {
             || detail.getCode() == ErrorCode.ERROR_CODE_EPOCH_MISMATCH) {
           return true;
         }
-      } catch (Exception ignored) {
+      } catch (Exception unpackError) {
+        continue;
       }
     }
-    return Status.fromThrowable(err).getCode() == Status.Code.FAILED_PRECONDITION;
+    return false;
   }
 
   @Override

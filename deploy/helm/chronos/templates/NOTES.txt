@@ -1,0 +1,10 @@
+Chronos has been rendered for {{ .Release.Namespace }} with {{ .Values.replicaCount }} static ownership replicas.
+
+Before applying a changed replica count, generate and review the ownership movement plan:
+  make kubernetes-scale-plan CHRONOS_OWNERSHIP_OLD_WORKERS=<old> CHRONOS_OWNERSHIP_NEW_WORKERS={{ .Values.replicaCount }}
+
+Required pre-created secrets:
+  - {{ .Values.security.grpcTlsSecretName }}
+  - {{ .Values.security.metricsTlsSecretName }}
+  - {{ .Values.etcd.tlsSecretName }}
+  - {{ .Values.security.clientCertAllowlistSecretName }}

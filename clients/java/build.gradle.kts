@@ -1,11 +1,15 @@
 plugins {
     id("java")
     id("com.google.protobuf") version "0.10.0"
+    id("maven-publish")
 }
 
 repositories {
     mavenCentral()
 }
+
+group = "io.github.rleungx"
+version = "0.1.0"
 
 val grpcVersion = "1.76.0"
 val protobufVersion = "4.34.1"
@@ -13,7 +17,6 @@ val protobufVersion = "4.34.1"
 dependencies {
     implementation("io.grpc:grpc-netty-shaded:$grpcVersion")
     implementation("com.google.protobuf:protobuf-java:$protobufVersion")
-    implementation("io.grpc:grpc-okhttp:$grpcVersion")
     implementation("io.grpc:grpc-protobuf:$grpcVersion")
     implementation("io.grpc:grpc-stub:$grpcVersion")
     compileOnly("org.apache.tomcat:annotations-api:6.0.53")
@@ -32,7 +35,6 @@ sourceSets {
     main {
         java {
             srcDir("src/main/java")
-            srcDir("../../examples/java")
         }
         resources {
             setSrcDirs(emptyList<String>())
@@ -47,6 +49,17 @@ sourceSets {
             setSrcDirs(emptyList<String>())
         }
     }
+}
+
+val exampleSourceSet = sourceSets.create("example") {
+    java {
+        srcDir("../../examples/java")
+    }
+    resources {
+        setSrcDirs(emptyList<String>())
+    }
+    compileClasspath += sourceSets["main"].output + configurations["runtimeClasspath"]
+    runtimeClasspath += output + compileClasspath
 }
 
 val syncRootProto by tasks.registering(Copy::class) {
@@ -75,7 +88,31 @@ protobuf {
 tasks.register<JavaExec>("runExample") {
     group = "application"
     mainClass.set("ClientExample")
-    classpath = sourceSets["main"].runtimeClasspath
+    classpath = exampleSourceSet.runtimeClasspath
+}
+
+publishing {
+    publications {
+        create<MavenPublication>("mavenJava") {
+            from(components["java"])
+            pom {
+                name.set("Chronos Java Client")
+                description.set("Application-facing Chronos timestamp client")
+                url.set("https://github.com/rleungx/chronos")
+                licenses {
+                    license {
+                        name.set("MIT OR Apache-2.0")
+                    }
+                }
+            }
+        }
+    }
+    repositories {
+        maven {
+            name = "localStaging"
+            url = layout.buildDirectory.dir("staging-repo").get().asFile.toURI()
+        }
+    }
 }
 
 tasks.test {

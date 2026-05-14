@@ -22,6 +22,8 @@ using chronos::tso::v1::TimestampService;
 namespace {
 
 std::atomic<uint64_t> g_client_scope_counter{1};
+constexpr const char* kErrorDetailTypeUrl =
+    "type.googleapis.com/chronos.tso.v1.ErrorDetail";
 
 std::string MakeIdempotencyScope() {
   auto now = std::chrono::steady_clock::now().time_since_epoch().count();
@@ -44,6 +46,124 @@ Client::Config ConfigWithTransport(
   auto config = ConfigWithTransport(std::move(transport_config));
   config.idempotency_enabled = idempotency_enabled;
   return config;
+}
+
+bool ReadVarint(const std::string& input, size_t* offset, uint64_t* value) {
+  uint64_t result = 0;
+  for (int shift = 0; shift <= 63; shift += 7) {
+    if (*offset >= input.size()) {
+      return false;
+    }
+    const uint8_t byte = static_cast<uint8_t>(input[(*offset)++]);
+    result |= static_cast<uint64_t>(byte & 0x7f) << shift;
+    if ((byte & 0x80) == 0) {
+      *value = result;
+      return true;
+    }
+  }
+  return false;
+}
+
+bool ReadLengthDelimited(
+    const std::string& input,
+    size_t* offset,
+    std::string* value) {
+  uint64_t length = 0;
+  if (!ReadVarint(input, offset, &length)) {
+    return false;
+  }
+  if (length > input.size() - *offset) {
+    return false;
+  }
+  value->assign(input.data() + *offset, static_cast<size_t>(length));
+  *offset += static_cast<size_t>(length);
+  return true;
+}
+
+bool SkipField(const std::string& input, size_t* offset, uint32_t wire_type) {
+  uint64_t varint_value = 0;
+  std::string length_delimited_value;
+  switch (wire_type) {
+    case 0:
+      return ReadVarint(input, offset, &varint_value);
+    case 1:
+      if (input.size() - *offset < 8) {
+        return false;
+      }
+      *offset += 8;
+      return true;
+    case 2:
+      return ReadLengthDelimited(input, offset, &length_delimited_value);
+    case 5:
+      if (input.size() - *offset < 4) {
+        return false;
+      }
+      *offset += 4;
+      return true;
+    default:
+      return false;
+  }
+}
+
+bool IsErrorDetailTypeUrl(const std::string& type_url) {
+  const std::string suffix = "/chronos.tso.v1.ErrorDetail";
+  return type_url == kErrorDetailTypeUrl ||
+         (type_url.size() >= suffix.size() &&
+          type_url.compare(type_url.size() - suffix.size(), suffix.size(), suffix) == 0);
+}
+
+bool ParseErrorDetailAny(const std::string& input, ErrorDetail* detail) {
+  size_t offset = 0;
+  std::string type_url;
+  std::string value;
+  while (offset < input.size()) {
+    uint64_t tag = 0;
+    if (!ReadVarint(input, &offset, &tag)) {
+      return false;
+    }
+    const uint32_t field_number = static_cast<uint32_t>(tag >> 3);
+    const uint32_t wire_type = static_cast<uint32_t>(tag & 0x07);
+    if (field_number == 1 && wire_type == 2) {
+      if (!ReadLengthDelimited(input, &offset, &type_url)) {
+        return false;
+      }
+    } else if (field_number == 2 && wire_type == 2) {
+      if (!ReadLengthDelimited(input, &offset, &value)) {
+        return false;
+      }
+    } else if (!SkipField(input, &offset, wire_type)) {
+      return false;
+    }
+  }
+  return IsErrorDetailTypeUrl(type_url) && detail->ParseFromString(value);
+}
+
+bool ParseRichErrorDetail(const std::string& input, ErrorDetail* detail) {
+  size_t offset = 0;
+  while (offset < input.size()) {
+    uint64_t tag = 0;
+    if (!ReadVarint(input, &offset, &tag)) {
+      return false;
+    }
+    const uint32_t field_number = static_cast<uint32_t>(tag >> 3);
+    const uint32_t wire_type = static_cast<uint32_t>(tag & 0x07);
+    if (field_number == 3 && wire_type == 2) {
+      std::string any;
+      if (!ReadLengthDelimited(input, &offset, &any)) {
+        return false;
+      }
+      if (ParseErrorDetailAny(any, detail)) {
+        return true;
+      }
+    } else if (!SkipField(input, &offset, wire_type)) {
+      return false;
+    }
+  }
+  return false;
+}
+
+bool ParseStatusErrorDetail(const std::string& input, ErrorDetail* detail) {
+  return ParseRichErrorDetail(input, detail) || detail->ParseFromString(input);
 }
 
 }  // namespace
@@ -118,9 +238,8 @@ TimelineRoute Client::EnsureRoute() {
 }
 
 TimelineRoute Client::EnsureRouteLocked() {
-  auto it = cache_.find(timeline_key_);
-  if (it != cache_.end()) {
-    return it->second;
+  if (has_route_) {
+    return route_;
   }
   grpc::ClientContext ctx;
   EnsureTimelineRequest request;
@@ -138,13 +257,12 @@ TimelineRoute Client::EnsureRouteLocked() {
     throw std::runtime_error(
         "chronos returned route with empty owner endpoint from EnsureTimeline");
   }
-  return RefreshRouteLocked();
+  return InstallRouteLocked(response.route());
 }
 
 TimelineRoute Client::RefreshRouteIfUnchangedLocked(const TimelineRoute& observed_route) {
-  auto it = cache_.find(timeline_key_);
-  if (it != cache_.end() && !SameRouteIdentity(it->second, observed_route)) {
-    return it->second;
+  if (has_route_ && !SameRouteIdentity(route_, observed_route)) {
+    return route_;
   }
   return RefreshRouteLocked();
 }
@@ -166,9 +284,15 @@ TimelineRoute Client::RefreshRouteLocked() {
     throw std::runtime_error(
         "chronos returned route with empty owner endpoint from GetTimelineRoute");
   }
+  return InstallRouteLocked(route);
+}
+
+TimelineRoute Client::InstallRouteLocked(const TimelineRoute& route) {
   tso_channel_ = CreateChannel(route.owner_worker_endpoint());
-  tso_stub_ = std::shared_ptr<TimestampService::Stub>(TimestampService::NewStub(tso_channel_).release());
-  cache_[timeline_key_] = route;
+  tso_stub_ = std::shared_ptr<TimestampService::Stub>(
+      TimestampService::NewStub(tso_channel_).release());
+  route_ = route;
+  has_route_ = true;
   return route;
 }
 
@@ -219,7 +343,7 @@ bool Client::IsStaleRouteError(const grpc::Status& status) {
     return false;
   }
   ErrorDetail detail;
-  if (!detail.ParseFromString(status.error_details())) {
+  if (!ParseStatusErrorDetail(status.error_details(), &detail)) {
     return false;
   }
   return detail.code() == ErrorCode::ERROR_CODE_NOT_TIMELINE_OWNER ||

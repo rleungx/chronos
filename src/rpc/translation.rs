@@ -69,11 +69,11 @@ fn trace_runtime_protection(err: &TsoError) {
 
 #[cfg(test)]
 mod tests {
-    use prost::Message;
     use tonic::Code;
 
     use super::*;
-    use crate::proto::v1::{ErrorCode, ErrorDetail};
+    use crate::proto::v1::ErrorCode;
+    use crate::rpc::decode_error_detail_from_status_details;
 
     #[test]
     fn timeline_proxy_timeout_maps_to_deadline_exceeded_status() {
@@ -90,7 +90,8 @@ mod tests {
                 timeline_key: "timeline-a".into(),
             }));
 
-        let detail = ErrorDetail::decode(status.details()).expect("error detail should decode");
+        let detail = decode_error_detail_from_status_details(status.details())
+            .expect("error detail should decode");
 
         assert_eq!(status.code(), Code::NotFound);
         assert_eq!(detail.code, ErrorCode::TimelineNotFound as i32);

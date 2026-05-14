@@ -10,7 +10,6 @@ use std::sync::Arc;
 use common_config::required_test_config;
 use common_etcd_endpoints::test_etcd_endpoints;
 use common_etcd_prefix::unique_test_etcd_prefix;
-use prost::Message;
 use tonic::{Code, Request};
 
 use chronos::lifecycle::TimelineLifecycleContract;
@@ -23,10 +22,9 @@ use chronos::proto::v1::{
     timeline_route_service_server::TimelineRouteService,
     timeline_status_service_server::TimelineStatusService,
     timestamp_service_server::TimestampService, AllocateTimestampsRequest as ProtoAllocateRequest,
-    EnsureTimelineRequest, ErrorCode, ErrorDetail, GetTimelineRouteRequest,
-    GetTimelineStatusRequest, ListTimelineStatusesRequest, OperatorActionBlocker,
-    OperatorActionNextStep, TimelineState, TimelineTransferReason, TransferTimelineRequest,
-    WorkerReadinessReason, WorkerReadinessState,
+    EnsureTimelineRequest, ErrorCode, GetTimelineRouteRequest, GetTimelineStatusRequest,
+    ListTimelineStatusesRequest, OperatorActionBlocker, OperatorActionNextStep, TimelineState,
+    TimelineTransferReason, TransferTimelineRequest, WorkerReadinessReason, WorkerReadinessState,
 };
 use chronos::rpc::{
     HealthStatusHandle, TsoControlService, TsoRouteService, TsoTimelineStatusService,
@@ -408,7 +406,8 @@ async fn timestamp_rpc_returns_structured_error_details() {
         .await
         .unwrap_err();
 
-    let detail = ErrorDetail::decode(error.details()).expect("error detail should decode");
+    let detail = chronos::rpc::decode_error_detail_from_status_details(error.details())
+        .expect("error detail should decode");
     assert_eq!(detail.code, ErrorCode::RouteVersionMismatch as i32);
     assert_eq!(detail.current_route_version, route.route_version);
     assert!(detail.message.contains("route version mismatch"));
@@ -471,7 +470,8 @@ async fn timeline_public_surfaces_follow_lifecycle_contract_for_direct_unavailab
             .unwrap_err();
 
         assert_eq!(error.code(), Code::Unavailable);
-        let detail = ErrorDetail::decode(error.details()).expect("error detail should decode");
+        let detail = chronos::rpc::decode_error_detail_from_status_details(error.details())
+            .expect("error detail should decode");
         assert_eq!(detail.code, ErrorCode::TemporarilyUnavailable as i32);
         assert!(detail.message.contains("timeline not ready"));
         assert!(detail.message.contains(&format!("state={state}")));
@@ -506,7 +506,8 @@ async fn transfer_timeline_rpc_reports_failover_lease_blocker_in_error_detail() 
         .unwrap_err();
 
     assert_eq!(error.code(), Code::FailedPrecondition);
-    let detail = ErrorDetail::decode(error.details()).expect("error detail should decode");
+    let detail = chronos::rpc::decode_error_detail_from_status_details(error.details())
+        .expect("error detail should decode");
     assert_eq!(detail.code, ErrorCode::TemporarilyUnavailable as i32);
     assert_eq!(
         detail.action_blocker,
@@ -560,7 +561,8 @@ async fn transfer_timeline_rpc_reports_failover_floor_blocker_in_error_detail() 
         .unwrap_err();
 
     assert_eq!(error.code(), Code::FailedPrecondition);
-    let detail = ErrorDetail::decode(error.details()).expect("error detail should decode");
+    let detail = chronos::rpc::decode_error_detail_from_status_details(error.details())
+        .expect("error detail should decode");
     assert_eq!(detail.code, ErrorCode::TemporarilyUnavailable as i32);
     assert_eq!(
         detail.action_blocker,

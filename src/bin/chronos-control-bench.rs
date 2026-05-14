@@ -5,7 +5,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
-use prost::Message;
 use tokio::sync::Barrier;
 use tonic::transport::Channel;
 use tonic::{Code, Request, Status};
@@ -652,8 +651,7 @@ fn decode_error_detail(status: &Status) -> Option<ErrorDetail> {
     if status.details().is_empty() {
         return None;
     }
-    ErrorDetail::decode(status.details())
-        .ok()
+    chronos::rpc::decode_error_detail_from_status_details(status.details())
         .filter(|detail| detail.code != ErrorCode::Unspecified as i32)
 }
 

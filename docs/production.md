@@ -40,6 +40,12 @@ mixed plan IDs, mixed modulo values, duplicate remainders, duplicate worker IDs,
 advertise endpoints on the same etcd prefix. Clients and benchmarks must route allocation requests
 to the `owner_worker_endpoint` returned by the timeline route service.
 
+The Kubernetes manifest uses this static partitioning model directly: the StatefulSet runs three
+replicas with `CHRONOS_GENERATOR_OWNERSHIP_MODULO=3`, and each pod derives
+`CHRONOS_GENERATOR_OWNERSHIP_REMAINDER` from its StatefulSet ordinal. Do not attach a normal HPA to
+this StatefulSet. Changing replica count changes the ownership modulo and must be handled as a
+planned repartition with a new ownership plan ID, release evidence, and a rebalance/failover window.
+
 Before changing worker count, generate an ownership movement plan:
 
 ```bash
@@ -127,8 +133,10 @@ make release-gate
 
 `make release-check` covers clippy, layer-0/2/3 validation, observability checks, dependency
 policy, release-shape validation, container delivery checks, and release builds. `make
-release-gate` adds layer-4 plus the long-running etcd-backed soak, chaos, failover, scale matrix,
-rebalance, and restore validation bundle.
+release-gate` adds release packaging, build metadata, SBOM/hash checks, container vulnerability scanning,
+clustered layer-4 validation, and the long-running etcd-backed soak, chaos, failover, production
+scale matrix, rebalance, and restore validation bundle. The local gate writes retained evidence to
+`artifacts/release-gate` by default and verifies the evidence bundle before returning success.
 
 ## Interpreting retained artifacts
 
@@ -142,6 +150,7 @@ When `CHRONOS_ARTIFACT_DIR` is set, the long-running harnesses retain:
 - `readyz.txt`
 - `metrics.txt`
 - `profile-summary.txt` for scale runs, derived from benchmark output and per-worker metrics
+- `host-info.txt`, `host-load-before.txt`, and `host-load-after.txt` for scale runs
 
 Recommended triage order:
 
@@ -203,12 +212,15 @@ your hardware, but do not remove the gates.
   for broader production evidence. The matrix scales load with worker count through
   `CHRONOS_SCALE_MATRIX_CONCURRENCY_PER_WORKER` and
   `CHRONOS_SCALE_MATRIX_TIMELINES_PER_WORKER`, defaulting to `8` and `32`.
+  `CHRONOS_SCALE_MATRIX_BENCH_CLIENT_PROCESSES_PER_WORKER` defaults to `1`, so each worker added
+  to the matrix also gets an additional benchmark process unless `CHRONOS_SCALE_BENCH_CLIENT_PROCESSES`
+  is set explicitly. This prevents a single benchmark process from becoming the default linearity
+  bottleneck.
   `CHRONOS_SCALE_MATRIX_LINEAR_EFFICIENCY_MIN` controls the minimum relative throughput
   efficiency versus the first matrix entry and defaults to `0.55` for the local single-host gate.
   Use a stricter value, such as `0.80`, when benchmark clients and Chronos workers run on separate
   production-like hosts. Use a higher `CHRONOS_SCALE_MATRIX_CONCURRENCY_PER_WORKER` in those
-  environments for saturation testing; the local default intentionally stays below the single
-  benchmark-process saturation point so it measures server-side scaling shape.
+  environments for saturation testing.
   `make test-scale-matrix-production` runs the same matrix with `2,3,5,8` workers and a default
   `0.80` linear-efficiency floor. Use it on production-like hosts with isolated benchmark clients
   before claiming linear scale-out capacity.
@@ -240,13 +252,31 @@ This repo proves the single-repo release gate, startup contracts, alert rule val
 single-node/local etcd validation harnesses, and route-aware scale smoke with disjoint generator
 ownership. `chronos-bench` maintains a configurable gRPC connection pool per owner endpoint and
 reuses those channels across worker tasks. The scale harness can also run multiple benchmark client
-processes and aggregate their output with `CHRONOS_SCALE_BENCH_CLIENT_PROCESSES`; keep the local
-default at one process unless benchmark clients run on separate hosts, because local client
-processes compete with the service workers and can hide server capacity. `make test-scale-bench`
+processes and aggregate their output with `CHRONOS_SCALE_BENCH_CLIENT_PROCESSES`; scale matrix runs
+default to one benchmark process per Chronos worker, while single-size `make test-scale-bench`
+keeps one process unless configured explicitly. Local client processes still compete with service
+workers, so production capacity claims should come from isolated benchmark clients. `make test-scale-bench`
 defaults to two workers; use `CHRONOS_SCALE_WORKERS=N` to run the same harness for one size, or
 `make test-scale-matrix` with `CHRONOS_SCALE_MATRIX_WORKERS=2,3,5,8` for a multi-size local matrix.
 Use `make test-scale-matrix-production` for the stricter production-style linearity gate once the
-benchmark clients are isolated from Chronos workers.
+benchmark clients are isolated from Chronos workers. Keep the generated `scale-matrix/summary.txt`
+with release evidence; it includes per-worker linear efficiency and the minimum expected
+throughput at the configured efficiency floor. Evidence verification also rechecks that each matrix
+entry contains throughput, linear-efficiency, zero-allocation-failure metrics, and profile p95/p99
+latency evidence, so incomplete or stale scale artifacts cannot pass the release evidence gate.
+Scale `profile-summary.txt` also contains derived per-worker average and p95/p99/p999 allocation,
+cached admission-wait, cached serve, proxy-wait latencies, plus per-worker allocation share, so a
+regression can be triaged from retained artifacts before collecting deeper host profiles.
+
+For Kubernetes scale changes, generate a planned ownership transition first:
+
+```bash
+make kubernetes-scale-plan CHRONOS_OWNERSHIP_OLD_WORKERS=3 CHRONOS_OWNERSHIP_NEW_WORKERS=5
+```
+
+Apply the generated ownership plan ID, StatefulSet replica count, ConfigMap modulo, and PDB
+`minAvailable=replicas-1` together. The manifest validator rejects mismatched replicas/modulo/PDB
+because a generic or partial scale change can create overlapping generator ownership.
 
 You still need environment evidence for clustered etcd quorum behavior, backup/restore drills,
 larger worker counts, staged rollout safety, and production alert threshold tuning.

@@ -189,6 +189,9 @@ func TestClientNewAndAllocateTimestamps(t *testing.T) {
 	if server.ensureCalls != 1 {
 		t.Fatalf("expected one ensure call, got %d", server.ensureCalls)
 	}
+	if server.getRouteCalls != 0 {
+		t.Fatalf("expected initial route from ensure response without extra get, got %d get calls", server.getRouteCalls)
+	}
 	if server.allocateCalls != 1 {
 		t.Fatalf("expected one allocate call, got %d", server.allocateCalls)
 	}
@@ -222,8 +225,8 @@ func TestClientRefreshesStaleRouteAndRetries(t *testing.T) {
 
 	server.mu.Lock()
 	defer server.mu.Unlock()
-	if server.getRouteCalls < 1 {
-		t.Fatalf("expected route refresh to happen, got %d get calls", server.getRouteCalls)
+	if server.getRouteCalls != 1 {
+		t.Fatalf("expected one route refresh after stale route, got %d get calls", server.getRouteCalls)
 	}
 	if server.allocateCalls != 2 {
 		t.Fatalf("expected one failed allocate and one retry, got %d calls", server.allocateCalls)
@@ -352,14 +355,20 @@ func TestClientRejectsMissingEnsureRoute(t *testing.T) {
 }
 
 func TestClientRejectsMissingRefreshedRoute(t *testing.T) {
-	server, addr := startFakeChronosServer(t, false)
+	server, addr := startFakeChronosServer(t, true)
 	server.mu.Lock()
 	server.omitGetRoute = true
 	server.mu.Unlock()
 
-	_, err := NewWithOptions(context.Background(), addr, "orders.primary", WithInsecureTransport())
+	client, err := NewWithOptions(context.Background(), addr, "orders.primary", WithInsecureTransport())
+	if err != nil {
+		t.Fatalf("NewWithOptions returned error: %v", err)
+	}
+	defer client.Close()
+
+	_, err = client.AllocateTimestamps(context.Background(), 1)
 	if err == nil {
-		t.Fatal("expected missing refreshed route to fail")
+		t.Fatal("expected missing refreshed route to fail after stale route")
 	}
 	if !strings.Contains(err.Error(), "chronos returned no route from get_timeline_route") {
 		t.Fatalf("unexpected error: %v", err)

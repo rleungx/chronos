@@ -38,7 +38,6 @@ required = {
   "ConfigMap" => "chronos-config",
   "PodDisruptionBudget" => "chronos",
   "StatefulSet" => "chronos",
-  "HorizontalPodAutoscaler" => "chronos",
   "NetworkPolicy" => "chronos-ingress",
   "ServiceMonitor" => "chronos"
 }
@@ -59,6 +58,8 @@ data = config.fetch("data", {})
   "CHRONOS_BIND_ADDR" => "0.0.0.0:50051",
   "CHRONOS_HEALTH_BIND_ADDR" => "0.0.0.0:9897",
   "CHRONOS_METRICS_BIND_ADDR" => "0.0.0.0:9898",
+  "CHRONOS_OWNERSHIP_PLAN_ID" => "kubernetes-static-3",
+  "CHRONOS_GENERATOR_OWNERSHIP_MODULO" => "3",
   "CHRONOS_AUTO_FAILOVER_ENABLED" => "true"
 }.each do |key, expected|
   fail!("ConfigMap chronos-config #{key} must be #{expected}") unless data[key] == expected
@@ -68,7 +69,11 @@ fail!("CHRONOS_ETCD_ENDPOINTS must use https") unless data.fetch("CHRONOS_ETCD_E
 statefulset = named(docs, "StatefulSet", "chronos")
 spec = statefulset.fetch("spec")
 fail!("StatefulSet must use chronos-headless serviceName") unless spec["serviceName"] == "chronos-headless"
-fail!("StatefulSet replicas must be at least 3") unless spec.fetch("replicas", 0).to_i >= 3
+replicas = spec.fetch("replicas", 0).to_i
+ownership_modulo = data.fetch("CHRONOS_GENERATOR_OWNERSHIP_MODULO", "0").to_i
+fail!("StatefulSet replicas must be at least 3") unless replicas >= 3
+fail!("StatefulSet replicas must match CHRONOS_GENERATOR_OWNERSHIP_MODULO") unless replicas == ownership_modulo
+fail!("CHRONOS_OWNERSHIP_PLAN_ID should include the static replica count") unless data.fetch("CHRONOS_OWNERSHIP_PLAN_ID", "").end_with?("-#{replicas}")
 fail!("StatefulSet podManagementPolicy must be Parallel") unless spec["podManagementPolicy"] == "Parallel"
 
 pod_spec = dig(statefulset, "spec", "template", "spec") || {}
@@ -86,6 +91,9 @@ container = Array(pod_spec["containers"]).find { |entry| entry["name"] == "chron
 fail!("missing chronos container") unless container
 image = container.fetch("image", "")
 fail!("chronos image must not use latest") if image.end_with?(":latest") || image == "latest"
+container_args = Array(container["args"]).join("\n")
+fail!("chronos container must derive ownership remainder from StatefulSet ordinal") unless container_args.include?("CHRONOS_GENERATOR_OWNERSHIP_REMAINDER")
+fail!("chronos container must exec the chronos binary") unless container_args.include?("exec /usr/local/bin/chronos")
 
 ports = Array(container["ports"]).map { |port| [port["name"], port["containerPort"]] }.to_h
 {"grpc" => 50051, "health" => 9897, "metrics" => 9898}.each do |name, port|
@@ -130,6 +138,7 @@ fail!("container must drop all capabilities") unless dig(security, "capabilities
 ].each do |name|
   fail!("container env missing #{name}") unless env_value(container, name)
 end
+fail!("CHRONOS_GENERATOR_OWNERSHIP_REMAINDER must be derived at runtime, not hard-coded") if env_value(container, "CHRONOS_GENERATOR_OWNERSHIP_REMAINDER")
 
 mount_names = Array(container["volumeMounts"]).map { |mount| mount["name"] }
 %w[tls-work tmp].each do |name|
@@ -142,11 +151,10 @@ volume_names = Array(pod_spec["volumes"]).map { |volume| volume["name"] }
 end
 
 pdb = named(docs, "PodDisruptionBudget", "chronos")
-fail!("PDB minAvailable must be at least 2") unless dig(pdb, "spec", "minAvailable").to_i >= 2
+expected_min_available = replicas - 1
+fail!("PDB minAvailable must be replicas-1 for planned static partitioning") unless dig(pdb, "spec", "minAvailable").to_i == expected_min_available
 
-hpa = named(docs, "HorizontalPodAutoscaler", "chronos")
-fail!("HPA minReplicas must be at least 3") unless dig(hpa, "spec", "minReplicas").to_i >= 3
-fail!("HPA maxReplicas must be above minReplicas") unless dig(hpa, "spec", "maxReplicas").to_i > dig(hpa, "spec", "minReplicas").to_i
+fail!("Kubernetes manifest must not define HPA for partitioned generator ownership") if named(docs, "HorizontalPodAutoscaler", "chronos")
 
 monitor = named(docs, "ServiceMonitor", "chronos")
 endpoint = Array(dig(monitor, "spec", "endpoints")).first || {}

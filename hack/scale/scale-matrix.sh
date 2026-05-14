@@ -35,6 +35,7 @@ matrix_workers="${CHRONOS_SCALE_MATRIX_WORKERS:-2,3}"
 matrix_efficiency_min="${CHRONOS_SCALE_MATRIX_LINEAR_EFFICIENCY_MIN:-0.55}"
 matrix_concurrency_per_worker="${CHRONOS_SCALE_MATRIX_CONCURRENCY_PER_WORKER:-8}"
 matrix_timelines_per_worker="${CHRONOS_SCALE_MATRIX_TIMELINES_PER_WORKER:-32}"
+matrix_bench_client_processes_per_worker="${CHRONOS_SCALE_MATRIX_BENCH_CLIENT_PROCESSES_PER_WORKER:-1}"
 artifact_root="${CHRONOS_SCALE_MATRIX_ARTIFACT_DIR:-${CHRONOS_ARTIFACT_DIR:-artifacts}/scale-matrix}"
 release_bin_dir="${CHRONOS_RELEASE_BIN_DIR:-${REPO_ROOT}/target/release}"
 summary_log="${artifact_root%/}/summary.txt"
@@ -51,6 +52,7 @@ for worker_count in "${WORKER_COUNTS[@]}"; do
 done
 require_positive_integer "CHRONOS_SCALE_MATRIX_CONCURRENCY_PER_WORKER" "${matrix_concurrency_per_worker}"
 require_positive_integer "CHRONOS_SCALE_MATRIX_TIMELINES_PER_WORKER" "${matrix_timelines_per_worker}"
+require_positive_integer "CHRONOS_SCALE_MATRIX_BENCH_CLIENT_PROCESSES_PER_WORKER" "${matrix_bench_client_processes_per_worker}"
 
 mkdir -p "${artifact_root}"
 
@@ -68,6 +70,7 @@ worker_counts=${matrix_workers}
 linear_efficiency_min=${matrix_efficiency_min}
 concurrency_per_worker=${matrix_concurrency_per_worker}
 timelines_per_worker=${matrix_timelines_per_worker}
+bench_client_processes_per_worker=${matrix_bench_client_processes_per_worker}
 artifact_dir=${artifact_root}
 artifact_index=${index_log}
 baseline_workers=${baseline_workers}
@@ -83,36 +86,78 @@ EOF
       local latency_p999_us
       local failures
       local reasons
+      local route_owner_endpoints
+      local route_owner_min_timelines
+      local route_owner_max_timelines
+      local route_owner_counts
       local concurrency
       local timelines
       local connect_timeout_ms
       local connect_retry_interval_ms
       local connection_pool_size
+      local allocation_client_channels
+      local concurrency_per_allocation_channel
       local client_processes
       local owner_affinity
+      local linear_efficiency
+      local linear_expected_req_per_sec
       req_per_sec="$(extract_metric "req_per_sec" "${run_summary}")"
       latency_p95_us="$(extract_metric "latency_p95_us" "${run_summary}")"
       latency_p99_us="$(extract_metric "latency_p99_us" "${run_summary}")"
       latency_p999_us="$(extract_metric "latency_p999_us" "${run_summary}")"
       failures="$(extract_metric "allocation_failed_total" "${run_summary}")"
       reasons="$(extract_metric "allocation_failure_reasons" "${run_summary}")"
+      route_owner_endpoints="$(extract_metric "route_owner_endpoints" "${run_summary}")"
+      route_owner_min_timelines="$(extract_metric "route_owner_min_timelines" "${run_summary}")"
+      route_owner_max_timelines="$(extract_metric "route_owner_max_timelines" "${run_summary}")"
+      route_owner_counts="$(extract_metric "route_owner_counts" "${run_summary}")"
       concurrency="$(extract_metric "bench_concurrency" "${run_summary}")"
       timelines="$(extract_metric "bench_timelines" "${run_summary}")"
       connect_timeout_ms="$(extract_metric "bench_connect_timeout_ms" "${run_summary}")"
       connect_retry_interval_ms="$(extract_metric "bench_connect_retry_interval_ms" "${run_summary}")"
       connection_pool_size="$(extract_metric "bench_allocation_connection_pool_size" "${run_summary}")"
+      allocation_client_channels="$(extract_metric "allocation_client_channels" "${run_summary}")"
+      concurrency_per_allocation_channel="$(extract_metric "concurrency_per_allocation_channel" "${run_summary}")"
       client_processes="$(extract_metric "bench_client_processes" "${run_summary}")"
       owner_affinity="$(extract_metric "owner_affinity" "${run_summary}")"
+      linear_efficiency=""
+      linear_expected_req_per_sec=""
+      if [[ -n "${baseline_req_per_sec}" && -n "${baseline_workers}" && -n "${req_per_sec}" ]]; then
+        read -r linear_efficiency linear_expected_req_per_sec < <(
+          python3 - "${req_per_sec}" "${worker_count}" "${baseline_req_per_sec}" "${baseline_workers}" "${matrix_efficiency_min}" <<'PY'
+import sys
+
+current = float(sys.argv[1])
+current_workers = float(sys.argv[2])
+baseline = float(sys.argv[3])
+baseline_workers = float(sys.argv[4])
+minimum_efficiency = float(sys.argv[5])
+
+ideal = baseline * (current_workers / baseline_workers)
+efficiency = current / ideal if ideal else 0.0
+expected = ideal * minimum_efficiency
+print(f"{efficiency:.4f} {expected:.2f}")
+PY
+        )
+      fi
       {
         printf 'workers_%s_summary=%s\n' "${worker_count}" "${run_summary}"
+        printf 'workers_%s_route_owner_endpoints=%s\n' "${worker_count}" "${route_owner_endpoints}"
+        printf 'workers_%s_route_owner_min_timelines=%s\n' "${worker_count}" "${route_owner_min_timelines}"
+        printf 'workers_%s_route_owner_max_timelines=%s\n' "${worker_count}" "${route_owner_max_timelines}"
+        printf 'workers_%s_route_owner_counts=%s\n' "${worker_count}" "${route_owner_counts}"
         printf 'workers_%s_concurrency=%s\n' "${worker_count}" "${concurrency}"
         printf 'workers_%s_timelines=%s\n' "${worker_count}" "${timelines}"
         printf 'workers_%s_connect_timeout_ms=%s\n' "${worker_count}" "${connect_timeout_ms}"
         printf 'workers_%s_connect_retry_interval_ms=%s\n' "${worker_count}" "${connect_retry_interval_ms}"
         printf 'workers_%s_allocation_connection_pool_size=%s\n' "${worker_count}" "${connection_pool_size}"
+        printf 'workers_%s_allocation_client_channels=%s\n' "${worker_count}" "${allocation_client_channels}"
+        printf 'workers_%s_concurrency_per_allocation_channel=%s\n' "${worker_count}" "${concurrency_per_allocation_channel}"
         printf 'workers_%s_bench_client_processes=%s\n' "${worker_count}" "${client_processes}"
         printf 'workers_%s_owner_affinity=%s\n' "${worker_count}" "${owner_affinity}"
         printf 'workers_%s_req_per_sec=%s\n' "${worker_count}" "${req_per_sec}"
+        printf 'workers_%s_linear_efficiency=%s\n' "${worker_count}" "${linear_efficiency}"
+        printf 'workers_%s_linear_expected_req_per_sec_at_min_efficiency=%s\n' "${worker_count}" "${linear_expected_req_per_sec}"
         printf 'workers_%s_latency_p95_us=%s\n' "${worker_count}" "${latency_p95_us}"
         printf 'workers_%s_latency_p99_us=%s\n' "${worker_count}" "${latency_p99_us}"
         printf 'workers_%s_latency_p999_us=%s\n' "${worker_count}" "${latency_p999_us}"
@@ -135,8 +180,15 @@ for worker_count in "${WORKER_COUNTS[@]}"; do
   run_root="${artifact_root%/}/workers-${worker_count}"
   run_concurrency="${CHRONOS_SCALE_CONCURRENCY:-$((worker_count * matrix_concurrency_per_worker))}"
   run_timelines="${CHRONOS_SCALE_TIMELINES:-$((worker_count * matrix_timelines_per_worker))}"
+  run_client_processes="${CHRONOS_SCALE_BENCH_CLIENT_PROCESSES:-$((worker_count * matrix_bench_client_processes_per_worker))}"
+  if [[ "${run_client_processes}" -gt "${run_concurrency}" ]]; then
+    run_client_processes="${run_concurrency}"
+  fi
+  if [[ "${run_client_processes}" -gt "${run_timelines}" ]]; then
+    run_client_processes="${run_timelines}"
+  fi
   mkdir -p "${run_root}"
-  echo "[scale-matrix] running ${worker_count}-worker scale bench with concurrency=${run_concurrency} timelines=${run_timelines}"
+  echo "[scale-matrix] running ${worker_count}-worker scale bench with concurrency=${run_concurrency} timelines=${run_timelines} client_processes=${run_client_processes}"
   env \
     CHRONOS_SKIP_RELEASE_BUILD=1 \
     CHRONOS_RELEASE_BIN_DIR="${release_bin_dir}" \
@@ -144,6 +196,7 @@ for worker_count in "${WORKER_COUNTS[@]}"; do
     CHRONOS_SCALE_WORKERS="${worker_count}" \
     CHRONOS_SCALE_CONCURRENCY="${run_concurrency}" \
     CHRONOS_SCALE_TIMELINES="${run_timelines}" \
+    CHRONOS_SCALE_BENCH_CLIENT_PROCESSES="${run_client_processes}" \
     CHRONOS_SCALE_SCENARIO="scale-matrix-${worker_count}-$(date +%s)-$$" \
     bash hack/scale/scale-etcd.sh
 
@@ -160,7 +213,7 @@ for worker_count in "${WORKER_COUNTS[@]}"; do
     continue
   fi
 
-  python3 - <<'PY' "${req_per_sec}" "${worker_count}" "${baseline_req_per_sec}" "${baseline_workers}" "${matrix_efficiency_min}"
+  python3 - "${req_per_sec}" "${worker_count}" "${baseline_req_per_sec}" "${baseline_workers}" "${matrix_efficiency_min}" <<'PY'
 import sys
 
 current = float(sys.argv[1])

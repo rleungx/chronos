@@ -5,7 +5,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use prost::Message;
 use tokio::sync::Barrier;
 use tokio::time::sleep;
 use tonic::transport::Channel;
@@ -385,7 +384,7 @@ fn format_counts(counts: &BTreeMap<String, u64>) -> String {
 }
 
 fn decode_error_detail(status: &Status) -> Option<ErrorDetail> {
-    ErrorDetail::decode(status.details()).ok()
+    chronos::rpc::decode_error_detail_from_status_details(status.details())
 }
 
 fn error_code_label(error_code: i32) -> Option<&'static str> {
@@ -814,6 +813,7 @@ async fn main() -> AppResult<()> {
 #[cfg(test)]
 mod tests {
     use prost::bytes::Bytes;
+    use prost::Message;
 
     use super::*;
 

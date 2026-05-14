@@ -165,10 +165,8 @@ fn decode_timeline_state_filter(state: i32) -> Result<TimelineLifecycleState, Bo
 
 #[cfg(test)]
 mod tests {
-    use prost::Message;
-
     use super::*;
-    use crate::proto::v1::{ErrorCode, ErrorDetail};
+    use crate::proto::v1::ErrorCode;
 
     #[test]
     fn normalize_list_request_dedups_states_and_applies_default_page_size() {
@@ -228,7 +226,8 @@ mod tests {
             error.message(),
             "page_token is stale or does not match the current filter shape"
         );
-        let detail = ErrorDetail::decode(error.details()).expect("error detail should decode");
+        let detail = crate::rpc::decode_error_detail_from_status_details(error.details())
+            .expect("error detail should decode");
         assert_eq!(detail.code, ErrorCode::InvalidArgument as i32);
     }
 
@@ -243,7 +242,8 @@ mod tests {
         .expect_err("request should be rejected");
 
         assert_eq!(error.code(), tonic::Code::InvalidArgument);
-        let detail = ErrorDetail::decode(error.details()).expect("error detail should decode");
+        let detail = crate::rpc::decode_error_detail_from_status_details(error.details())
+            .expect("error detail should decode");
         assert_eq!(detail.code, ErrorCode::InvalidArgument as i32);
     }
 
@@ -258,7 +258,8 @@ mod tests {
         .expect_err("request should be rejected");
 
         assert_eq!(error.code(), tonic::Code::InvalidArgument);
-        let detail = ErrorDetail::decode(error.details()).expect("error detail should decode");
+        let detail = crate::rpc::decode_error_detail_from_status_details(error.details())
+            .expect("error detail should decode");
         assert_eq!(detail.code, ErrorCode::InvalidArgument as i32);
     }
 
@@ -268,7 +269,8 @@ mod tests {
             .expect_err("state filter should be rejected");
 
         assert_eq!(error.code(), tonic::Code::InvalidArgument);
-        let detail = ErrorDetail::decode(error.details()).expect("error detail should decode");
+        let detail = crate::rpc::decode_error_detail_from_status_details(error.details())
+            .expect("error detail should decode");
         assert_eq!(detail.code, ErrorCode::InvalidArgument as i32);
     }
 }

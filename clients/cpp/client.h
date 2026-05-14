@@ -4,7 +4,6 @@
 #include <memory>
 #include <mutex>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 #include <grpcpp/grpcpp.h>
@@ -53,6 +52,8 @@ class Client {
   chronos::tso::v1::TimelineRoute RefreshRouteIfUnchangedLocked(
       const chronos::tso::v1::TimelineRoute& observed_route);
   chronos::tso::v1::TimelineRoute RefreshRouteLocked();
+  chronos::tso::v1::TimelineRoute InstallRouteLocked(
+      const chronos::tso::v1::TimelineRoute& route);
   void SleepBeforeStaleRouteRetry() const;
   grpc::Status AllocateOnce(
       chronos::tso::v1::TimestampService::Stub& tso_stub,
@@ -72,7 +73,8 @@ class Client {
   std::shared_ptr<grpc::Channel> tso_channel_;
   std::unique_ptr<chronos::tso::v1::TimelineRouteService::Stub> route_stub_;
   std::shared_ptr<chronos::tso::v1::TimestampService::Stub> tso_stub_;
-  std::unordered_map<std::string, chronos::tso::v1::TimelineRoute> cache_;
+  chronos::tso::v1::TimelineRoute route_;
+  bool has_route_ = false;
   std::string timeline_key_;
   Config config_;
   std::string idempotency_scope_;

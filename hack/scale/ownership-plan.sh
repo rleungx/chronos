@@ -14,6 +14,7 @@ require_positive_integer() {
 OLD_WORKERS="${1:-${CHRONOS_OWNERSHIP_OLD_WORKERS:-1}}"
 NEW_WORKERS="${2:-${CHRONOS_OWNERSHIP_NEW_WORKERS:-${CHRONOS_SCALE_WORKERS:-2}}}"
 GENERATOR_COUNT="${3:-${CHRONOS_OWNERSHIP_GENERATORS:-256}}"
+PLAN_ID="${CHRONOS_OWNERSHIP_PLAN_ID:-planned-${OLD_WORKERS}-to-${NEW_WORKERS}-$(date -u +%Y%m%dT%H%M%SZ)}"
 
 require_positive_integer "old worker count" "${OLD_WORKERS}"
 require_positive_integer "new worker count" "${NEW_WORKERS}"
@@ -62,13 +63,18 @@ join_counts() {
 echo "old_workers=${OLD_WORKERS}"
 echo "new_workers=${NEW_WORKERS}"
 echo "generator_count=${GENERATOR_COUNT}"
+echo "ownership_plan_id=${PLAN_ID}"
 echo "stable_generators_total=${stable_total}"
 echo "moved_generators_total=${moved_total}"
 echo "moved_ratio_percent=$(awk -v moved="${moved_total}" -v total="${GENERATOR_COUNT}" 'BEGIN { printf "%.2f", moved * 100 / total }')"
 echo "outgoing_generators_by_old_remainder=$(join_counts outgoing_by_old "${OLD_WORKERS}")"
 echo "incoming_generators_by_new_remainder=$(join_counts incoming_by_new "${NEW_WORKERS}")"
+echo "kubernetes_statefulset_replicas=${NEW_WORKERS}"
+echo "kubernetes_pdb_min_available=$((NEW_WORKERS - 1))"
+echo "kubernetes_configmap_env=CHRONOS_OWNERSHIP_PLAN_ID=${PLAN_ID},CHRONOS_GENERATOR_OWNERSHIP_MODULO=${NEW_WORKERS}"
+echo "rollout_order=update_configmap,update_statefulset_replicas,wait_ready,run_scale_matrix,rebalance_if_needed"
 echo "new_worker_env_template_begin"
 for ((idx = 0; idx < NEW_WORKERS; idx++)); do
-  echo "worker_${idx}=CHRONOS_GENERATOR_OWNERSHIP_MODULO=${NEW_WORKERS} CHRONOS_GENERATOR_OWNERSHIP_REMAINDER=${idx}"
+  echo "worker_${idx}=CHRONOS_OWNERSHIP_PLAN_ID=${PLAN_ID} CHRONOS_GENERATOR_OWNERSHIP_MODULO=${NEW_WORKERS} CHRONOS_GENERATOR_OWNERSHIP_REMAINDER=${idx}"
 done
 echo "new_worker_env_template_end"

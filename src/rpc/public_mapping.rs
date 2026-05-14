@@ -1,9 +1,10 @@
-use prost::Message;
 use tonic::{Code, Status};
 
 use crate::lifecycle::{TimelineLifecycleContract, TimelinePublicUnavailability};
 use crate::proto::v1::{ErrorCode, ErrorDetail, OperatorActionBlocker, OperatorActionNextStep};
 use crate::{TimelineLifecycleState, TsoError};
+
+use super::encode_error_detail_status;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TimelineNotReadyPublicMapping {
@@ -13,11 +14,10 @@ struct TimelineNotReadyPublicMapping {
 
 pub(super) fn status_with_error_detail(code: Code, err: TsoError) -> Status {
     let detail = build_error_detail(&err);
-    let encoded_detail = detail.encode_to_vec();
     Status::with_details(
         code,
         err.to_string(),
-        prost::bytes::Bytes::from(encoded_detail),
+        prost::bytes::Bytes::from(encode_error_detail_status(code, err.to_string(), detail)),
     )
 }
 
@@ -34,8 +34,12 @@ pub(super) fn invalid_argument_status_with_detail(message: impl Into<String>) ->
     };
     Status::with_details(
         Code::InvalidArgument,
-        message,
-        prost::bytes::Bytes::from(detail.encode_to_vec()),
+        message.clone(),
+        prost::bytes::Bytes::from(encode_error_detail_status(
+            Code::InvalidArgument,
+            message,
+            detail,
+        )),
     )
 }
 
@@ -238,6 +242,7 @@ fn build_error_detail(err: &TsoError) -> ErrorDetail {
 mod tests {
     use super::*;
     use crate::proto::v1::{OperatorActionBlocker, OperatorActionNextStep};
+    use crate::rpc::decode_error_detail_from_status_details;
 
     #[test]
     fn status_with_error_detail_encodes_expected_payload() {
@@ -248,7 +253,8 @@ mod tests {
             },
         );
 
-        let detail = ErrorDetail::decode(status.details()).expect("error detail should decode");
+        let detail = decode_error_detail_from_status_details(status.details())
+            .expect("error detail should decode");
 
         assert_eq!(status.code(), Code::FailedPrecondition);
         assert_eq!(detail.code, ErrorCode::NotTimelineOwner as i32);
@@ -258,7 +264,8 @@ mod tests {
     #[test]
     fn invalid_argument_status_with_detail_uses_structured_payload() {
         let status = invalid_argument_status_with_detail("page_token is malformed");
-        let detail = ErrorDetail::decode(status.details()).expect("error detail should decode");
+        let detail = decode_error_detail_from_status_details(status.details())
+            .expect("error detail should decode");
 
         assert_eq!(status.code(), Code::InvalidArgument);
         assert_eq!(detail.code, ErrorCode::InvalidArgument as i32);
@@ -301,7 +308,8 @@ mod tests {
 
         for (error, blocker, next_step) in cases {
             let status = map_tso_error(error);
-            let detail = ErrorDetail::decode(status.details()).expect("error detail should decode");
+            let detail = decode_error_detail_from_status_details(status.details())
+                .expect("error detail should decode");
 
             assert_eq!(status.code(), Code::FailedPrecondition);
             assert_eq!(detail.code, ErrorCode::TemporarilyUnavailable as i32);
@@ -399,7 +407,8 @@ mod tests {
 
         for (error, expected_grpc_code, expected_detail_code) in cases {
             let status = map_tso_error(error);
-            let detail = ErrorDetail::decode(status.details()).expect("error detail should decode");
+            let detail = decode_error_detail_from_status_details(status.details())
+                .expect("error detail should decode");
 
             assert_eq!(status.code(), expected_grpc_code);
             assert_eq!(detail.code, expected_detail_code as i32);

@@ -16,13 +16,12 @@ use chronos::proto::v1::{
     timeline_control_service_client::TimelineControlServiceClient,
     timeline_route_service_client::TimelineRouteServiceClient,
     timestamp_service_client::TimestampServiceClient, AllocateTimestampsRequest,
-    EnsureTimelineRequest, ErrorDetail, GetTimelineRouteRequest, ResourceTier, TimelineRoute,
+    EnsureTimelineRequest, GetTimelineRouteRequest, ResourceTier, TimelineRoute,
     TimelineTransferReason, TransferTimelineRequest, WorkerReadinessState,
 };
 use common_etcd_endpoints::{test_etcd_endpoints, test_etcd_endpoints_csv};
 use common_etcd_prefix::unique_test_etcd_prefix;
 use etcd_client::Client;
-use prost::Message;
 use tokio::time::{sleep, timeout};
 use tonic::{transport::Channel, Code, Request};
 
@@ -412,8 +411,8 @@ async fn etcd_spawned_process_failover_preserves_tso_monotonicity() {
     let blocked = failover_timeline(bind_b, timeline_key, &endpoint_b).await;
     let blocked = blocked.expect_err("failover should be blocked before lease expiry");
     assert_eq!(blocked.code(), Code::FailedPrecondition);
-    let blocked_detail =
-        ErrorDetail::decode(blocked.details()).expect("error detail should decode");
+    let blocked_detail = chronos::rpc::decode_error_detail_from_status_details(blocked.details())
+        .expect("error detail should decode");
     assert_eq!(
         blocked_detail.action_blocker,
         chronos::proto::v1::OperatorActionBlocker::LeaseNotExpired as i32
@@ -441,8 +440,9 @@ async fn etcd_spawned_process_failover_preserves_tso_monotonicity() {
             match failover_timeline(bind_b, timeline_key, &endpoint_b).await {
                 Ok(_) => return,
                 Err(status) if status.code() == Code::FailedPrecondition => {
-                    let detail = ErrorDetail::decode(status.details())
-                        .expect("failover blocker detail should decode");
+                    let detail =
+                        chronos::rpc::decode_error_detail_from_status_details(status.details())
+                            .expect("failover blocker detail should decode");
                     if detail.action_blocker
                         == chronos::proto::v1::OperatorActionBlocker::LeaseNotExpired as i32
                     {

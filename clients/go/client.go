@@ -117,7 +117,7 @@ type Client struct {
 	staleConns   []*grpc.ClientConn
 	routeClient  tsov1.TimelineRouteServiceClient
 	tsoClient    tsov1.TimestampServiceClient
-	cache        map[string]*tsov1.TimelineRoute
+	route        *tsov1.TimelineRoute
 	timelineKey  string
 	ownerAddr    string
 	mu           sync.RWMutex
@@ -153,7 +153,6 @@ func NewWithOptions(ctx context.Context, addr string, timelineKey string, opts .
 	client := &Client{
 		routeConn:    conn,
 		routeClient:  tsov1.NewTimelineRouteServiceClient(conn),
-		cache:        map[string]*tsov1.TimelineRoute{},
 		timelineKey:  timelineKey,
 		requestScope: newClientRequestScope(),
 		config:       cfg,
@@ -214,9 +213,9 @@ func (c *Client) AllocateTimestamps(ctx context.Context, count uint32) ([]*tsov1
 
 func (c *Client) ensureRoute(ctx context.Context) (*tsov1.TimelineRoute, error) {
 	c.mu.RLock()
-	route, ok := c.cache[c.timelineKey]
+	route := c.route
 	c.mu.RUnlock()
-	if ok {
+	if route != nil {
 		return route, nil
 	}
 
@@ -231,12 +230,12 @@ func (c *Client) ensureRoute(ctx context.Context) (*tsov1.TimelineRoute, error) 
 		return nil, err
 	}
 
-	return c.refreshRoute(ctx)
+	return c.installRoute(ctx, resp.GetRoute())
 }
 
 func (c *Client) refreshRouteIfUnchanged(ctx context.Context, observedRoute *tsov1.TimelineRoute) (*tsov1.TimelineRoute, error) {
 	c.mu.RLock()
-	currentRoute := c.cache[c.timelineKey]
+	currentRoute := c.route
 	c.mu.RUnlock()
 	if currentRoute != nil && !sameRouteIdentity(currentRoute, observedRoute) {
 		if err := c.ensureOwnerClient(ctx, currentRoute.OwnerWorkerEndpoint); err != nil {
@@ -258,12 +257,16 @@ func (c *Client) refreshRoute(ctx context.Context) (*tsov1.TimelineRoute, error)
 	if err := validateRoute("get_timeline_route", route); err != nil {
 		return nil, err
 	}
+	return c.installRoute(ctx, route)
+}
+
+func (c *Client) installRoute(ctx context.Context, route *tsov1.TimelineRoute) (*tsov1.TimelineRoute, error) {
 	if err := c.ensureOwnerClient(ctx, route.OwnerWorkerEndpoint); err != nil {
 		return nil, err
 	}
 
 	c.mu.Lock()
-	c.cache[c.timelineKey] = route
+	c.route = route
 	c.mu.Unlock()
 	return route, nil
 }

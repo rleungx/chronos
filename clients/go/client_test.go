@@ -1,10 +1,22 @@
 package chronos
 
-import "testing"
+import (
+	"testing"
+
+	"google.golang.org/grpc/codes"
+	grpcstatus "google.golang.org/grpc/status"
+)
 
 func TestStaleRouteErrorFalseOnNil(t *testing.T) {
 	if isStaleRouteError(nil) {
 		t.Fatal("nil error should not be treated as stale route")
+	}
+}
+
+func TestStaleRouteErrorRequiresChronosRouteDetail(t *testing.T) {
+	err := grpcstatus.Error(codes.FailedPrecondition, "non-route precondition failed")
+	if isStaleRouteError(err) {
+		t.Fatal("plain FAILED_PRECONDITION should not be treated as stale route")
 	}
 }
 

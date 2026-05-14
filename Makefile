@@ -25,6 +25,7 @@ ETCD_ENDPOINTS ?= 127.0.0.1:2379
 	test-scale-matrix \
 	test-scale-matrix-production \
 	scale-ownership-plan \
+	kubernetes-scale-plan \
 	test-rebalance-bench \
 	test-soak \
 	test-chaos \
@@ -32,6 +33,7 @@ ETCD_ENDPOINTS ?= 127.0.0.1:2379
 	promtool-check \
 	observability-check \
 	kubernetes-manifest-check \
+	helm-chart-check \
 	release-evidence-check \
 	dependency-check \
 	container-vulnerability-scan \
@@ -42,13 +44,24 @@ ETCD_ENDPOINTS ?= 127.0.0.1:2379
 	release-source-check \
 	release-package \
 	release-shape-check \
+	release-security-check \
+	release-check-core \
 	release-check \
 	release-gate-layer-4 \
 	release-gate-layer-4-clustered \
 	release-gate \
+	client-conformance-check \
 	client-check-go \
 	client-check-java \
 	client-check-cpp \
+	client-example-check-rust \
+	client-example-check-go \
+	client-example-check-java \
+	client-example-check-cpp \
+	client-example-check \
+	client-package-check-java \
+	client-package-check-cpp \
+	client-package-check \
 	client-check \
 	observability-up \
 	observability-down
@@ -63,6 +76,7 @@ CHRONOS_ALLOW_DIRTY_RELEASE ?= 0
 CARGO_DENY_VERSION ?= 0.19.4
 CHRONOS_SKIP_RELEASE_BUILD ?= 0
 CHRONOS_RELEASE_BIN_DIR ?= $(CURDIR)/target/release
+RELEASE_GATE_ARTIFACT_DIR ?= $(CURDIR)/artifacts/release-gate
 PRODUCTION_SHAPE_ETCD_ENDPOINTS := 127.0.0.1:2379
 PRODUCTION_SHAPE_BIND_ADDR := 127.0.0.1:50051
 PRODUCTION_SHAPE_ADVERTISE_ENDPOINT := 10.0.0.10:50051
@@ -203,6 +217,9 @@ test-scale-matrix-production:
 scale-ownership-plan:
 	bash hack/scale/ownership-plan.sh
 
+kubernetes-scale-plan:
+	bash hack/scale/ownership-plan.sh
+
 test-rebalance-bench:
 	CHRONOS_SKIP_RELEASE_BUILD=$(CHRONOS_SKIP_RELEASE_BUILD) \
 	CHRONOS_RELEASE_BIN_DIR=$(CHRONOS_RELEASE_BIN_DIR) \
@@ -234,6 +251,10 @@ observability-check: promtool-check
 
 kubernetes-manifest-check:
 	bash hack/validate-kubernetes-manifests.sh deploy/kubernetes/chronos.yaml
+	bash hack/validate-helm-chart.sh deploy/helm/chronos
+
+helm-chart-check:
+	bash hack/validate-helm-chart.sh deploy/helm/chronos
 
 dependency-check:
 	@if ! cargo deny --version 2>/dev/null | grep -q '$(CARGO_DENY_VERSION)'; then \
@@ -244,6 +265,9 @@ dependency-check:
 release-evidence-check:
 	bash hack/verify-evidence.sh
 
+client-conformance-check:
+	bash hack/verify-client-conformance.sh
+
 client-check-go:
 	cd clients/go && go mod verify && go test ./...
 
@@ -253,10 +277,41 @@ client-check-java:
 client-check-cpp:
 	cmake -S clients/cpp -B clients/cpp/build && cmake --build clients/cpp/build && ctest --test-dir clients/cpp/build --output-on-failure
 
+client-example-check-rust:
+	cargo check --locked --example client_example
+
+client-example-check-go:
+	cd examples/go && go test ./...
+
+client-example-check-java:
+	cd clients/java && gradle --no-daemon compileExampleJava
+
+client-example-check-cpp:
+	cmake -S clients/cpp -B clients/cpp/build && cmake --build clients/cpp/build --target client_example
+
+client-example-check:
+	$(MAKE) client-example-check-rust
+	$(MAKE) client-example-check-go
+	$(MAKE) client-example-check-java
+	$(MAKE) client-example-check-cpp
+
+client-package-check-java:
+	cd clients/java && gradle --no-daemon publishMavenJavaPublicationToLocalStagingRepository
+
+client-package-check-cpp:
+	cmake -S clients/cpp -B clients/cpp/build && cmake --build clients/cpp/build && cmake --install clients/cpp/build --prefix clients/cpp/build/install-check
+
+client-package-check:
+	$(MAKE) client-package-check-java
+	$(MAKE) client-package-check-cpp
+
 client-check:
+	$(MAKE) client-conformance-check
 	$(MAKE) client-check-go
 	$(MAKE) client-check-java
 	$(MAKE) client-check-cpp
+	$(MAKE) client-example-check
+	$(MAKE) client-package-check
 
 container-startup-smoke:
 	$(MAKE) CONTAINER_CHECK_IMAGE=$(CONTAINER_CHECK_IMAGE) CONTAINER_CHECK_FORCE_BUILD=$(CONTAINER_CHECK_FORCE_BUILD) container-image-check
@@ -268,7 +323,7 @@ container-etcd-startup-smoke:
 
 container-image-check:
 	@if [ "$(CONTAINER_CHECK_FORCE_BUILD)" = "1" ] || ! docker image inspect $(CONTAINER_CHECK_IMAGE) >/dev/null 2>&1; then \
-		docker build --build-arg CHRONOS_BUILD_COMMIT=$$(git rev-parse HEAD) -t $(CONTAINER_CHECK_IMAGE) .; \
+		DOCKER_BUILDKIT=1 docker build --build-arg CHRONOS_BUILD_COMMIT=$$(git rev-parse HEAD) -t $(CONTAINER_CHECK_IMAGE) .; \
 	else \
 		echo "reusing existing image $(CONTAINER_CHECK_IMAGE)"; \
 	fi
@@ -342,15 +397,25 @@ release-package:
 	$(MAKE) release-source-check
 	rm -rf artifacts/release
 	mkdir -p artifacts/release
-	CHRONOS_BUILD_COMMIT=$$(git rev-parse HEAD) cargo build --locked --release --bin chronos --bin chronos-bench --bin chronos-control-bench --bin chronos-failover-bench
+	@set -e; \
+	build_commit=$$(git rev-parse HEAD); \
+	printf 'git_commit=%s\nchronos_build_commit=%s\nbuilt_at=%s\n' "$$build_commit" "$$build_commit" "$$(date -u +%Y-%m-%dT%H:%M:%SZ)" > artifacts/release/BUILD_INFO; \
+	CHRONOS_BUILD_COMMIT="$$build_commit" cargo build --locked --release --bin chronos --bin chronos-bench --bin chronos-control-bench --bin chronos-failover-bench
 	cp target/release/chronos artifacts/release/
 	cp target/release/chronos-bench artifacts/release/
 	cp target/release/chronos-control-bench artifacts/release/
 	cp target/release/chronos-failover-bench artifacts/release/
-	(cd artifacts/release && if command -v shasum >/dev/null 2>&1; then shasum -a 256 chronos chronos-bench chronos-control-bench chronos-failover-bench; else sha256sum chronos chronos-bench chronos-control-bench chronos-failover-bench; fi > SHA256SUMS)
+	(cd artifacts/release && if command -v shasum >/dev/null 2>&1; then shasum -a 256 BUILD_INFO chronos chronos-bench chronos-control-bench chronos-failover-bench; else sha256sum BUILD_INFO chronos chronos-bench chronos-control-bench chronos-failover-bench; fi > SHA256SUMS)
 	docker run --rm -v "$(CURDIR)/artifacts/release:/artifacts" $(SYFT_IMAGE) dir:/artifacts -o spdx-json > artifacts/release/chronos-release.spdx.json
 
-release-check:
+release-security-check: release-package
+	$(MAKE) dependency-check
+	$(MAKE) container-vulnerability-scan
+	test -s artifacts/release/BUILD_INFO
+	test -s artifacts/release/chronos-release.spdx.json
+	test -s artifacts/release/SHA256SUMS
+
+release-check-core:
 	$(MAKE) test-layer-0
 	$(MAKE) test-release-core
 	$(MAKE) observability-check
@@ -358,6 +423,9 @@ release-check:
 	$(MAKE) release-shape-check
 	$(MAKE) dependency-check
 	$(MAKE) client-check
+
+release-check:
+	$(MAKE) release-check-core
 	$(MAKE) container-check
 
 release-gate-layer-4:
@@ -382,15 +450,16 @@ release-gate-layer-4-clustered:
 
 release-gate:
 	$(MAKE) release-check
-	$(MAKE) release-package
+	$(MAKE) CONTAINER_CHECK_FORCE_BUILD=0 release-security-check
 	$(MAKE) release-gate-layer-4-clustered
-	$(MAKE) CHRONOS_SKIP_RELEASE_BUILD=1 test-soak
-	$(MAKE) CHRONOS_SKIP_RELEASE_BUILD=1 test-chaos
-	$(MAKE) CHRONOS_SKIP_RELEASE_BUILD=1 test-failover-bench
-	$(MAKE) CHRONOS_SKIP_RELEASE_BUILD=1 test-auto-failover-bench
-	$(MAKE) CHRONOS_SKIP_RELEASE_BUILD=1 test-scale-matrix-production
-	$(MAKE) CHRONOS_SKIP_RELEASE_BUILD=1 test-rebalance-bench
-	$(MAKE) CHRONOS_SKIP_RELEASE_BUILD=1 test-restore-dr
+	$(MAKE) CHRONOS_SKIP_RELEASE_BUILD=1 CHRONOS_ARTIFACT_DIR=$(RELEASE_GATE_ARTIFACT_DIR) CHRONOS_KEEP_ARTIFACTS_ON_SUCCESS=1 test-soak
+	$(MAKE) CHRONOS_SKIP_RELEASE_BUILD=1 CHRONOS_ARTIFACT_DIR=$(RELEASE_GATE_ARTIFACT_DIR) CHRONOS_KEEP_ARTIFACTS_ON_SUCCESS=1 test-chaos
+	$(MAKE) CHRONOS_SKIP_RELEASE_BUILD=1 CHRONOS_ARTIFACT_DIR=$(RELEASE_GATE_ARTIFACT_DIR) CHRONOS_KEEP_ARTIFACTS_ON_SUCCESS=1 test-failover-bench
+	$(MAKE) CHRONOS_SKIP_RELEASE_BUILD=1 CHRONOS_ARTIFACT_DIR=$(RELEASE_GATE_ARTIFACT_DIR) CHRONOS_KEEP_ARTIFACTS_ON_SUCCESS=1 test-auto-failover-bench
+	$(MAKE) CHRONOS_SKIP_RELEASE_BUILD=1 CHRONOS_ARTIFACT_DIR=$(RELEASE_GATE_ARTIFACT_DIR) CHRONOS_KEEP_ARTIFACTS_ON_SUCCESS=1 test-scale-matrix-production
+	$(MAKE) CHRONOS_SKIP_RELEASE_BUILD=1 CHRONOS_ARTIFACT_DIR=$(RELEASE_GATE_ARTIFACT_DIR) CHRONOS_KEEP_ARTIFACTS_ON_SUCCESS=1 test-rebalance-bench
+	$(MAKE) CHRONOS_SKIP_RELEASE_BUILD=1 CHRONOS_ARTIFACT_DIR=$(RELEASE_GATE_ARTIFACT_DIR) CHRONOS_KEEP_ARTIFACTS_ON_SUCCESS=1 test-restore-dr
+	bash hack/verify-evidence.sh $(RELEASE_GATE_ARTIFACT_DIR)
 
 observability-up:
 	docker compose -f observability/docker-compose.yml up -d

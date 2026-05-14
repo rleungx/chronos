@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 IMAGE="${CHRONOS_CONTAINER_SMOKE_IMAGE:-chronos:container-check}"
+GRPCURL_IMAGE="${CHRONOS_CONTAINER_SMOKE_GRPCURL_IMAGE:-fullstorydev/grpcurl:v1.9.3}"
 READY_TIMEOUT_SECS="${CHRONOS_CONTAINER_SMOKE_READY_TIMEOUT_SECS:-15}"
 POLL_INTERVAL_SECS="${CHRONOS_CONTAINER_SMOKE_POLL_INTERVAL_SECS:-1}"
 CONTAINER_NAME="chronos-container-smoke-$$"
@@ -119,7 +122,7 @@ elif [[ "${MODE}" == "etcd" ]]; then
   if ! make etcd-health >/dev/null 2>&1; then
     make etcd-up >/dev/null
     STARTED_ETCD=1
-    source "$(dirname "$0")/lib/common.sh"
+    source "${SCRIPT_DIR}/lib/common.sh"
     wait_for_etcd 20 1
   fi
   docker_run_args+=(
@@ -187,6 +190,49 @@ PY
   fi
 }
 
+grpcurl_call() {
+  local data=$1
+  local method=$2
+  docker run --rm \
+    --network "container:${CONTAINER_NAME}" \
+    -v "${TLS_VOLUME}:/tls:ro" \
+    -v "${REPO_ROOT}:/proto:ro" \
+    "${GRPCURL_IMAGE}" \
+    -cacert /tls/ca.pem \
+    -cert /tls/client.pem \
+    -key /tls/client.key \
+    -import-path /proto \
+    -proto tso.proto \
+    -d "${data}" \
+    127.0.0.1:50051 \
+    "${method}"
+}
+
+assert_grpc_mtls_services() {
+  local ensure_response
+  local route_fields
+  local epoch
+  local route_version
+
+  grpcurl_call '{}' chronos.tso.v1.TimelineControlService/Health >/dev/null
+  ensure_response="$(
+    grpcurl_call \
+      '{"timelineKey":"container.smoke","desiredResourceTier":"RESOURCE_TIER_SHARED"}' \
+      chronos.tso.v1.TimelineRouteService/EnsureTimeline
+  )"
+  route_fields="$(
+    python3 -c 'import json, sys; data=json.load(sys.stdin); route=data["route"]; print(route["epoch"], route["routeVersion"])' \
+      <<<"${ensure_response}"
+  )"
+  read -r epoch route_version <<<"${route_fields}"
+  grpcurl_call \
+    "{\"timelineKey\":\"container.smoke\",\"count\":1,\"expectedEpoch\":\"${epoch}\",\"expectedRouteVersion\":\"${route_version}\",\"requestTimeoutMs\":100}" \
+    chronos.tso.v1.TimestampService/AllocateTimestamps >/dev/null
+  grpcurl_call \
+    '{"timelineKey":"container.smoke"}' \
+    chronos.tso.v1.TimelineStatusService/GetTimelineStatus >/dev/null
+}
+
 deadline=$((SECONDS + READY_TIMEOUT_SECS))
 while (( SECONDS < deadline )); do
   if READY_BODY="$(${CURL_BASE[@]} "${READY_URL}" 2>/dev/null)"; then
@@ -197,6 +243,7 @@ while (( SECONDS < deadline )); do
           echo "gRPC listener was not reachable at ${GRPC_TARGET}" >&2
           exit 1
         fi
+        assert_grpc_mtls_services
         if [[ "${MODE}" == "etcd" ]]; then
           lease_deadline=$((SECONDS + 5))
           while (( SECONDS < lease_deadline )); do

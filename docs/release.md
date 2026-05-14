@@ -11,22 +11,34 @@ Run the full repo-local release gate from a clean working tree:
 make release-gate
 ```
 
+`make release-gate` retains long-running validation evidence under `artifacts/release-gate` by
+default and verifies it before the gate passes.
+
 This is equivalent to the following validation bundle:
 
 ```bash
 make release-check
-make test-layer-4
+make release-security-check
+make release-gate-layer-4-clustered
 make test-soak
 make test-chaos
 make test-failover-bench
 make test-auto-failover-bench
-make test-scale-matrix
+make test-scale-matrix-production
 make test-rebalance-bench
 make test-restore-dr
+bash hack/verify-evidence.sh artifacts/release-gate
 ```
 
 For production scale evidence, also run `make test-scale-matrix-production` on production-like
-hosts with benchmark clients isolated from Chronos workers.
+hosts with benchmark clients isolated from Chronos workers. Archive the generated
+`scale-matrix/summary.txt`; it records per-worker throughput, linear efficiency, and the minimum
+expected throughput for the configured efficiency floor. The scale harness also retains
+`host-info.txt`, `host-load-before.txt`, `host-load-after.txt`, and profile summaries with p95/p99
+stage latency upper bounds, per-worker allocation share, and per-worker route ownership. `make
+release-evidence-check` verifies that retained scale-matrix evidence includes every worker size, a
+passing linear-efficiency value, zero allocation failures, per-node logs/metrics/readiness snapshots,
+host snapshots, and derived profile summaries for latency triage.
 
 ## Required config checks
 
@@ -53,7 +65,10 @@ Before publishing or deploying, ensure you have:
 3. retained soak/chaos/failover/scale/rebalance/restore artifacts for the validation run
 4. alert rules validated with `make observability-check`
 5. dependency policy validated with `make dependency-check`
-6. release-shape and container delivery checks validated via `make release-check`
+6. cross-language client behavior validated with `make client-conformance-check`
+7. Kubernetes manifests validated for static partitioned ownership via `make kubernetes-manifest-check`
+8. release-shape and container delivery checks validated via `make release-check`
+9. `BUILD_INFO`, SBOM/hash artifacts, and container vulnerability scanning validated via `make release-security-check`
 
 ## Rollback expectation
 

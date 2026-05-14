@@ -1,3 +1,4 @@
+mod error_details;
 mod health_handle;
 mod public_mapping;
 mod route_timestamp_service_facade;
@@ -10,6 +11,9 @@ mod translation;
 use crate::recovery::duration_since_unix_epoch_or_zero;
 use std::time::SystemTime;
 
+#[doc(hidden)]
+pub use error_details::decode_error_detail_from_status_details;
+pub(crate) use error_details::encode_error_detail_status;
 pub use health_handle::HealthStatusHandle;
 pub use route_timestamp_service_facade::{TsoRouteService, TsoTimestampService};
 pub use service_facade::{TsoControlService, TsoTimelineStatusService};

@@ -2,7 +2,7 @@
 
 `Client` is the C++ application-facing Chronos client implementation.
 
-Support level: Repository-local implementation.
+Support level: Repository-local implementation with CMake install/export metadata.
 
 ## Public shape
 

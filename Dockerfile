@@ -1,10 +1,13 @@
+# syntax=docker/dockerfile:1.7
+
 FROM rust:1.94.0-bookworm@sha256:365468470075493dc4583f47387001854321c5a8583ea9604b297e67f01c5a4f AS builder
 
 ARG CHRONOS_BUILD_COMMIT=unknown
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    apt-get update \
+    && apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev ca-certificates
 
 WORKDIR /workspace
 
@@ -21,30 +24,34 @@ RUN mkdir -p /workspace/google \
 
 COPY Cargo.toml Cargo.lock build.rs tso.proto ./
 
-RUN mkdir -p src \
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,target=/workspace/target,sharing=locked \
+    mkdir -p src \
     && printf 'pub fn dependency_cache_anchor() {}\n' > src/lib.rs \
     && printf 'fn main() {}\n' > src/main.rs \
     && cargo build --locked --release --bin chronos \
     && rm -rf src
 
-RUN rm -f target/release/chronos \
-    && rm -rf target/release/.fingerprint/chronos-* \
-    && rm -rf target/release/build/chronos-* \
-    && rm -f target/release/deps/chronos-*
-
 COPY . .
 
 ENV RUSTUP_TOOLCHAIN=1.94.0
 
-RUN cargo build --locked --release --bin chronos
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,target=/workspace/target,sharing=locked \
+    touch build.rs tso.proto src/lib.rs src/main.rs \
+    && cargo build --locked --release --bin chronos \
+    && cp target/release/chronos /usr/local/bin/chronos
 
 FROM debian:bookworm-slim@sha256:f9c6a2fd2ddbc23e336b6257a5245e31f996953ef06cd13a59fa0a1df2d5c252 AS runtime
 
 ARG CHRONOS_BUILD_COMMIT=unknown
 
-RUN apt-get update \
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
-    && rm -rf /var/lib/apt/lists/* \
     && useradd --system --uid 10001 --create-home --home-dir /var/lib/chronos chronos
 
 LABEL org.opencontainers.image.title="chronos" \
@@ -53,7 +60,7 @@ LABEL org.opencontainers.image.title="chronos" \
 
 WORKDIR /var/lib/chronos
 
-COPY --from=builder /workspace/target/release/chronos /usr/local/bin/chronos
+COPY --from=builder /usr/local/bin/chronos /usr/local/bin/chronos
 
 USER 10001:10001
 

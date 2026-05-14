@@ -20,11 +20,22 @@ allow = [
 exceptions = []
 
 [bans]
-multiple-versions = "warn"
+multiple-versions = "deny"
 wildcards = "deny"
 highlight = "all"
 deny = []
-skip = []
+skip = [
+  { name = "getrandom", version = "=0.2.17" },
+  { name = "getrandom", version = "=0.3.4" },
+  { name = "hashbrown", version = "=0.14.5" },
+  { name = "hashbrown", version = "=0.15.5" },
+  { name = "linux-raw-sys", version = "=0.4.15" },
+  { name = "r-efi", version = "=5.3.0" },
+  { name = "rustix", version = "=0.38.44" },
+  { name = "windows-sys", version = "=0.52.0" },
+  { name = "windows-sys", version = "=0.59.0" },
+  { name = "wit-bindgen", version = "=0.51.0" }
+]
 skip-tree = []
 
 [sources]

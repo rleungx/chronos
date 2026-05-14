@@ -65,6 +65,9 @@ allocation API.
 Production deployments should use etcd metadata, routable advertise endpoints, explicit security
 configuration, and capacity sized for active timelines. For horizontal allocation scale, partition
 traffic across timeline keys and configure multi-node generator ownership.
+The Kubernetes manifest is intentionally a static partitioned StatefulSet; scale it through a
+planned ownership-plan change rather than a generic HPA. Use `make kubernetes-scale-plan` before
+changing replicas, ownership modulo, or PDB settings.
 
 Operator docs:
 

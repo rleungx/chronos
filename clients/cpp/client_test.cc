@@ -28,10 +28,44 @@ using chronos::tso::v1::TimestampService;
 
 namespace {
 
+constexpr const char* kErrorDetailTypeUrl =
+    "type.googleapis.com/chronos.tso.v1.ErrorDetail";
+constexpr const char* kPendingOwnerEndpoint = "pending-owner-endpoint";
+
 Client::TransportConfig InsecureTransport() {
   Client::TransportConfig config;
   config.insecure = true;
   return config;
+}
+
+void AppendVarint(uint64_t value, std::string* out) {
+  while (value >= 0x80) {
+    out->push_back(static_cast<char>((value & 0x7f) | 0x80));
+    value >>= 7;
+  }
+  out->push_back(static_cast<char>(value));
+}
+
+void AppendLengthDelimited(
+    uint32_t field_number,
+    const std::string& value,
+    std::string* out) {
+  AppendVarint((static_cast<uint64_t>(field_number) << 3) | 2, out);
+  AppendVarint(value.size(), out);
+  out->append(value);
+}
+
+std::string RichErrorDetails(const ErrorDetail& detail) {
+  std::string any;
+  AppendLengthDelimited(1, kErrorDetailTypeUrl, &any);
+  AppendLengthDelimited(2, detail.SerializeAsString(), &any);
+
+  std::string status;
+  AppendVarint(8, &status);
+  AppendVarint(grpc::StatusCode::FAILED_PRECONDITION, &status);
+  AppendLengthDelimited(2, "stale route", &status);
+  AppendLengthDelimited(3, any, &status);
+  return status;
 }
 
 struct RouteServiceImpl final : TimelineRouteService::Service {
@@ -51,6 +85,10 @@ struct RouteServiceImpl final : TimelineRouteService::Service {
       grpc::ServerContext*,
       const GetTimelineRouteRequest* request,
       GetTimelineRouteResponse* response) override {
+    ++get_route_calls;
+    if (omit_get_route.load()) {
+      return grpc::Status::OK;
+    }
     route->set_timeline_key(request->timeline_key());
     response->mutable_route()->CopyFrom(*route);
     return grpc::Status::OK;
@@ -58,6 +96,8 @@ struct RouteServiceImpl final : TimelineRouteService::Service {
 
   std::shared_ptr<TimelineRoute> route;
   ResourceTier last_desired_resource_tier = ResourceTier::RESOURCE_TIER_UNSPECIFIED;
+  std::atomic<int> get_route_calls{0};
+  std::atomic<bool> omit_get_route{false};
 };
 
 struct TimestampServiceImpl final : TimestampService::Service {
@@ -84,7 +124,7 @@ struct TimestampServiceImpl final : TimestampService::Service {
       return grpc::Status(
           grpc::StatusCode::FAILED_PRECONDITION,
           "stale route",
-          detail.SerializeAsString());
+          RichErrorDetails(detail));
     }
 
     if (request->expected_epoch() != route->epoch() ||
@@ -96,7 +136,7 @@ struct TimestampServiceImpl final : TimestampService::Service {
       return grpc::Status(
           grpc::StatusCode::FAILED_PRECONDITION,
           "stale route",
-          detail.SerializeAsString());
+          RichErrorDetails(detail));
     }
 
     response->set_timeline_key(request->timeline_key());
@@ -117,34 +157,25 @@ struct TimestampServiceImpl final : TimestampService::Service {
   std::vector<std::string> request_ids;
 };
 
+struct PlainFailedPreconditionTimestampServiceImpl final : TimestampService::Service {
+  grpc::Status AllocateTimestamps(
+      grpc::ServerContext*,
+      const AllocateTimestampsRequest*,
+      AllocateTimestampsResponse*) override {
+    ++allocate_calls;
+    return grpc::Status(
+        grpc::StatusCode::FAILED_PRECONDITION,
+        "non-route precondition failed");
+  }
+
+  std::atomic<int> allocate_calls{0};
+};
+
 struct MissingEnsureRouteServiceImpl final : TimelineRouteService::Service {
   grpc::Status EnsureTimeline(
       grpc::ServerContext*,
       const EnsureTimelineRequest*,
       EnsureTimelineResponse*) override {
-    return grpc::Status::OK;
-  }
-
-  grpc::Status GetTimelineRoute(
-      grpc::ServerContext*,
-      const GetTimelineRouteRequest*,
-      GetTimelineRouteResponse*) override {
-    return grpc::Status::OK;
-  }
-};
-
-struct MissingGetRouteServiceImpl final : TimelineRouteService::Service {
-  grpc::Status EnsureTimeline(
-      grpc::ServerContext*,
-      const EnsureTimelineRequest* request,
-      EnsureTimelineResponse* response) override {
-    auto* route = response->mutable_route();
-    route->set_timeline_key(request->timeline_key());
-    route->set_generator_id(7);
-    route->set_owner_worker_endpoint("127.0.0.1:1");
-    route->set_epoch(3);
-    route->set_route_version(11);
-    route->set_resource_tier(ResourceTier::RESOURCE_TIER_SHARED);
     return grpc::Status::OK;
   }
 
@@ -182,7 +213,7 @@ TimelineRoute MakeRoute(const std::string& owner_endpoint) {
 }
 
 void TestAllocateAgainstOwnerEndpoint() {
-  auto route = std::make_shared<TimelineRoute>(MakeRoute("unused"));
+  auto route = std::make_shared<TimelineRoute>(MakeRoute(kPendingOwnerEndpoint));
   auto owner_service = TimestampServiceImpl(route, false);
   auto owner_server = StartServer(&owner_service);
   route->set_owner_worker_endpoint("127.0.0.1:" + std::to_string(owner_server.port));
@@ -201,6 +232,9 @@ void TestAllocateAgainstOwnerEndpoint() {
   if (owner_service.allocate_calls.load() != 1) {
     throw std::runtime_error("owner endpoint was not used for allocation");
   }
+  if (route_service.get_route_calls.load() != 0) {
+    throw std::runtime_error("initial route should come from EnsureTimeline without extra get");
+  }
   {
     std::lock_guard<std::mutex> lock(owner_service.request_ids_mu);
     if (owner_service.request_ids.size() != 1 || !owner_service.request_ids[0].empty()) {
@@ -210,7 +244,7 @@ void TestAllocateAgainstOwnerEndpoint() {
 }
 
 void TestRefreshesStaleRouteAndRetries() {
-  auto route = std::make_shared<TimelineRoute>(MakeRoute("unused"));
+  auto route = std::make_shared<TimelineRoute>(MakeRoute(kPendingOwnerEndpoint));
   auto owner_service = TimestampServiceImpl(route, true);
   auto owner_server = StartServer(&owner_service);
   route->set_owner_worker_endpoint("127.0.0.1:" + std::to_string(owner_server.port));
@@ -230,6 +264,9 @@ void TestRefreshesStaleRouteAndRetries() {
   if (owner_service.allocate_calls.load() != 2) {
     throw std::runtime_error("expected one stale attempt and one retry");
   }
+  if (route_service.get_route_calls.load() != 1) {
+    throw std::runtime_error("expected exactly one route refresh after stale route");
+  }
   {
     std::lock_guard<std::mutex> lock(owner_service.request_ids_mu);
     if (owner_service.request_ids.size() != 2 ||
@@ -241,7 +278,7 @@ void TestRefreshesStaleRouteAndRetries() {
 }
 
 void TestClientConfigFlowsIntoRequests() {
-  auto route = std::make_shared<TimelineRoute>(MakeRoute("unused"));
+  auto route = std::make_shared<TimelineRoute>(MakeRoute(kPendingOwnerEndpoint));
   auto owner_service = TimestampServiceImpl(route, false);
   auto owner_server = StartServer(&owner_service);
   route->set_owner_worker_endpoint("127.0.0.1:" + std::to_string(owner_server.port));
@@ -280,7 +317,7 @@ void TestClientConfigFlowsIntoRequests() {
 }
 
 void TestIdempotentClientsUseDistinctRequestIds() {
-  auto route = std::make_shared<TimelineRoute>(MakeRoute("unused"));
+  auto route = std::make_shared<TimelineRoute>(MakeRoute(kPendingOwnerEndpoint));
   auto owner_service = TimestampServiceImpl(route, false);
   auto owner_server = StartServer(&owner_service);
   route->set_owner_worker_endpoint("127.0.0.1:" + std::to_string(owner_server.port));
@@ -311,6 +348,35 @@ void TestIdempotentClientsUseDistinctRequestIds() {
         owner_service.request_ids[0] == owner_service.request_ids[1]) {
       throw std::runtime_error("independent clients reused a request id");
     }
+  }
+}
+
+void TestFailedPreconditionWithoutChronosRouteDetailIsNotRetried() {
+  auto owner_service = PlainFailedPreconditionTimestampServiceImpl();
+  auto owner_server = StartServer(&owner_service);
+  auto route = std::make_shared<TimelineRoute>(
+      MakeRoute("127.0.0.1:" + std::to_string(owner_server.port)));
+
+  auto route_service = RouteServiceImpl(route);
+  auto route_server = StartServer(&route_service);
+
+  Client client(
+      "127.0.0.1:" + std::to_string(route_server.port),
+      "orders.primary",
+      InsecureTransport());
+  try {
+    client.AllocateTimestamps(1);
+    throw std::runtime_error("expected non-route failed precondition to be returned");
+  } catch (const std::runtime_error& ex) {
+    if (std::string(ex.what()).find("non-route precondition failed") == std::string::npos) {
+      throw;
+    }
+  }
+  if (owner_service.allocate_calls.load() != 1) {
+    throw std::runtime_error("non-route failed precondition should not be retried");
+  }
+  if (route_service.get_route_calls.load() != 0) {
+    throw std::runtime_error("non-route failed precondition should not refresh route");
   }
 }
 
@@ -345,14 +411,21 @@ void TestRejectsMissingEnsureRoute() {
 }
 
 void TestRejectsMissingRefreshedRoute() {
-  auto service = MissingGetRouteServiceImpl();
-  auto server = StartServer(&service);
+  auto route = std::make_shared<TimelineRoute>(MakeRoute(kPendingOwnerEndpoint));
+  auto owner_service = TimestampServiceImpl(route, true);
+  auto owner_server = StartServer(&owner_service);
+  route->set_owner_worker_endpoint("127.0.0.1:" + std::to_string(owner_server.port));
+
+  auto route_service = RouteServiceImpl(route);
+  route_service.omit_get_route = true;
+  auto route_server = StartServer(&route_service);
 
   try {
     Client client(
-        "127.0.0.1:" + std::to_string(server.port),
+        "127.0.0.1:" + std::to_string(route_server.port),
         "orders.primary",
         InsecureTransport());
+    client.AllocateTimestamps(1);
     throw std::runtime_error("expected missing refreshed route to be rejected");
   } catch (const std::runtime_error& ex) {
     if (std::string(ex.what()).find("no route from GetTimelineRoute") == std::string::npos) {
@@ -369,6 +442,7 @@ int main() {
     TestRefreshesStaleRouteAndRetries();
     TestClientConfigFlowsIntoRequests();
     TestIdempotentClientsUseDistinctRequestIds();
+    TestFailedPreconditionWithoutChronosRouteDetailIsNotRetried();
     TestRejectsPartialClientIdentity();
     TestRejectsMissingEnsureRoute();
     TestRejectsMissingRefreshedRoute();

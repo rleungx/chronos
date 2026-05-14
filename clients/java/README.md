@@ -2,7 +2,7 @@
 
 `Client` is the Java application-facing Chronos client implementation.
 
-Support level: Repository-local implementation.
+Support level: Repository-local implementation with Maven publication metadata.
 
 ## Public shape
 
@@ -21,6 +21,13 @@ explicit plaintext for local development.
 ```bash
 cd clients/java
 gradle test
+```
+
+To validate the example without adding it to the library artifact:
+
+```bash
+cd clients/java
+gradle compileExampleJava
 ```
 
 ## Behavior

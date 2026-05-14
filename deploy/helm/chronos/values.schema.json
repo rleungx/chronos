@@ -1,0 +1,84 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "required": ["replicaCount", "image", "etcd", "security"],
+  "properties": {
+    "replicaCount": {
+      "type": "integer",
+      "minimum": 3
+    },
+    "image": {
+      "type": "object",
+      "required": ["repository", "tag"],
+      "properties": {
+        "repository": { "type": "string", "minLength": 1 },
+        "tag": {
+          "type": "string",
+          "minLength": 1,
+          "not": { "const": "latest" }
+        },
+        "pullPolicy": {
+          "type": "string",
+          "enum": ["Always", "IfNotPresent", "Never"]
+        }
+      }
+    },
+    "ownership": {
+      "type": "object",
+      "properties": {
+        "planId": { "type": "string" }
+      }
+    },
+    "etcd": {
+      "type": "object",
+      "required": ["endpoints", "prefix", "tlsSecretName"],
+      "properties": {
+        "endpoints": {
+          "type": "string",
+          "pattern": "^https://"
+        },
+        "prefix": {
+          "type": "string",
+          "pattern": "^/"
+        },
+        "timeoutMs": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "tlsSecretName": { "type": "string", "minLength": 1 }
+      }
+    },
+    "security": {
+      "type": "object",
+      "required": ["mode", "clientCertAllowlistSecretName", "grpcTlsSecretName", "metricsTlsSecretName"],
+      "properties": {
+        "mode": { "const": "required" },
+        "clientCertAllowlistSecretName": { "type": "string", "minLength": 1 },
+        "grpcTlsSecretName": { "type": "string", "minLength": 1 },
+        "metricsTlsSecretName": { "type": "string", "minLength": 1 }
+      }
+    },
+    "runtime": {
+      "type": "object",
+      "properties": {
+        "grpcRequestTimeoutMs": { "type": "integer", "minimum": 1 },
+        "grpcMaxRequestBytes": { "type": "integer", "minimum": 1024 },
+        "grpcMaxConcurrentRequests": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "serviceMonitor": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "tlsSecretName": { "type": "string", "minLength": 1 },
+        "serverName": { "type": "string", "minLength": 1 }
+      }
+    },
+    "networkPolicy": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" }
+      }
+    }
+  }
+}

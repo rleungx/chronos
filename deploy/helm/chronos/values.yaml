@@ -1,0 +1,81 @@
+replicaCount: 3
+
+image:
+  repository: ghcr.io/rleungx/chronos
+  tag: "0.1.0"
+  pullPolicy: IfNotPresent
+
+nameOverride: ""
+fullnameOverride: ""
+
+namespace:
+  create: true
+
+ownership:
+  planId: ""
+
+etcd:
+  endpoints: https://etcd-client.etcd.svc.cluster.local:2379
+  prefix: /chronos
+  timeoutMs: 1000
+  tlsSecretName: chronos-etcd-client-tls
+
+security:
+  mode: required
+  clientCertAllowlistSecretName: chronos-client-cert-allowlist
+  grpcTlsSecretName: chronos-grpc-tls
+  metricsTlsSecretName: chronos-metrics-tls
+
+runtime:
+  logFormat: json
+  logFilter: info
+  safetyGapMs: 1
+  grpcRequestTimeoutMs: 100
+  grpcMaxRequestBytes: 1048576
+  grpcMaxConcurrentRequests: 256
+
+autoFailover:
+  enabled: true
+  intervalMs: 1000
+  batchSize: 16
+
+service:
+  type: ClusterIP
+  grpcPort: 50051
+  healthPort: 9897
+  metricsPort: 9898
+
+serviceMonitor:
+  enabled: true
+  interval: 15s
+  scrapeTimeout: 5s
+  tlsSecretName: chronos-metrics-client-tls
+  serverName: chronos
+
+networkPolicy:
+  enabled: true
+  clientPodSelector:
+    app.kubernetes.io/part-of: chronos-client
+  monitoringNamespaceSelector:
+    kubernetes.io/metadata.name: monitoring
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 256Mi
+  limits:
+    cpu: "1"
+    memory: 1Gi
+
+podDisruptionBudget:
+  enabled: true
+
+podAntiAffinity:
+  enabled: true
+
+topologySpreadConstraints:
+  enabled: true
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

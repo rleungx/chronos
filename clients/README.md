@@ -48,5 +48,16 @@ Common client options are available in every language:
 |---|---|---|
 | Rust | Primary | In-repo implementation, linted, and tested |
 | Go | Primary | Packaged submodule with generated proto and tests |
-| Java | Repository-local | In-repo implementation and tests, not yet a published SDK artifact |
-| C++ | Repository-local | In-repo implementation and tests, not yet a published SDK artifact |
+| Java | Repository-local | In-repo implementation, tests, and Maven publication metadata |
+| C++ | Repository-local | In-repo implementation, tests, and CMake install/export target |
+
+## Compatibility
+
+Client examples and library entry points are CI-gated. Rust and Go are the stable application
+surfaces for published integrations. Java and C++ track the same API shape in this repository and
+are suitable for source-based integrations; publish them externally only with an explicit
+versioning and distribution step.
+
+The cross-language client contract lives in `clients/client-contract.md` and is checked by
+`make client-conformance-check`. Repository-local package metadata is checked by
+`make client-package-check`.
