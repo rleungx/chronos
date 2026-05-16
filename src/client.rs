@@ -35,7 +35,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::sync::Mutex;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
-use tonic::{Code, Status};
+use tonic::{Code, Request, Status};
 
 use crate::proto::v1::{
     timeline_route_service_client::TimelineRouteServiceClient,
@@ -47,6 +47,7 @@ use crate::rpc::decode_error_detail_from_status_details;
 
 const DEFAULT_STALE_ROUTE_RETRY_ATTEMPTS: u32 = 3;
 const DEFAULT_STALE_ROUTE_RETRY_BACKOFF_MS: u64 = 5;
+const DEFAULT_REQUEST_TIMEOUT_MS: u32 = 250;
 static CLIENT_SCOPE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone)]
@@ -75,7 +76,7 @@ impl ClientConfig {
         Self {
             timeline_key: timeline_key.into(),
             desired_resource_tier: ResourceTier::Shared,
-            request_timeout_ms: 0,
+            request_timeout_ms: DEFAULT_REQUEST_TIMEOUT_MS,
             stale_route_retry_attempts: DEFAULT_STALE_ROUTE_RETRY_ATTEMPTS,
             stale_route_retry_backoff_ms: DEFAULT_STALE_ROUTE_RETRY_BACKOFF_MS,
             idempotency_enabled: false,
@@ -233,13 +234,17 @@ impl Client {
 
     pub async fn with_channel(channel: Channel, config: ClientConfig) -> Result<Self, ClientError> {
         let mut route_client = TimelineRouteServiceClient::new(channel.clone());
+        let ensure_request = request_with_timeout(
+            EnsureTimelineRequest {
+                timeline_key: config.timeline_key.clone(),
+                desired_resource_tier: config.desired_resource_tier as i32,
+            },
+            config.request_timeout_ms,
+        );
         let ensured_route = require_route(
             "ensure_timeline",
             route_client
-                .ensure_timeline(tonic::Request::new(EnsureTimelineRequest {
-                    timeline_key: config.timeline_key.clone(),
-                    desired_resource_tier: config.desired_resource_tier as i32,
-                }))
+                .ensure_timeline(ensure_request)
                 .await?
                 .into_inner()
                 .route,
@@ -316,9 +321,12 @@ impl Client {
             self.route_client
                 .lock()
                 .await
-                .get_timeline_route(tonic::Request::new(GetTimelineRouteRequest {
-                    timeline_key: self.config.timeline_key.clone(),
-                }))
+                .get_timeline_route(request_with_timeout(
+                    GetTimelineRouteRequest {
+                        timeline_key: self.config.timeline_key.clone(),
+                    },
+                    self.config.request_timeout_ms,
+                ))
                 .await?
                 .into_inner()
                 .route,
@@ -366,15 +374,19 @@ impl Client {
         count: u32,
         client_request_id: &str,
     ) -> Result<Vec<TimestampRange>, Status> {
-        Ok(tso_client
-            .allocate_timestamps(tonic::Request::new(AllocateTimestampsRequest {
+        let request = request_with_timeout(
+            AllocateTimestampsRequest {
                 timeline_key: route.timeline_key.clone(),
                 count,
                 expected_epoch: route.epoch,
                 expected_route_version: route.route_version,
                 client_request_id: client_request_id.to_string(),
                 request_timeout_ms: self.config.request_timeout_ms,
-            }))
+            },
+            self.config.request_timeout_ms,
+        );
+        Ok(tso_client
+            .allocate_timestamps(request)
             .await?
             .into_inner()
             .ranges)
@@ -401,6 +413,14 @@ fn new_idempotency_scope() -> String {
         .map(|duration| duration.as_nanos())
         .unwrap_or_default();
     format!("{:x}-{:x}-{:x}", std::process::id(), now_ns, counter)
+}
+
+fn request_with_timeout<T>(message: T, timeout_ms: u32) -> Request<T> {
+    let mut request = Request::new(message);
+    if timeout_ms > 0 {
+        request.set_timeout(Duration::from_millis(timeout_ms as u64));
+    }
+    request
 }
 
 fn same_route_identity(left: &TimelineRoute, right: &TimelineRoute) -> bool {
@@ -917,6 +937,25 @@ mod tests {
 
         let idempotent_config = ClientConfig::new("orders.primary").with_idempotency_enabled(true);
         assert!(idempotent_config.idempotency_enabled);
+    }
+
+    #[test]
+    fn request_timeout_sets_grpc_timeout_metadata() {
+        let request = request_with_timeout(
+            GetTimelineRouteRequest {
+                timeline_key: "orders.primary".into(),
+            },
+            1500,
+        );
+        assert!(request.metadata().contains_key("grpc-timeout"));
+
+        let request = request_with_timeout(
+            GetTimelineRouteRequest {
+                timeline_key: "orders.primary".into(),
+            },
+            0,
+        );
+        assert!(!request.metadata().contains_key("grpc-timeout"));
     }
 
     #[test]

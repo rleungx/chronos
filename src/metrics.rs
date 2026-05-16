@@ -126,6 +126,18 @@ pub static TSO_ALLOCATE_STAGE_LATENCY: LazyLock<HistogramVec> = LazyLock::new(||
         &["path", "stage"],
     )
 });
+pub static TSO_GENERATOR_FAIRNESS_ACTIVE_TURNS: LazyLock<IntGauge> = LazyLock::new(|| {
+    register_int_gauge_metric(
+        "tso_generator_fairness_active_turns",
+        "Current number of generator fairness turns held by shared or warm timelines",
+    )
+});
+pub static TSO_GENERATOR_FAIRNESS_WAITERS: LazyLock<IntGauge> = LazyLock::new(|| {
+    register_int_gauge_metric(
+        "tso_generator_fairness_waiters",
+        "Current number of requests queued behind generator fairness turns",
+    )
+});
 pub static TSO_REQUEST_IDEMPOTENCY_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     register_int_counter_vec_metric(
         "tso_request_idempotency_total",
@@ -188,6 +200,13 @@ pub static TSO_METADATA_ERRORS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(||
         "tso_metadata_errors_total",
         "Metadata store request errors",
         &["op"],
+    )
+});
+pub static TSO_METADATA_RETRIES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec_metric(
+        "tso_metadata_retries_total",
+        "Metadata store retry attempts",
+        &["op", "reason"],
     )
 });
 pub static TSO_METADATA_CONFLICTS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
@@ -271,6 +290,18 @@ pub static TSO_STARTUP_READY: LazyLock<IntGauge> = LazyLock::new(|| {
     register_int_gauge_metric(
         "tso_startup_ready",
         "Whether the service has completed startup and is ready",
+    )
+});
+pub static TSO_METRICS_RENDER_LATENCY: LazyLock<Histogram> = LazyLock::new(|| {
+    register_histogram_metric(
+        "tso_metrics_render_latency_seconds",
+        "Latency of rendering Prometheus metrics in seconds",
+    )
+});
+pub static TSO_METRICS_RENDER_ERRORS_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter_metric(
+        "tso_metrics_render_errors_total",
+        "Total number of Prometheus metrics render failures",
     )
 });
 pub static TSO_IDENTITY_LEASE_EVENTS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {

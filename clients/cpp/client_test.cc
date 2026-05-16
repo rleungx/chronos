@@ -1,9 +1,11 @@
 #include <atomic>
+#include <chrono>
 #include <iostream>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <grpcpp/grpcpp.h>
@@ -166,6 +168,19 @@ struct PlainFailedPreconditionTimestampServiceImpl final : TimestampService::Ser
     return grpc::Status(
         grpc::StatusCode::FAILED_PRECONDITION,
         "non-route precondition failed");
+  }
+
+  std::atomic<int> allocate_calls{0};
+};
+
+struct SlowTimestampServiceImpl final : TimestampService::Service {
+  grpc::Status AllocateTimestamps(
+      grpc::ServerContext*,
+      const AllocateTimestampsRequest*,
+      AllocateTimestampsResponse*) override {
+    ++allocate_calls;
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    return grpc::Status::OK;
   }
 
   std::atomic<int> allocate_calls{0};
@@ -380,6 +395,37 @@ void TestFailedPreconditionWithoutChronosRouteDetailIsNotRetried() {
   }
 }
 
+void TestRequestTimeoutAppliesGrpcDeadline() {
+  auto owner_service = SlowTimestampServiceImpl();
+  auto owner_server = StartServer(&owner_service);
+  auto route = std::make_shared<TimelineRoute>(
+      MakeRoute("127.0.0.1:" + std::to_string(owner_server.port)));
+
+  auto route_service = RouteServiceImpl(route);
+  auto route_server = StartServer(&route_service);
+
+  Client::Config config;
+  config.transport = InsecureTransport();
+  config.request_timeout_ms = 50;
+
+  Client client(
+      "127.0.0.1:" + std::to_string(route_server.port),
+      "orders.primary",
+      std::move(config));
+  bool failed = false;
+  try {
+    client.AllocateTimestamps(1);
+  } catch (const std::runtime_error&) {
+    failed = true;
+  }
+  if (!failed) {
+    throw std::runtime_error("expected allocation to hit grpc deadline");
+  }
+  if (owner_service.allocate_calls.load() != 1) {
+    throw std::runtime_error("deadline test should issue exactly one allocation");
+  }
+}
+
 void TestRejectsPartialClientIdentity() {
   try {
     Client::TransportConfig config;
@@ -443,6 +489,7 @@ int main() {
     TestClientConfigFlowsIntoRequests();
     TestIdempotentClientsUseDistinctRequestIds();
     TestFailedPreconditionWithoutChronosRouteDetailIsNotRetried();
+    TestRequestTimeoutAppliesGrpcDeadline();
     TestRejectsPartialClientIdentity();
     TestRejectsMissingEnsureRoute();
     TestRejectsMissingRefreshedRoute();

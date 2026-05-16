@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::env;
 use std::error::Error;
 use std::io::Read;
 use std::net::{SocketAddr, TcpListener};
@@ -19,6 +18,14 @@ use chronos::proto::v1::{
     EnsureTimelineRequest, ErrorCode, ErrorDetail, GetTimelineRouteRequest, ResourceTier,
     TimelineRoute, TimelineTransferReason, TransferTimelineRequest, WorkerReadinessState,
 };
+
+#[path = "support/env.rs"]
+mod support_env;
+#[path = "support/stats.rs"]
+mod support_stats;
+
+use support_env::{env_or, env_or_string};
+use support_stats::percentile;
 
 type AppResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -68,20 +75,6 @@ struct FailoverBenchStats {
     monotonicity_violations_total: u64,
     first_success_after_kill_ms: Option<u64>,
     error_counts: HashMap<String, u64>,
-}
-
-fn env_or<T>(key: &str, default: T) -> T
-where
-    T: std::str::FromStr,
-{
-    env::var(key)
-        .ok()
-        .and_then(|value| value.parse::<T>().ok())
-        .unwrap_or(default)
-}
-
-fn env_or_string(key: &str, default: &str) -> String {
-    env::var(key).unwrap_or_else(|_| default.to_owned())
 }
 
 fn parse_endpoints_csv(value: &str) -> Vec<String> {
@@ -473,14 +466,6 @@ async fn failover_timeline(
         }))
         .await?;
     Ok(response.into_inner())
-}
-
-fn percentile(sorted: &[u64], pct: f64) -> u64 {
-    if sorted.is_empty() {
-        return 0;
-    }
-    let idx = ((sorted.len() - 1) as f64 * pct).round() as usize;
-    sorted[idx]
 }
 
 fn decode_error_detail(status: &Status) -> Option<ErrorDetail> {

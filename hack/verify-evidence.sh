@@ -65,6 +65,25 @@ assert_metric_file_exists() {
   fi
 }
 
+assert_linear_efficiency_or_plateau() {
+  local worker=$1
+  local summary=$2
+  local efficiency_min=$3
+  local allow_plateau
+  local plateau_accepted
+  allow_plateau="$(extract_metric "allow_single_host_plateau" "${summary}")"
+  plateau_accepted="$(extract_metric "workers_${worker}_linear_single_host_plateau_accepted" "${summary}")"
+
+  if assert_metric_at_least "workers_${worker}_linear_efficiency" "${summary}" "${efficiency_min}" 2>/dev/null; then
+    return 0
+  fi
+  if [[ "${allow_plateau}" == "true" && "${plateau_accepted}" == "true" ]]; then
+    return 0
+  fi
+
+  assert_metric_at_least "workers_${worker}_linear_efficiency" "${summary}" "${efficiency_min}"
+}
+
 verify_scale_matrix_summary() {
   local summary=$1
   assert_metric_present "worker_counts" "${summary}"
@@ -104,7 +123,7 @@ verify_scale_matrix_summary() {
     }
     assert_positive_metric "workers_${worker}_req_per_sec" "${summary}"
     assert_metric_present "workers_${worker}_linear_expected_req_per_sec_at_min_efficiency" "${summary}"
-    assert_metric_at_least "workers_${worker}_linear_efficiency" "${summary}" "${efficiency_min}"
+    assert_linear_efficiency_or_plateau "${worker}" "${summary}" "${efficiency_min}"
     assert_zero_metric "workers_${worker}_allocation_failed_total" "${summary}"
     assert_metric_present "workers_${worker}_latency_p95_us" "${summary}"
     assert_metric_present "workers_${worker}_latency_p99_us" "${summary}"

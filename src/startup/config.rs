@@ -7,22 +7,8 @@ use crate::AppResult;
 pub(crate) const DEFAULT_ETCD_PREFIX: &str = "/chronos";
 const DEFAULT_LOG_FILTER: &str = "info";
 
-const REMOVED_STARTUP_TUNING_ENV_VARS: &[&str] = &[
-    "CHRONOS_ROUTE_CACHE_TTL_MS",
-    "CHRONOS_SHARED_GENERATORS",
-    "CHRONOS_WARM_GENERATORS",
-    "CHRONOS_MAX_BATCH_PER_REQUEST",
-    "CHRONOS_DEFAULT_RESOURCE_TIER",
-    "CHRONOS_MAX_FUTURE_BORROW_MS",
-    "CHRONOS_MAX_CLOCK_REWIND_MS",
-    "CHRONOS_RECOVERY_CATCHUP_BUDGET_MS",
-    "CHRONOS_LEASE_TTL_MS",
-    "CHRONOS_GENERATOR_LEASE_TTL_MS",
-    "CHRONOS_GENERATOR_MAINTENANCE_INTERVAL_MS",
-    "CHRONOS_PRE_BORROW_MS",
-    "CHRONOS_SHARED_JUMP_AHEAD_THRESHOLD_MS",
-    "CHRONOS_GENERATOR_OWNERSHIP",
-];
+const REMOVED_STARTUP_TUNING_ENV_VARS: &[&str] =
+    &["CHRONOS_GENERATOR_OWNERSHIP", "CHRONOS_ROUTE_CACHE_TTL_MS"];
 
 #[derive(Debug, Clone)]
 pub(crate) struct LoadedStartupConfig {
@@ -161,6 +147,29 @@ fn read_csv_env(key: &str) -> Vec<String> {
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
         .collect()
+}
+
+fn parse_resource_tier_env(value: &str) -> AppResult<chronos::ResourceTier> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "shared" => Ok(chronos::ResourceTier::Shared),
+        "warm" => Ok(chronos::ResourceTier::Warm),
+        "dedicated" => Ok(chronos::ResourceTier::Dedicated),
+        other => Err(format!(
+            "CHRONOS_DEFAULT_RESOURCE_TIER must be one of shared,warm,dedicated (got {other})"
+        )
+        .into()),
+    }
+}
+
+fn read_u32_csv_env(key: &str) -> AppResult<Vec<u32>> {
+    let mut values = Vec::new();
+    if env::var_os(key).is_none() {
+        return Ok(values);
+    }
+    for value in read_csv_env(key) {
+        values.push(value.parse()?);
+    }
+    Ok(values)
 }
 
 fn apply_string_env(key: &str, target: &mut String) {
@@ -315,6 +324,15 @@ fn apply_transport_limit_env(config: &mut TsoConfig) -> AppResult<()> {
 }
 
 fn apply_capacity_env(config: &mut TsoConfig) -> AppResult<()> {
+    apply_parsed_env("CHRONOS_SHARED_GENERATORS", &mut config.shared_generators)?;
+    apply_parsed_env("CHRONOS_WARM_GENERATORS", &mut config.warm_generators)?;
+    apply_parsed_env(
+        "CHRONOS_MAX_BATCH_PER_REQUEST",
+        &mut config.max_batch_per_request,
+    )?;
+    if let Ok(value) = env::var("CHRONOS_DEFAULT_RESOURCE_TIER") {
+        config.default_resource_tier = parse_resource_tier_env(&value)?;
+    }
     apply_parsed_env(
         "CHRONOS_MAX_TIMELINE_PROXY_LANES",
         &mut config.max_timeline_proxy_lanes,
@@ -348,10 +366,41 @@ fn apply_generator_ownership_env(config: &mut TsoConfig) -> AppResult<()> {
         "CHRONOS_GENERATOR_OWNERSHIP_REMAINDER",
         &mut config.generator_ownership_remainder,
     )?;
+    let remainders = read_u32_csv_env("CHRONOS_GENERATOR_OWNERSHIP_REMAINDERS")?;
+    if !remainders.is_empty() {
+        config.generator_ownership_remainder = remainders[0];
+        config.generator_ownership_remainders = remainders;
+    }
     Ok(())
 }
 
 fn apply_timing_env(config: &mut TsoConfig) -> AppResult<()> {
+    apply_parsed_env(
+        "CHRONOS_MAX_FUTURE_BORROW_MS",
+        &mut config.max_future_borrow_ms,
+    )?;
+    apply_parsed_env(
+        "CHRONOS_MAX_CLOCK_REWIND_MS",
+        &mut config.max_clock_rewind_ms,
+    )?;
+    apply_parsed_env(
+        "CHRONOS_RECOVERY_CATCHUP_BUDGET_MS",
+        &mut config.recovery_catchup_budget_ms,
+    )?;
+    apply_parsed_env("CHRONOS_LEASE_TTL_MS", &mut config.lease_ttl_ms)?;
+    apply_parsed_env(
+        "CHRONOS_GENERATOR_LEASE_TTL_MS",
+        &mut config.generator_lease_ttl_ms,
+    )?;
+    apply_parsed_env(
+        "CHRONOS_GENERATOR_MAINTENANCE_INTERVAL_MS",
+        &mut config.generator_maintenance_interval_ms,
+    )?;
+    apply_parsed_env("CHRONOS_PRE_BORROW_MS", &mut config.pre_borrow_ms)?;
+    apply_parsed_env(
+        "CHRONOS_SHARED_JUMP_AHEAD_THRESHOLD_MS",
+        &mut config.shared_jump_ahead_threshold_ms,
+    )?;
     apply_parsed_env(
         "CHRONOS_AUTO_FAILOVER_ENABLED",
         &mut config.auto_failover_enabled,

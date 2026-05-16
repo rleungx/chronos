@@ -41,10 +41,14 @@ app.kubernetes.io/component: tso
 {{- if .Values.ownership.planId -}}
 {{- .Values.ownership.planId -}}
 {{- else -}}
-{{- printf "%s-static-%d" (include "chronos.fullname" .) (int .Values.replicaCount) -}}
+{{- printf "%s-rendezvous-shards-%d" (include "chronos.fullname" .) (int .Values.ownership.shardCount) -}}
 {{- end -}}
 {{- end -}}
 
 {{- define "chronos.image" -}}
+{{- if .Values.image.digest -}}
+{{- printf "%s@%s" .Values.image.repository .Values.image.digest -}}
+{{- else -}}
 {{- printf "%s:%s" .Values.image.repository .Values.image.tag -}}
+{{- end -}}
 {{- end -}}

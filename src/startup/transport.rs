@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::stream;
 use http_body_util::Full;
@@ -22,7 +22,7 @@ use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
 use tracing::warn;
 
 use chronos::tls as shared_tls;
-use chronos::TsoConfig;
+use chronos::{metrics, TsoConfig};
 
 use crate::AppResult;
 
@@ -61,10 +61,13 @@ pub(crate) async fn metrics_handler<B>(
     match path.as_str() {
         "/healthz" | "/readyz" => health_handler(req, ready).await,
         "/metrics" => {
+            let started = Instant::now();
             let encoder = TextEncoder::new();
             let metric_families = prometheus::gather();
             let mut buffer = Vec::new();
             if let Err(error) = encoder.encode(&metric_families, &mut buffer) {
+                metrics::TSO_METRICS_RENDER_ERRORS_TOTAL.inc();
+                metrics::TSO_METRICS_RENDER_LATENCY.observe(started.elapsed().as_secs_f64());
                 warn!(
                     component = "startup",
                     event = "metrics_render_failed",
@@ -76,6 +79,7 @@ pub(crate) async fn metrics_handler<B>(
                     "metrics unavailable",
                 ));
             }
+            metrics::TSO_METRICS_RENDER_LATENCY.observe(started.elapsed().as_secs_f64());
             Ok(metrics_response(buffer))
         }
         _ => Ok(plain_text_response(StatusCode::NOT_FOUND, "not found")),

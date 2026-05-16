@@ -1,4 +1,4 @@
-Chronos has been rendered for {{ .Release.Namespace }} with {{ .Values.replicaCount }} static ownership replicas.
+Chronos has been rendered for {{ .Release.Namespace }} with {{ .Values.replicaCount }} replicas over {{ .Values.ownership.shardCount }} ownership shards.
 
 Before applying a changed replica count, generate and review the ownership movement plan:
   make kubernetes-scale-plan CHRONOS_OWNERSHIP_OLD_WORKERS=<old> CHRONOS_OWNERSHIP_NEW_WORKERS={{ .Values.replicaCount }}

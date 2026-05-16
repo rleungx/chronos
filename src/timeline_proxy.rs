@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
@@ -18,6 +19,7 @@ use crate::{
 pub struct TimelineScopedAllocator {
     data_plane: TsoDataPlane,
     timeline_serializers: Arc<DashMap<String, Arc<TimelineSerializer>>>,
+    idle_serializers: Arc<StdMutex<VecDeque<String>>>,
     serializer_slots: Arc<AtomicUsize>,
     max_serializers: usize,
 }
@@ -31,7 +33,9 @@ struct TimelineSerializer {
 }
 
 struct TimelineSerializerLease {
+    timeline_key: String,
     serializer: Arc<TimelineSerializer>,
+    idle_serializers: Arc<StdMutex<VecDeque<String>>>,
 }
 
 impl Drop for TimelineSerializerLease {
@@ -41,6 +45,21 @@ impl Drop for TimelineSerializerLease {
             .active_references
             .fetch_sub(1, Ordering::AcqRel);
         debug_assert!(previous > 0);
+        if previous == 1 {
+            lock_idle_serializers(&self.idle_serializers).push_back(self.timeline_key.clone());
+        }
+    }
+}
+
+fn lock_idle_serializers(
+    idle_serializers: &StdMutex<VecDeque<String>>,
+) -> StdMutexGuard<'_, VecDeque<String>> {
+    match idle_serializers.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            record_recovery_event("timeline_proxy", "idle_serializer_queue", "mutex_poisoned");
+            poisoned.into_inner()
+        }
     }
 }
 
@@ -50,6 +69,7 @@ impl TimelineScopedAllocator {
         Self {
             data_plane,
             timeline_serializers: Arc::new(DashMap::new()),
+            idle_serializers: Arc::new(StdMutex::new(VecDeque::new())),
             serializer_slots: Arc::new(AtomicUsize::new(0)),
             max_serializers,
         }
@@ -159,7 +179,11 @@ impl TimelineScopedAllocator {
             }
             serializer.active_references.fetch_add(1, Ordering::AcqRel);
         }
-        Some(TimelineSerializerLease { serializer })
+        Some(TimelineSerializerLease {
+            timeline_key: timeline_key.to_owned(),
+            serializer,
+            idle_serializers: self.idle_serializers.clone(),
+        })
     }
 
     fn serializer_for(&self, timeline_key: &str) -> Result<TimelineSerializerLease, TsoError> {
@@ -211,25 +235,33 @@ impl TimelineScopedAllocator {
                     });
                     entry.insert(serializer.clone());
                     metrics::TSO_TIMELINE_PROXY_LANES.set(self.timeline_serializers.len() as i64);
-                    return Ok(TimelineSerializerLease { serializer });
+                    return Ok(TimelineSerializerLease {
+                        timeline_key: timeline_key.to_owned(),
+                        serializer,
+                        idle_serializers: self.idle_serializers.clone(),
+                    });
                 }
             }
         }
     }
 
     fn prune_one_idle_serializer(&self) -> bool {
-        self.try_prune_idle_candidates(self.timeline_serializers.len())
+        self.try_prune_idle_candidates(self.timeline_serializers.len().max(1))
     }
 
     fn try_prune_idle_candidates(&self, attempts: usize) -> bool {
-        let candidates: Vec<_> = self
-            .timeline_serializers
-            .iter()
-            .take(attempts)
-            .map(|entry| (entry.key().clone(), entry.value().clone()))
-            .collect();
-
-        for (timeline_key, serializer) in candidates {
+        for _ in 0..attempts {
+            let Some(timeline_key) = lock_idle_serializers(&self.idle_serializers).pop_front()
+            else {
+                return false;
+            };
+            let Some(serializer) = self
+                .timeline_serializers
+                .get(&timeline_key)
+                .map(|entry| entry.value().clone())
+            else {
+                continue;
+            };
             if serializer.active_references.load(Ordering::Acquire) != 0 {
                 continue;
             }

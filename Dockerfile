@@ -51,8 +51,15 @@ ARG CHRONOS_BUILD_COMMIT=unknown
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
     apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
-    && useradd --system --uid 10001 --create-home --home-dir /var/lib/chronos chronos
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends --only-upgrade \
+        libc6 \
+        libc-bin \
+        libcap2 \
+        libsystemd0 \
+        libudev1 \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates \
+    && apt-get clean \
+    && useradd --uid 10001 --create-home --home-dir /var/lib/chronos --shell /usr/sbin/nologin --no-log-init chronos
 
 LABEL org.opencontainers.image.title="chronos" \
       org.opencontainers.image.revision="${CHRONOS_BUILD_COMMIT}" \

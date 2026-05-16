@@ -33,15 +33,17 @@ data:
   CHRONOS_METRICS_BIND_ADDR: 0.0.0.0:9898
   CHRONOS_LOG_FORMAT: json
   CHRONOS_LOG_FILTER: info
-  CHRONOS_OWNERSHIP_PLAN_ID: kubernetes-static-3
-  CHRONOS_GENERATOR_OWNERSHIP_MODULO: "3"
+  CHRONOS_OWNERSHIP_PLAN_ID: kubernetes-rendezvous-shards-256
+  CHRONOS_GENERATOR_OWNERSHIP_MODULO: "256"
+  CHRONOS_OWNERSHIP_WORKER_COUNT: "3"
+  CHRONOS_OWNERSHIP_ASSIGNMENT_SEED: "20260516"
   CHRONOS_SAFETY_GAP_MS: "1"
   CHRONOS_AUTO_FAILOVER_ENABLED: "true"
   CHRONOS_AUTO_FAILOVER_INTERVAL_MS: "1000"
   CHRONOS_AUTO_FAILOVER_BATCH_SIZE: "16"
-  CHRONOS_GRPC_REQUEST_TIMEOUT_MS: "100"
+  CHRONOS_GRPC_REQUEST_TIMEOUT_MS: "250"
   CHRONOS_GRPC_MAX_REQUEST_BYTES: "1048576"
-  CHRONOS_GRPC_MAX_CONCURRENT_REQUESTS: "256"
+  CHRONOS_GRPC_MAX_CONCURRENT_REQUESTS: "1024"
   CHRONOS_ETCD_TIMEOUT_MS: "1000"
 ---
 apiVersion: v1
@@ -148,14 +150,14 @@ spec:
       topologySpreadConstraints:
         - maxSkew: 1
           topologyKey: topology.kubernetes.io/zone
-          whenUnsatisfiable: ScheduleAnyway
+          whenUnsatisfiable: DoNotSchedule
           labelSelector:
             matchLabels:
               app.kubernetes.io/name: chronos
               app.kubernetes.io/component: tso
       initContainers:
         - name: install-tls
-          image: debian:bookworm-slim@sha256:f9c6a2fd2ddbc23e336b6257a5245e31f996953ef06cd13a59fa0a1df2d5c252
+          image: ghcr.io/rleungx/chronos:0.1.0
           imagePullPolicy: IfNotPresent
           command:
             - /bin/sh
@@ -200,25 +202,7 @@ spec:
             - -ec
           args:
             - |
-              ordinal="${POD_NAME##*-}"
-              modulo="${CHRONOS_GENERATOR_OWNERSHIP_MODULO:?missing CHRONOS_GENERATOR_OWNERSHIP_MODULO}"
-              case "${ordinal}" in
-                ""|*[!0-9]*)
-                  echo "POD_NAME must end with a numeric StatefulSet ordinal, got: ${POD_NAME}" >&2
-                  exit 1
-                  ;;
-              esac
-              case "${modulo}" in
-                ""|*[!0-9]*)
-                  echo "CHRONOS_GENERATOR_OWNERSHIP_MODULO must be numeric, got: ${modulo}" >&2
-                  exit 1
-                  ;;
-              esac
-              if [ "${ordinal}" -ge "${modulo}" ]; then
-                echo "pod ordinal ${ordinal} must be < CHRONOS_GENERATOR_OWNERSHIP_MODULO=${modulo}" >&2
-                exit 1
-              fi
-              export CHRONOS_GENERATOR_OWNERSHIP_REMAINDER="${ordinal}"
+              eval "$(/usr/local/bin/chronos --print-ownership-env)"
               exec /usr/local/bin/chronos
           ports:
             - name: grpc
@@ -313,10 +297,9 @@ spec:
                   - sleep 5
           resources:
             requests:
-              cpu: 250m
-              memory: 256Mi
+              cpu: 500m
+              memory: 512Mi
             limits:
-              cpu: "1"
               memory: 1Gi
           securityContext:
             allowPrivilegeEscalation: false

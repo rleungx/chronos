@@ -17,6 +17,13 @@
           "minLength": 1,
           "not": { "const": "latest" }
         },
+        "digest": {
+          "type": "string",
+          "anyOf": [
+            { "const": "" },
+            { "pattern": "^sha256:[a-f0-9]{64}$" }
+          ]
+        },
         "pullPolicy": {
           "type": "string",
           "enum": ["Always", "IfNotPresent", "Never"]
@@ -26,7 +33,15 @@
     "ownership": {
       "type": "object",
       "properties": {
-        "planId": { "type": "string" }
+        "planId": { "type": "string" },
+        "shardCount": {
+          "type": "integer",
+          "minimum": 3
+        },
+        "assignmentSeed": {
+          "type": "integer",
+          "minimum": 0
+        }
       }
     },
     "etcd": {
@@ -64,6 +79,20 @@
         "grpcRequestTimeoutMs": { "type": "integer", "minimum": 1 },
         "grpcMaxRequestBytes": { "type": "integer", "minimum": 1024 },
         "grpcMaxConcurrentRequests": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "resources": {
+      "type": "object"
+    },
+    "topologySpreadConstraints": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "topologyKey": { "type": "string", "minLength": 1 },
+        "whenUnsatisfiable": {
+          "type": "string",
+          "enum": ["DoNotSchedule", "ScheduleAnyway"]
+        }
       }
     },
     "serviceMonitor": {

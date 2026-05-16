@@ -44,6 +44,10 @@ pub(super) fn timeline_status_index_marker_key(prefix: &str) -> String {
     namespace(prefix, "timeline_status/__ready")
 }
 
+pub(super) fn timeline_status_index_rebuild_lock_key(prefix: &str) -> String {
+    namespace(prefix, "timeline_status/__rebuild_lock")
+}
+
 pub(super) fn timeline_status_owner_index_key(
     prefix: &str,
     owner_worker_endpoint: &str,

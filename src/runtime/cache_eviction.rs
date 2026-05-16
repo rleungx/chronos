@@ -294,29 +294,14 @@ impl TimelineCacheStore {
     }
 
     fn evict_one_idle_entry(&self, capacity: &mut CapacityState) -> bool {
-        let mut deferred = Vec::new();
-        if self.try_evict_idle_entry_batch(capacity, EVICTION_CANDIDATE_BATCH_LIMIT, &mut deferred)
-        {
-            return true;
-        }
-
         self.maybe_compact_eviction_candidates(capacity);
-        if self.try_evict_idle_entry_batch(capacity, EVICTION_CANDIDATE_BATCH_LIMIT, &mut deferred)
-        {
-            capacity.eviction_candidates.extend(deferred.drain(..));
-            return true;
-        }
-
-        capacity.eviction_candidates.extend(deferred.drain(..));
-        let mut retried_deferred = Vec::new();
-        let evicted = self.try_evict_idle_entry_batch(
-            capacity,
-            EVICTION_CANDIDATE_BATCH_LIMIT,
-            &mut retried_deferred,
-        );
-        capacity
+        let mut deferred = Vec::new();
+        let attempts = capacity
             .eviction_candidates
-            .extend(retried_deferred.drain(..));
+            .len()
+            .max(EVICTION_CANDIDATE_BATCH_LIMIT);
+        let evicted = self.try_evict_idle_entry_batch(capacity, attempts, &mut deferred);
+        capacity.eviction_candidates.extend(deferred.drain(..));
         evicted
     }
 

@@ -21,6 +21,7 @@ import (
 )
 
 const maxRetainedStaleOwnerConns = 16
+const defaultRequestTimeoutMs uint32 = 250
 const defaultStaleRouteRetryAttempts uint32 = 3
 const defaultStaleRouteRetryBackoffMs uint64 = 5
 
@@ -48,7 +49,7 @@ type transportConfig struct {
 func defaultConfig() config {
 	return config{
 		desiredResourceTier:      tsov1.ResourceTier_RESOURCE_TIER_SHARED,
-		requestTimeoutMs:         0,
+			requestTimeoutMs:         defaultRequestTimeoutMs,
 		staleRouteRetryAttempts:  defaultStaleRouteRetryAttempts,
 		staleRouteRetryBackoffMs: defaultStaleRouteRetryBackoffMs,
 		idempotencyEnabled:       false,
@@ -219,7 +220,9 @@ func (c *Client) ensureRoute(ctx context.Context) (*tsov1.TimelineRoute, error) 
 		return route, nil
 	}
 
-	resp, err := c.routeClient.EnsureTimeline(ctx, &tsov1.EnsureTimelineRequest{
+	rpcCtx, cancel := c.rpcContext(ctx)
+	defer cancel()
+	resp, err := c.routeClient.EnsureTimeline(rpcCtx, &tsov1.EnsureTimelineRequest{
 		TimelineKey:         c.timelineKey,
 		DesiredResourceTier: c.config.desiredResourceTier,
 	})
@@ -247,7 +250,9 @@ func (c *Client) refreshRouteIfUnchanged(ctx context.Context, observedRoute *tso
 }
 
 func (c *Client) refreshRoute(ctx context.Context) (*tsov1.TimelineRoute, error) {
-	resp, err := c.routeClient.GetTimelineRoute(ctx, &tsov1.GetTimelineRouteRequest{
+	rpcCtx, cancel := c.rpcContext(ctx)
+	defer cancel()
+	resp, err := c.routeClient.GetTimelineRoute(rpcCtx, &tsov1.GetTimelineRouteRequest{
 		TimelineKey: c.timelineKey,
 	})
 	if err != nil {
@@ -334,7 +339,9 @@ func (c *Client) allocateOnce(ctx context.Context, route *tsov1.TimelineRoute, c
 	tsoClient := c.tsoClient
 	c.mu.RUnlock()
 
-	resp, err := tsoClient.AllocateTimestamps(ctx, &tsov1.AllocateTimestampsRequest{
+	rpcCtx, cancel := c.rpcContext(ctx)
+	defer cancel()
+	resp, err := tsoClient.AllocateTimestamps(rpcCtx, &tsov1.AllocateTimestampsRequest{
 		TimelineKey:          route.TimelineKey,
 		Count:                count,
 		ExpectedEpoch:        route.Epoch,
@@ -347,6 +354,17 @@ func (c *Client) allocateOnce(ctx context.Context, route *tsov1.TimelineRoute, c
 	}
 
 	return resp.Ranges, nil
+}
+
+func (c *Client) rpcContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if c.config.requestTimeoutMs == 0 {
+		return ctx, func() {}
+	}
+	timeout := time.Duration(c.config.requestTimeoutMs) * time.Millisecond
+	if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) <= timeout {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, timeout)
 }
 
 func (c *Client) nextClientRequestID(timelineKey string) string {

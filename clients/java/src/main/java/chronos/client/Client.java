@@ -24,12 +24,14 @@ import java.util.Deque;
 import java.util.List;
 import java.util.Objects;
 import java.util.UUID;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import javax.net.ssl.SSLException;
 
 public class Client implements AutoCloseable {
   private static final int MAX_RETAINED_STALE_OWNER_CHANNELS = 16;
+  private static final int DEFAULT_REQUEST_TIMEOUT_MS = 250;
   private static final int DEFAULT_STALE_ROUTE_RETRY_ATTEMPTS = 3;
   private static final long DEFAULT_STALE_ROUTE_RETRY_BACKOFF_MS = 5;
 
@@ -112,7 +114,7 @@ public class Client implements AutoCloseable {
     public static Config defaults() {
       return new Config(
           ResourceTier.RESOURCE_TIER_SHARED,
-          0,
+          DEFAULT_REQUEST_TIMEOUT_MS,
           DEFAULT_STALE_ROUTE_RETRY_ATTEMPTS,
           DEFAULT_STALE_ROUTE_RETRY_BACKOFF_MS,
           false,
@@ -325,7 +327,7 @@ public class Client implements AutoCloseable {
       }
 
       var ensureResponse =
-          routeStub.ensureTimeline(
+          routeStubWithDeadline().ensureTimeline(
               EnsureTimelineRequest.newBuilder()
                   .setTimelineKey(timelineKey)
                   .setDesiredResourceTier(config.desiredResourceTier)
@@ -349,7 +351,7 @@ public class Client implements AutoCloseable {
 
   private TimelineRoute refreshRouteLocked() {
     var response =
-        routeStub
+        routeStubWithDeadline()
             .getTimelineRoute(
                 GetTimelineRouteRequest.newBuilder().setTimelineKey(timelineKey).build());
     TimelineRoute route = requireRoute("getTimelineRoute", response.hasRoute(), response.getRoute());
@@ -398,7 +400,7 @@ public class Client implements AutoCloseable {
 
   private AllocateTimestampsResponse allocateOnce(
       TimelineRoute route, int count, String clientRequestId) {
-    return tsoStub.get().allocateTimestamps(
+    return stubWithDeadline(tsoStub.get()).allocateTimestamps(
         AllocateTimestampsRequest.newBuilder()
             .setTimelineKey(route.getTimelineKey())
             .setCount(count)
@@ -407,6 +409,21 @@ public class Client implements AutoCloseable {
             .setClientRequestId(clientRequestId)
             .setRequestTimeoutMs(config.requestTimeoutMs)
             .build());
+  }
+
+  private TimelineRouteServiceGrpc.TimelineRouteServiceBlockingStub routeStubWithDeadline() {
+    if (config.requestTimeoutMs <= 0) {
+      return routeStub;
+    }
+    return routeStub.withDeadlineAfter(config.requestTimeoutMs, TimeUnit.MILLISECONDS);
+  }
+
+  private TimestampServiceGrpc.TimestampServiceBlockingStub stubWithDeadline(
+      TimestampServiceGrpc.TimestampServiceBlockingStub stub) {
+    if (config.requestTimeoutMs <= 0) {
+      return stub;
+    }
+    return stub.withDeadlineAfter(config.requestTimeoutMs, TimeUnit.MILLISECONDS);
   }
 
   private String nextClientRequestId(String timelineKey) {

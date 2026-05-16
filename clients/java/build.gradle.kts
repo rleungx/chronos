@@ -25,12 +25,6 @@ dependencies {
     testRuntimeOnly("org.junit.platform:junit-platform-launcher:1.11.3")
 }
 
-java {
-    toolchain {
-        languageVersion.set(JavaLanguageVersion.of(25))
-    }
-}
-
 sourceSets {
     main {
         java {
@@ -117,7 +111,10 @@ publishing {
 
 tasks.test {
     useJUnitPlatform()
-    jvmArgs("--sun-misc-unsafe-memory-access=allow")
+}
+
+tasks.withType<JavaCompile>().configureEach {
+    options.release.set(21)
 }
 
 tasks.named("generateProto") {

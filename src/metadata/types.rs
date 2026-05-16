@@ -208,18 +208,6 @@ impl OwnershipPlanRecord {
                     existing.remainder, existing.worker_id, existing.advertise_endpoint
                 )));
             }
-            if existing.worker_id == member.worker_id {
-                return Err(TsoError::Internal(format!(
-                    "ownership plan worker_id {} is already assigned to remainder {}",
-                    existing.worker_id, existing.remainder
-                )));
-            }
-            if existing.advertise_endpoint == member.advertise_endpoint {
-                return Err(TsoError::Internal(format!(
-                    "ownership plan advertise_endpoint {} is already assigned to remainder {}",
-                    existing.advertise_endpoint, existing.remainder
-                )));
-            }
         }
 
         self.members.push(member);
@@ -260,8 +248,6 @@ impl OwnershipPlanRecord {
         }
 
         let mut remainders = HashSet::new();
-        let mut worker_ids = HashSet::new();
-        let mut endpoints = HashSet::new();
         for member in &self.members {
             if member.remainder >= self.modulo {
                 return Err(TsoError::Internal(format!(
@@ -273,18 +259,6 @@ impl OwnershipPlanRecord {
                 return Err(TsoError::Internal(format!(
                     "ownership plan contains duplicate remainder {}",
                     member.remainder
-                )));
-            }
-            if !worker_ids.insert(member.worker_id.as_str()) {
-                return Err(TsoError::Internal(format!(
-                    "ownership plan contains duplicate worker_id {}",
-                    member.worker_id
-                )));
-            }
-            if !endpoints.insert(member.advertise_endpoint.as_str()) {
-                return Err(TsoError::Internal(format!(
-                    "ownership plan contains duplicate advertise_endpoint {}",
-                    member.advertise_endpoint
                 )));
             }
         }
@@ -810,7 +784,7 @@ mod tests {
     }
 
     #[test]
-    fn ownership_plan_rejects_duplicate_remainder_worker_or_endpoint() {
+    fn ownership_plan_rejects_duplicate_remainder_and_allows_multi_shard_worker() {
         let mut plan = OwnershipPlanRecord::new(
             "plan-a".into(),
             3,
@@ -822,14 +796,10 @@ mod tests {
             plan.admit_member("plan-a", 3, plan_member(0, "worker-b", "worker-b:50051"), 2),
             Err(TsoError::Internal(_))
         ));
-        assert!(matches!(
-            plan.admit_member("plan-a", 3, plan_member(1, "worker-a", "worker-b:50051"), 2),
-            Err(TsoError::Internal(_))
-        ));
-        assert!(matches!(
-            plan.admit_member("plan-a", 3, plan_member(1, "worker-b", "worker-a:50051"), 2),
-            Err(TsoError::Internal(_))
-        ));
+        assert!(plan
+            .admit_member("plan-a", 3, plan_member(1, "worker-a", "worker-a:50051"), 2)
+            .expect("same worker should be allowed to own multiple remainders"));
+        assert_eq!(plan.members.len(), 2);
     }
 
     #[test]

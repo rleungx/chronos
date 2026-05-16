@@ -5,58 +5,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 source "${REPO_ROOT}/hack/lib/common.sh"
+source "${REPO_ROOT}/hack/lib/ownership.sh"
+source "${REPO_ROOT}/hack/lib/prometheus.sh"
 
 cd "${REPO_ROOT}"
-
-require_positive_integer() {
-  local name=$1
-  local value=$2
-  if ! [[ "${value}" =~ ^[0-9]+$ ]] || [[ "${value}" -eq 0 ]]; then
-    echo "${name} must be a positive integer, got: ${value}" >&2
-    return 1
-  fi
-}
-
-require_nonnegative_integer() {
-  local name=$1
-  local value=$2
-  if ! [[ "${value}" =~ ^[0-9]+$ ]]; then
-    echo "${name} must be a non-negative integer, got: ${value}" >&2
-    return 1
-  fi
-}
-
-csv_to_array() {
-  local array_name=$1
-  local value=$2
-  eval "${array_name}=()"
-  local -a raw
-  IFS=',' read -ra raw <<<"${value}"
-  local item
-  for item in "${raw[@]}"; do
-    item="${item#"${item%%[![:space:]]*}"}"
-    item="${item%"${item##*[![:space:]]}"}"
-    [[ -n "${item}" ]] && eval "${array_name}+=(\"\${item}\")"
-  done
-}
-
-join_by_comma() {
-  local joined=""
-  local item
-  for item in "$@"; do
-    if [[ -n "${joined}" ]]; then
-      joined+=","
-    fi
-    joined+="${item}"
-  done
-  printf '%s' "${joined}"
-}
-
-generated_endpoint() {
-  local base_port=$1
-  local index=$2
-  printf '127.0.0.1:%s' "$((base_port + index))"
-}
 
 metric_log_name() {
   local index=$1
@@ -70,6 +22,10 @@ readyz_log_name() {
 
 WORKER_COUNT="${CHRONOS_SCALE_WORKERS:-2}"
 require_positive_integer "CHRONOS_SCALE_WORKERS" "${WORKER_COUNT}"
+OWNERSHIP_SHARD_COUNT="${CHRONOS_SCALE_OWNERSHIP_SHARDS:-${CHRONOS_OWNERSHIP_SHARDS:-256}}"
+OWNERSHIP_ASSIGNMENT_SEED="${CHRONOS_SCALE_OWNERSHIP_ASSIGNMENT_SEED:-${CHRONOS_OWNERSHIP_ASSIGNMENT_SEED:-20260516}}"
+require_positive_integer "CHRONOS_SCALE_OWNERSHIP_SHARDS" "${OWNERSHIP_SHARD_COUNT}"
+require_nonnegative_integer "CHRONOS_SCALE_OWNERSHIP_ASSIGNMENT_SEED" "${OWNERSHIP_ASSIGNMENT_SEED}"
 
 DEFAULT_BENCH_REQUEST_TIMEOUT_MS=10000
 DEFAULT_BENCH_CLIENT_TIMEOUT_MS=15000
@@ -95,7 +51,14 @@ BENCH_CLIENT_TIMEOUT_MS="${CHRONOS_SCALE_CLIENT_TIMEOUT_MS:-${DEFAULT_BENCH_CLIE
 BENCH_CONNECT_TIMEOUT_MS="${CHRONOS_SCALE_CONNECT_TIMEOUT_MS:-${DEFAULT_BENCH_CONNECT_TIMEOUT_MS}}"
 BENCH_CONNECT_RETRY_INTERVAL_MS="${CHRONOS_SCALE_CONNECT_RETRY_INTERVAL_MS:-${DEFAULT_BENCH_CONNECT_RETRY_INTERVAL_MS}}"
 BENCH_ALLOCATION_CONNECTION_POOL_SIZE="${CHRONOS_SCALE_ALLOCATION_CONNECTION_POOL_SIZE:-4}"
-BENCH_CLIENT_PROCESSES="${CHRONOS_SCALE_BENCH_CLIENT_PROCESSES:-1}"
+BENCH_PARTITION_CLIENTS_BY_OWNER="${CHRONOS_SCALE_PARTITION_CLIENTS_BY_OWNER:-true}"
+DEFAULT_BENCH_CLIENT_PROCESSES=1
+if [[ "${BENCH_PARTITION_CLIENTS_BY_OWNER}" == "true" || "${BENCH_PARTITION_CLIENTS_BY_OWNER}" == "1" ]]; then
+  DEFAULT_BENCH_CLIENT_PROCESSES="${WORKER_COUNT}"
+fi
+BENCH_CLIENT_PROCESSES="${CHRONOS_SCALE_BENCH_CLIENT_PROCESSES:-${DEFAULT_BENCH_CLIENT_PROCESSES}}"
+RUNTIME_WORKER_THREADS="${CHRONOS_SCALE_RUNTIME_WORKER_THREADS:-1}"
+BENCH_RUNTIME_WORKER_THREADS="${CHRONOS_SCALE_BENCH_RUNTIME_WORKER_THREADS:-1}"
 COLD_PROBE_ENABLED="${CHRONOS_SCALE_COLD_PROBE:-true}"
 COLD_PROBE_CONCURRENCY="${CHRONOS_SCALE_COLD_PROBE_CONCURRENCY:-${DEFAULT_COLD_PROBE_CONCURRENCY}}"
 COLD_REQUEST_TIMEOUT_MS="${CHRONOS_SCALE_COLD_REQUEST_TIMEOUT_MS:-${DEFAULT_COLD_REQUEST_TIMEOUT_MS}}"
@@ -124,6 +87,8 @@ require_positive_integer "CHRONOS_SCALE_CONNECT_TIMEOUT_MS" "${BENCH_CONNECT_TIM
 require_positive_integer "CHRONOS_SCALE_CONNECT_RETRY_INTERVAL_MS" "${BENCH_CONNECT_RETRY_INTERVAL_MS}"
 require_positive_integer "CHRONOS_SCALE_ALLOCATION_CONNECTION_POOL_SIZE" "${BENCH_ALLOCATION_CONNECTION_POOL_SIZE}"
 require_positive_integer "CHRONOS_SCALE_BENCH_CLIENT_PROCESSES" "${BENCH_CLIENT_PROCESSES}"
+require_positive_integer "CHRONOS_SCALE_RUNTIME_WORKER_THREADS" "${RUNTIME_WORKER_THREADS}"
+require_positive_integer "CHRONOS_SCALE_BENCH_RUNTIME_WORKER_THREADS" "${BENCH_RUNTIME_WORKER_THREADS}"
 require_positive_integer "CHRONOS_SCALE_COLD_PROBE_CONCURRENCY" "${COLD_PROBE_CONCURRENCY}"
 require_nonnegative_integer "CHRONOS_SCALE_POST_READY_SLEEP_SECS" "${POST_READY_SLEEP_SECS}"
 if [[ "${BENCH_CLIENT_PROCESSES}" -gt "${BENCH_CONCURRENCY}" ]]; then
@@ -134,11 +99,19 @@ if [[ "${BENCH_CLIENT_PROCESSES}" -gt "${BENCH_TIMELINES}" ]]; then
   echo "CHRONOS_SCALE_BENCH_CLIENT_PROCESSES must be <= CHRONOS_SCALE_TIMELINES" >&2
   exit 1
 fi
+if [[ "${BENCH_PARTITION_CLIENTS_BY_OWNER}" == "true" || "${BENCH_PARTITION_CLIENTS_BY_OWNER}" == "1" ]]; then
+  if [[ "${BENCH_CLIENT_PROCESSES}" -lt "${WORKER_COUNT}" ]]; then
+    echo "CHRONOS_SCALE_BENCH_CLIENT_PROCESSES must be >= CHRONOS_SCALE_WORKERS when CHRONOS_SCALE_PARTITION_CLIENTS_BY_OWNER is true" >&2
+    exit 1
+  fi
+fi
 
 SERVICE_ENDPOINTS=()
 METRICS_ENDPOINTS=()
 ADVERTISE_ENDPOINTS=()
 WORKER_IDS=()
+OWNERSHIP_REMAINDERS=()
+PRIMARY_REMAINDERS=()
 
 if [[ -n "${CHRONOS_SCALE_SERVICE_ENDPOINTS:-}" ]]; then
   csv_to_array SERVICE_ENDPOINTS "${CHRONOS_SCALE_SERVICE_ENDPOINTS}"
@@ -217,6 +190,16 @@ METRICS_ENDPOINTS_CSV="$(join_by_comma "${METRICS_ENDPOINTS[@]}")"
 ADVERTISE_ENDPOINTS_CSV="$(join_by_comma "${ADVERTISE_ENDPOINTS[@]}")"
 WORKER_IDS_CSV="$(join_by_comma "${WORKER_IDS[@]}")"
 
+for ((idx = 0; idx < WORKER_COUNT; idx++)); do
+  remainders="$(ownership_remainders_for_worker "${WORKER_COUNT}" "${idx}" "${OWNERSHIP_SHARD_COUNT}" "${OWNERSHIP_ASSIGNMENT_SEED}")"
+  if [[ -z "${remainders}" ]]; then
+    echo "worker ${idx} owns no generator shards; increase CHRONOS_SCALE_OWNERSHIP_SHARDS or reduce CHRONOS_SCALE_WORKERS" >&2
+    exit 1
+  fi
+  OWNERSHIP_REMAINDERS+=("${remainders}")
+  PRIMARY_REMAINDERS+=("${remainders%%,*}")
+done
+
 if [[ -n "${ARTIFACT_ROOT}" ]]; then
   ARTIFACT_DIR="${ARTIFACT_ROOT%/}/scale"
   mkdir -p "${ARTIFACT_DIR}"
@@ -294,6 +277,9 @@ bench_connect_timeout_ms=${BENCH_CONNECT_TIMEOUT_MS}
 bench_connect_retry_interval_ms=${BENCH_CONNECT_RETRY_INTERVAL_MS}
 bench_allocation_connection_pool_size=${BENCH_ALLOCATION_CONNECTION_POOL_SIZE}
 bench_client_processes=${BENCH_CLIENT_PROCESSES}
+bench_partition_clients_by_owner=${BENCH_PARTITION_CLIENTS_BY_OWNER}
+runtime_worker_threads=${RUNTIME_WORKER_THREADS}
+bench_runtime_worker_threads=${BENCH_RUNTIME_WORKER_THREADS}
 cold_probe_enabled=${COLD_PROBE_ENABLED}
 cold_probe_concurrency=${COLD_PROBE_CONCURRENCY}
 cold_request_timeout_ms=${COLD_REQUEST_TIMEOUT_MS}
@@ -310,8 +296,9 @@ etcd_prefix=${ETCD_PREFIX}
 timeline_scenario=${TIMELINE_SCENARIO}
 worker_ids=${WORKER_IDS_CSV}
 ownership_plan_id=${TIMELINE_SCENARIO}
-generator_ownership_modulo=${WORKER_COUNT}
-generator_ownership_remainders=0..$((WORKER_COUNT - 1))
+generator_ownership_modulo=${OWNERSHIP_SHARD_COUNT}
+generator_ownership_assignment_seed=${OWNERSHIP_ASSIGNMENT_SEED}
+generator_ownership_remainders=$(join_by_comma "${OWNERSHIP_REMAINDERS[@]}")
 safety_gap_ms=${SAFETY_GAP_MS}
 artifact_dir=${ARTIFACT_DIR}
 artifact_index=${INDEX_LOG}
@@ -332,6 +319,7 @@ EOF
       route_owner_min_timelines \
       route_owner_max_timelines \
       route_owner_counts \
+      owner_endpoint_filter \
       allocation_failed_total \
       allocation_measured_failed_total \
       allocation_failure_reasons \
@@ -341,6 +329,7 @@ EOF
       allocation_client_channels \
       concurrency_per_allocation_channel \
       bench_client_processes \
+      worker_index_offsets \
       owner_affinity \
       req_per_sec \
       latency_p95_us \
@@ -354,90 +343,6 @@ EOF
       [[ -n "${value}" ]] && printf '%s=%s\n' "${key}" "${value}" >>"${SUMMARY_LOG}"
     done
   fi
-}
-
-prom_metric_value() {
-  local file=$1
-  local metric=$2
-  [[ -f "${file}" ]] || return 0
-  awk -v metric="${metric}" '$1 == metric { print $2; exit }' "${file}"
-}
-
-prom_metric_lines() {
-  local file=$1
-  local metric=$2
-  [[ -f "${file}" ]] || return 0
-  awk -v metric="${metric}" 'index($1, metric) == 1 { print }' "${file}"
-}
-
-prom_metric_average_us() {
-  local file=$1
-  local count_metric=$2
-  local sum_metric=$3
-  local count
-  local sum
-  count="$(prom_metric_value "${file}" "${count_metric}")"
-  sum="$(prom_metric_value "${file}" "${sum_metric}")"
-  [[ -n "${count}" && -n "${sum}" ]] || return 0
-  python3 - "${count}" "${sum}" <<'PY'
-import sys
-
-count = float(sys.argv[1])
-total_seconds = float(sys.argv[2])
-if count <= 0:
-    raise SystemExit(0)
-print(f"{(total_seconds / count) * 1_000_000:.2f}")
-PY
-}
-
-prom_histogram_quantile_upper_bound() {
-  local file=$1
-  local prefix=$2
-  local quantile=$3
-  [[ -f "${file}" ]] || return 0
-  awk -v prefix="${prefix}" -v quantile="${quantile}" '
-    index($1, prefix) == 1 {
-      label = $1
-      value = $2 + 0
-      le = label
-      sub(/^.*le="/, "", le)
-      sub(/".*$/, "", le)
-      if (le == "+Inf") {
-        total = value
-      } else {
-        count += 1
-        buckets[count] = le
-        values[count] = value
-      }
-    }
-    END {
-      if (total <= 0) {
-        exit 0
-      }
-      target = total * quantile
-      for (idx = 1; idx <= count; idx += 1) {
-        if (values[idx] >= target) {
-          print buckets[idx]
-          exit 0
-        }
-      }
-      print "+Inf"
-    }
-  ' "${file}"
-}
-
-prom_histogram_quantile_upper_bound_us() {
-  local file=$1
-  local prefix=$2
-  local quantile=$3
-  local upper_bound
-  upper_bound="$(prom_histogram_quantile_upper_bound "${file}" "${prefix}" "${quantile}")"
-  [[ -n "${upper_bound}" && "${upper_bound}" != "+Inf" ]] || return 0
-  python3 - "${upper_bound}" <<'PY'
-import sys
-
-print(f"{float(sys.argv[1]) * 1_000_000:.0f}")
-PY
 }
 
 write_profile_summary() {
@@ -464,6 +369,10 @@ write_profile_summary() {
         allocation_client_channels \
         concurrency_per_allocation_channel \
         bench_client_processes \
+        owner_endpoint_filter \
+        worker_index_offsets \
+        runtime_worker_threads \
+        bench_runtime_worker_threads \
         owner_affinity \
         req_per_sec \
         latency_p50_us \
@@ -581,6 +490,9 @@ capture_host_snapshot() {
     echo "worker_count=${WORKER_COUNT}"
     echo "bench_concurrency=${BENCH_CONCURRENCY}"
     echo "bench_client_processes=${BENCH_CLIENT_PROCESSES}"
+    echo "bench_partition_clients_by_owner=${BENCH_PARTITION_CLIENTS_BY_OWNER}"
+    echo "runtime_worker_threads=${RUNTIME_WORKER_THREADS}"
+    echo "bench_runtime_worker_threads=${BENCH_RUNTIME_WORKER_THREADS}"
     if command -v uname >/dev/null 2>&1; then
       echo "uname=$(uname -a)"
     fi
@@ -725,6 +637,14 @@ def sum_int(key):
 def max_int(key):
     return max((int(float(row.get(key, "0") or 0)) for row in rows), default=0)
 
+def list_values(key):
+    values = []
+    for row in rows:
+        value = row.get(key)
+        if value not in (None, ""):
+            values.append(value)
+    return ",".join(values)
+
 def parse_counts(value):
     counts = defaultdict(int)
     if not value or value == "none":
@@ -772,6 +692,7 @@ lines = [
     ("endpoint", first("endpoint")),
     ("control_endpoints", first("control_endpoints")),
     ("route_to_owners", first("route_to_owners")),
+    ("owner_endpoint_filter", list_values("owner_endpoint_filter") or "none"),
     ("route_owner_endpoints", str(len(route_counts))),
     ("route_owner_min_timelines", str(min(route_values) if route_values else 0)),
     ("route_owner_max_timelines", str(max(route_values) if route_values else 0)),
@@ -789,6 +710,7 @@ lines = [
     ("allocation_client_channels", str(allocation_client_channels)),
     ("concurrency_per_allocation_channel", f"{concurrency_per_channel:.2f}"),
     ("bench_client_processes", str(len(rows))),
+    ("worker_index_offsets", list_values("worker_index_offset")),
     ("cold_probe_enabled", first("cold_probe_enabled")),
     ("cold_probe_concurrency", str(sum_int("cold_probe_concurrency"))),
     ("cold_request_timeout_ms", first("cold_request_timeout_ms")),
@@ -836,6 +758,7 @@ echo "[scale] validating ${WORKER_COUNT}-worker ownership plan"
 for ((idx = 0; idx < WORKER_COUNT; idx++)); do
   env \
     CHRONOS_SECURITY_MODE=dev-insecure \
+    CHRONOS_RUNTIME_WORKER_THREADS="${RUNTIME_WORKER_THREADS}" \
     CHRONOS_METADATA=etcd \
     CHRONOS_BIND_ADDR="${SERVICE_ENDPOINTS[idx]}" \
     CHRONOS_ADVERTISE_ENDPOINT="${ADVERTISE_ENDPOINTS[idx]}" \
@@ -844,8 +767,9 @@ for ((idx = 0; idx < WORKER_COUNT; idx++)); do
     CHRONOS_ETCD_PREFIX="${ETCD_PREFIX}" \
     CHRONOS_WORKER_ID="${WORKER_IDS[idx]}" \
     CHRONOS_OWNERSHIP_PLAN_ID="${TIMELINE_SCENARIO}" \
-    CHRONOS_GENERATOR_OWNERSHIP_MODULO="${WORKER_COUNT}" \
-    CHRONOS_GENERATOR_OWNERSHIP_REMAINDER="${idx}" \
+    CHRONOS_GENERATOR_OWNERSHIP_MODULO="${OWNERSHIP_SHARD_COUNT}" \
+    CHRONOS_GENERATOR_OWNERSHIP_REMAINDER="${PRIMARY_REMAINDERS[idx]}" \
+    CHRONOS_GENERATOR_OWNERSHIP_REMAINDERS="${OWNERSHIP_REMAINDERS[idx]}" \
     CHRONOS_SAFETY_GAP_MS="${SAFETY_GAP_MS}" \
     "${RELEASE_BIN_DIR}/chronos" --check-config >/dev/null
 done
@@ -854,6 +778,7 @@ for ((idx = 0; idx < WORKER_COUNT; idx++)); do
   echo "[scale] starting chronos worker ${idx}"
   env \
     CHRONOS_SECURITY_MODE=dev-insecure \
+    CHRONOS_RUNTIME_WORKER_THREADS="${RUNTIME_WORKER_THREADS}" \
     CHRONOS_METADATA=etcd \
     CHRONOS_BIND_ADDR="${SERVICE_ENDPOINTS[idx]}" \
     CHRONOS_ADVERTISE_ENDPOINT="${ADVERTISE_ENDPOINTS[idx]}" \
@@ -862,8 +787,9 @@ for ((idx = 0; idx < WORKER_COUNT; idx++)); do
     CHRONOS_ETCD_PREFIX="${ETCD_PREFIX}" \
     CHRONOS_WORKER_ID="${WORKER_IDS[idx]}" \
     CHRONOS_OWNERSHIP_PLAN_ID="${TIMELINE_SCENARIO}" \
-    CHRONOS_GENERATOR_OWNERSHIP_MODULO="${WORKER_COUNT}" \
-    CHRONOS_GENERATOR_OWNERSHIP_REMAINDER="${idx}" \
+    CHRONOS_GENERATOR_OWNERSHIP_MODULO="${OWNERSHIP_SHARD_COUNT}" \
+    CHRONOS_GENERATOR_OWNERSHIP_REMAINDER="${PRIMARY_REMAINDERS[idx]}" \
+    CHRONOS_GENERATOR_OWNERSHIP_REMAINDERS="${OWNERSHIP_REMAINDERS[idx]}" \
     CHRONOS_SAFETY_GAP_MS="${SAFETY_GAP_MS}" \
     "${RELEASE_BIN_DIR}/chronos" >"${CHRONOS_LOGS[idx]}" 2>&1 &
   CHRONOS_PIDS+=("$!")
@@ -881,9 +807,15 @@ capture_host_snapshot "before_bench" "${HOST_LOAD_BEFORE_LOG}"
 echo "[scale] running ${WORKER_COUNT}-worker route-aware allocation benchmark with ${BENCH_CLIENT_PROCESSES} client process(es)"
 : >"${BENCH_LOG}"
 BENCH_CLIENT_PIDS=()
+bench_worker_index_offset=0
 for ((idx = 0; idx < BENCH_CLIENT_PROCESSES; idx++)); do
   client_concurrency="$(split_count_for_client "${BENCH_CONCURRENCY}" "${idx}")"
   client_timelines="$(split_count_for_client "${BENCH_TIMELINES}" "${idx}")"
+  owner_endpoint_filter=""
+  if [[ "${BENCH_PARTITION_CLIENTS_BY_OWNER}" == "true" || "${BENCH_PARTITION_CLIENTS_BY_OWNER}" == "1" ]]; then
+    owner_endpoint_filter="${HTTP_SERVICE_ENDPOINTS[$((idx % WORKER_COUNT))]}"
+    client_timelines=$((client_timelines * WORKER_COUNT))
+  fi
   client_cold_probe_concurrency="$(split_count_for_client "${COLD_PROBE_CONCURRENCY}" "${idx}")"
   if [[ "${client_cold_probe_concurrency}" -eq 0 ]]; then
     client_cold_probe_concurrency=1
@@ -892,6 +824,7 @@ for ((idx = 0; idx < BENCH_CLIENT_PROCESSES; idx++)); do
     CHRONOS_BENCH_ENDPOINT="${HTTP_SERVICE_ENDPOINTS[0]}" \
     CHRONOS_BENCH_CONTROL_ENDPOINTS="${CONTROL_ENDPOINTS}" \
     CHRONOS_BENCH_ROUTE_TO_OWNERS=true \
+    CHRONOS_BENCH_OWNER_ENDPOINT_FILTER="${owner_endpoint_filter}" \
     CHRONOS_BENCH_SCENARIO="${TIMELINE_SCENARIO}-client-${idx}" \
     CHRONOS_BENCH_CONCURRENCY="${client_concurrency}" \
     CHRONOS_BENCH_TIMELINES="${client_timelines}" \
@@ -903,12 +836,15 @@ for ((idx = 0; idx < BENCH_CLIENT_PROCESSES; idx++)); do
     CHRONOS_BENCH_CONNECT_TIMEOUT_MS="${BENCH_CONNECT_TIMEOUT_MS}" \
     CHRONOS_BENCH_CONNECT_RETRY_INTERVAL_MS="${BENCH_CONNECT_RETRY_INTERVAL_MS}" \
     CHRONOS_BENCH_ALLOCATION_CONNECTION_POOL_SIZE="${BENCH_ALLOCATION_CONNECTION_POOL_SIZE}" \
+    CHRONOS_BENCH_WORKER_INDEX_OFFSET="${bench_worker_index_offset}" \
+    CHRONOS_BENCH_RUNTIME_WORKER_THREADS="${BENCH_RUNTIME_WORKER_THREADS}" \
     CHRONOS_BENCH_COLD_PROBE="${COLD_PROBE_ENABLED}" \
     CHRONOS_BENCH_COLD_PROBE_CONCURRENCY="${client_cold_probe_concurrency}" \
     CHRONOS_BENCH_COLD_REQUEST_TIMEOUT_MS="${COLD_REQUEST_TIMEOUT_MS}" \
     CHRONOS_BENCH_COLD_CLIENT_TIMEOUT_MS="${COLD_CLIENT_TIMEOUT_MS}" \
     "${RELEASE_BIN_DIR}/chronos-bench" >"${BENCH_CLIENT_LOGS[idx]}" 2>&1 &
   BENCH_CLIENT_PIDS+=("$!")
+  bench_worker_index_offset=$((bench_worker_index_offset + client_concurrency))
 done
 
 BENCH_CLIENT_FAILED=0

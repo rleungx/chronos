@@ -242,6 +242,7 @@ TimelineRoute Client::EnsureRouteLocked() {
     return route_;
   }
   grpc::ClientContext ctx;
+  ApplyRequestDeadline(&ctx);
   EnsureTimelineRequest request;
   request.set_timeline_key(timeline_key_);
   request.set_desired_resource_tier(config_.desired_resource_tier);
@@ -269,6 +270,7 @@ TimelineRoute Client::RefreshRouteIfUnchangedLocked(const TimelineRoute& observe
 
 TimelineRoute Client::RefreshRouteLocked() {
   grpc::ClientContext ctx;
+  ApplyRequestDeadline(&ctx);
   GetTimelineRouteRequest request;
   request.set_timeline_key(timeline_key_);
   chronos::tso::v1::GetTimelineRouteResponse response;
@@ -288,11 +290,20 @@ TimelineRoute Client::RefreshRouteLocked() {
 }
 
 TimelineRoute Client::InstallRouteLocked(const TimelineRoute& route) {
+  if (has_route_ &&
+      route.owner_worker_endpoint() == route_.owner_worker_endpoint() &&
+      tso_stub_ != nullptr) {
+    route_ = route;
+    return route_;
+  }
+
+  auto previous_channel = tso_channel_;
   tso_channel_ = CreateChannel(route.owner_worker_endpoint());
   tso_stub_ = std::shared_ptr<TimestampService::Stub>(
       TimestampService::NewStub(tso_channel_).release());
   route_ = route;
   has_route_ = true;
+  RetainStaleOwnerChannelLocked(std::move(previous_channel));
   return route;
 }
 
@@ -310,6 +321,7 @@ grpc::Status Client::AllocateOnce(
     uint32_t count,
     const std::string& client_request_id) {
   grpc::ClientContext ctx;
+  ApplyRequestDeadline(&ctx);
   AllocateTimestampsRequest request;
   request.set_timeline_key(route.timeline_key());
   request.set_count(count);
@@ -318,6 +330,25 @@ grpc::Status Client::AllocateOnce(
   request.set_client_request_id(client_request_id);
   request.set_request_timeout_ms(config_.request_timeout_ms);
   return tso_stub.AllocateTimestamps(&ctx, request, response);
+}
+
+void Client::ApplyRequestDeadline(grpc::ClientContext* context) const {
+  if (config_.request_timeout_ms == 0) {
+    return;
+  }
+  context->set_deadline(
+      std::chrono::system_clock::now() +
+      std::chrono::milliseconds(config_.request_timeout_ms));
+}
+
+void Client::RetainStaleOwnerChannelLocked(std::shared_ptr<grpc::Channel> previous) {
+  if (previous == nullptr) {
+    return;
+  }
+  stale_tso_channels_.push_back(std::move(previous));
+  while (stale_tso_channels_.size() > kMaxRetainedStaleOwnerChannels) {
+    stale_tso_channels_.pop_front();
+  }
 }
 
 std::string Client::NextClientRequestId(const std::string& timeline_key) {

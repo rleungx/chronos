@@ -48,6 +48,15 @@ groups:
           summary: Chronos metadata operations are erroring
           description: Metadata store operations recorded errors in the last 5 minutes.
 
+      - alert: ChronosMetadataRetries
+        expr: sum(increase(tso_metadata_retries_total{job="chronos"}[5m])) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: Chronos metadata operations are retrying
+          description: Metadata store operations needed retries in the last 5 minutes.
+
   - name: chronos-control-plane
     rules:
       - alert: ChronosWatchResyncs
@@ -139,3 +148,12 @@ groups:
         annotations:
           summary: Chronos startup bootstrap failures detected
           description: Startup bootstrap failures were recorded in the last 15 minutes.
+
+      - alert: ChronosMetricsRenderFailures
+        expr: increase(tso_metrics_render_errors_total{job="chronos"}[10m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: Chronos metrics rendering failed
+          description: Prometheus metrics render failures were recorded in the last 10 minutes.

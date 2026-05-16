@@ -1,5 +1,4 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::env;
 use std::error::Error;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -18,6 +17,20 @@ use chronos::proto::v1::{
     ListTimelineStatusesRequest, ResourceTier, TimelineRoute, TimelineState,
     TimelineTransferReason, TransferTimelineRequest,
 };
+
+#[path = "support/config_parse.rs"]
+mod support_config_parse;
+#[path = "support/endpoint.rs"]
+mod support_endpoint;
+#[path = "support/env.rs"]
+mod support_env;
+#[path = "support/stats.rs"]
+mod support_stats;
+
+use support_config_parse::{parse_boolish, parse_csv_string_list, parse_csv_u32_list};
+use support_endpoint::{normalize_endpoint, normalize_endpoint_or_fallback};
+use support_env::{env_or, env_or_string};
+use support_stats::percentile;
 
 type AppResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -125,55 +138,6 @@ struct RebalanceBenchStats {
     transfer_latencies_us: Vec<u64>,
 }
 
-fn env_or<T>(key: &str, default: T) -> T
-where
-    T: std::str::FromStr,
-{
-    env::var(key)
-        .ok()
-        .and_then(|value| value.parse::<T>().ok())
-        .unwrap_or(default)
-}
-
-fn env_or_string(key: &str, default: &str) -> String {
-    env::var(key).unwrap_or_else(|_| default.to_owned())
-}
-
-fn normalize_endpoint(endpoint: &str) -> String {
-    let endpoint = endpoint.trim();
-    if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
-        endpoint.to_owned()
-    } else {
-        format!("http://{endpoint}")
-    }
-}
-
-fn normalize_endpoint_or_fallback(endpoint: &str, fallback_endpoint: &str) -> String {
-    let endpoint = endpoint.trim();
-    if endpoint.is_empty() {
-        fallback_endpoint.to_owned()
-    } else {
-        normalize_endpoint(endpoint)
-    }
-}
-
-fn parse_csv_string_list(value: &str) -> Vec<String> {
-    value
-        .split(',')
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-        .collect()
-}
-
-fn parse_boolish(value: &str) -> AppResult<bool> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" | "on" => Ok(true),
-        "0" | "false" | "no" | "off" => Ok(false),
-        other => Err(format!("invalid boolean value: {other}").into()),
-    }
-}
-
 fn parse_scenario(value: &str) -> AppResult<Scenario> {
     match value.trim().to_ascii_lowercase().as_str() {
         "status_scan" => Ok(Scenario::StatusScan),
@@ -214,22 +178,6 @@ fn parse_filter_states_csv(value: &str) -> AppResult<Vec<i32>> {
     }
     parsed.sort_unstable();
     parsed.dedup();
-    Ok(parsed)
-}
-
-fn parse_csv_u32_list(value: &str) -> AppResult<Vec<u32>> {
-    let mut parsed = Vec::new();
-    for token in value.split(',') {
-        let trimmed = token.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        parsed.push(
-            trimmed
-                .parse::<u32>()
-                .map_err(|error| format!("invalid u32 value {trimmed}: {error}"))?,
-        );
-    }
     Ok(parsed)
 }
 
@@ -472,14 +420,6 @@ async fn list_timeline_statuses_page(
         }))
         .await?
         .into_inner())
-}
-
-fn percentile(sorted: &[u64], pct: f64) -> u64 {
-    if sorted.is_empty() {
-        return 0;
-    }
-    let idx = ((sorted.len() - 1) as f64 * pct).round() as usize;
-    sorted[idx]
 }
 
 async fn run_status_scan_bench(config: &BenchConfig) -> AppResult<StatusWorkerStats> {
@@ -1276,18 +1216,6 @@ mod tests {
                 TimelineState::Recovering as i32
             ]
         );
-    }
-
-    #[test]
-    fn percentile_handles_empty_and_simple_slices() {
-        assert_eq!(percentile(&[], 0.95), 0);
-        assert_eq!(percentile(&[10, 20, 30], 0.50), 20);
-        assert_eq!(percentile(&[10, 20, 30], 0.99), 30);
-    }
-
-    #[test]
-    fn parse_csv_u32_list_parses_and_skips_empty_entries() {
-        assert_eq!(parse_csv_u32_list("1, 2,,3").unwrap(), vec![1, 2, 3]);
     }
 
     #[test]

@@ -18,19 +18,21 @@ type fakeChronosServer struct {
 	tsov1.UnimplementedTimelineRouteServiceServer
 	tsov1.UnimplementedTimestampServiceServer
 
-	mu              sync.Mutex
-	route           *tsov1.TimelineRoute
-	ensureCalls     int
-	getRouteCalls   int
-	allocateCalls   int
-	staleOnAllocate bool
-	nextStartTso    uint64
-	lastRequestID   string
-	returnedRequest []string
-	lastEnsureTier  tsov1.ResourceTier
-	lastTimeoutMs   uint32
-	omitEnsureRoute bool
-	omitGetRoute    bool
+	mu               sync.Mutex
+	route            *tsov1.TimelineRoute
+	ensureCalls      int
+	getRouteCalls    int
+	allocateCalls    int
+	staleOnAllocate  bool
+	nextStartTso     uint64
+	lastRequestID    string
+	returnedRequest  []string
+	lastEnsureTier   tsov1.ResourceTier
+	lastTimeoutMs    uint32
+	ensureDeadline   bool
+	allocateDeadline bool
+	omitEnsureRoute  bool
+	omitGetRoute     bool
 }
 
 type fakeRouteOnlyServer struct {
@@ -72,11 +74,12 @@ func newFakeChronosServer(staleOnAllocate bool) *fakeChronosServer {
 	}
 }
 
-func (s *fakeChronosServer) EnsureTimeline(_ context.Context, req *tsov1.EnsureTimelineRequest) (*tsov1.EnsureTimelineResponse, error) {
+func (s *fakeChronosServer) EnsureTimeline(ctx context.Context, req *tsov1.EnsureTimelineRequest) (*tsov1.EnsureTimelineResponse, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.ensureCalls++
 	s.lastEnsureTier = req.DesiredResourceTier
+	_, s.ensureDeadline = ctx.Deadline()
 	if s.omitEnsureRoute {
 		return &tsov1.EnsureTimelineResponse{}, nil
 	}
@@ -95,13 +98,14 @@ func (s *fakeChronosServer) GetTimelineRoute(_ context.Context, req *tsov1.GetTi
 	return &tsov1.GetTimelineRouteResponse{Route: cloneRoute(s.route)}, nil
 }
 
-func (s *fakeChronosServer) AllocateTimestamps(_ context.Context, req *tsov1.AllocateTimestampsRequest) (*tsov1.AllocateTimestampsResponse, error) {
+func (s *fakeChronosServer) AllocateTimestamps(ctx context.Context, req *tsov1.AllocateTimestampsRequest) (*tsov1.AllocateTimestampsResponse, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.allocateCalls++
 	s.lastRequestID = req.ClientRequestId
 	s.returnedRequest = append(s.returnedRequest, req.ClientRequestId)
 	s.lastTimeoutMs = req.RequestTimeoutMs
+	_, s.allocateDeadline = ctx.Deadline()
 
 	if s.staleOnAllocate {
 		s.route.RouteVersion++
@@ -160,6 +164,12 @@ func TestClientOptionsFlowIntoRequests(t *testing.T) {
 	}
 	if server.lastRequestID == "" {
 		t.Fatal("expected idempotency option to send a client request id")
+	}
+	if !server.ensureDeadline {
+		t.Fatal("expected request timeout option to set ensure RPC deadline")
+	}
+	if !server.allocateDeadline {
+		t.Fatal("expected request timeout option to set allocate RPC deadline")
 	}
 }
 

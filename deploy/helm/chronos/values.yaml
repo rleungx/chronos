@@ -3,6 +3,7 @@ replicaCount: 3
 image:
   repository: ghcr.io/rleungx/chronos
   tag: "0.1.0"
+  digest: ""
   pullPolicy: IfNotPresent
 
 nameOverride: ""
@@ -13,6 +14,8 @@ namespace:
 
 ownership:
   planId: ""
+  shardCount: 256
+  assignmentSeed: 20260516
 
 etcd:
   endpoints: https://etcd-client.etcd.svc.cluster.local:2379
@@ -30,9 +33,9 @@ runtime:
   logFormat: json
   logFilter: info
   safetyGapMs: 1
-  grpcRequestTimeoutMs: 100
+  grpcRequestTimeoutMs: 250
   grpcMaxRequestBytes: 1048576
-  grpcMaxConcurrentRequests: 256
+  grpcMaxConcurrentRequests: 1024
 
 autoFailover:
   enabled: true
@@ -61,10 +64,9 @@ networkPolicy:
 
 resources:
   requests:
-    cpu: 250m
-    memory: 256Mi
+    cpu: 500m
+    memory: 512Mi
   limits:
-    cpu: "1"
     memory: 1Gi
 
 podDisruptionBudget:
@@ -75,6 +77,8 @@ podAntiAffinity:
 
 topologySpreadConstraints:
   enabled: true
+  topologyKey: topology.kubernetes.io/zone
+  whenUnsatisfiable: DoNotSchedule
 
 nodeSelector: {}
 tolerations: []

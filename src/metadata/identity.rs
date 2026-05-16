@@ -1,5 +1,7 @@
 use async_trait::async_trait;
-use etcd_client::{Client, Compare, CompareOp, PutOptions, Txn, TxnOp};
+use etcd_client::Client;
+#[cfg(test)]
+use etcd_client::{Compare, CompareOp, PutOptions, Txn, TxnOp};
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -122,13 +124,14 @@ impl Drop for InstanceIdentityLease {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(super) struct InstanceIdentityLeaseRecord {
     pub(super) instance_id: String,
     pub(super) worker_id: String,
     pub(super) advertise_endpoint: String,
 }
 
+#[cfg(test)]
 #[async_trait]
 pub(super) trait IdentityLeaseTxnRunner {
     async fn put_identity_if_absent_with_lease(
@@ -146,6 +149,7 @@ trait IdentityLeaseRevoker: Send + Sync {
     async fn revoke(&mut self, lease_id: i64) -> Result<(), TsoError>;
 }
 
+#[cfg(test)]
 #[async_trait]
 impl IdentityLeaseTxnRunner for Client {
     async fn put_identity_if_absent_with_lease(
@@ -184,6 +188,7 @@ impl IdentityLeaseRevoker for Client {
     }
 }
 
+#[cfg(test)]
 pub(super) async fn claim_instance_identity<R: IdentityLeaseTxnRunner + ?Sized>(
     runner: &mut R,
     key: &[u8],

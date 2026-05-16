@@ -12,6 +12,8 @@ pub mod metadata;
 pub mod metrics;
 mod plane;
 mod planning;
+#[doc(hidden)]
+pub mod process_runtime;
 pub mod proto;
 mod recovery;
 pub mod rpc;

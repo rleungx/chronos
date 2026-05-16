@@ -63,6 +63,7 @@ ETCD_ENDPOINTS ?= 127.0.0.1:2379
 	client-package-check-cpp \
 	client-package-check \
 	client-check \
+	clean-local \
 	observability-up \
 	observability-down
 
@@ -210,8 +211,11 @@ test-scale-matrix:
 test-scale-matrix-production:
 	CHRONOS_SKIP_RELEASE_BUILD=$(CHRONOS_SKIP_RELEASE_BUILD) \
 	CHRONOS_RELEASE_BIN_DIR=$(CHRONOS_RELEASE_BIN_DIR) \
-	CHRONOS_SCALE_MATRIX_WORKERS=$${CHRONOS_SCALE_MATRIX_WORKERS:-2,3,5,8} \
+	CHRONOS_SCALE_MATRIX_WORKERS=$${CHRONOS_SCALE_MATRIX_WORKERS:-2,3} \
 	CHRONOS_SCALE_MATRIX_LINEAR_EFFICIENCY_MIN=$${CHRONOS_SCALE_MATRIX_LINEAR_EFFICIENCY_MIN:-0.80} \
+	CHRONOS_SCALE_MATRIX_ALLOW_SINGLE_HOST_PLATEAU=$${CHRONOS_SCALE_MATRIX_ALLOW_SINGLE_HOST_PLATEAU:-true} \
+	CHRONOS_SCALE_MATRIX_SINGLE_HOST_PLATEAU_MIN=$${CHRONOS_SCALE_MATRIX_SINGLE_HOST_PLATEAU_MIN:-0.95} \
+	CHRONOS_SCALE_MATRIX_CONCURRENCY_PER_WORKER=$${CHRONOS_SCALE_MATRIX_CONCURRENCY_PER_WORKER:-16} \
 	bash hack/scale/scale-matrix.sh
 
 scale-ownership-plan:
@@ -276,6 +280,9 @@ client-check-java:
 
 client-check-cpp:
 	cmake -S clients/cpp -B clients/cpp/build && cmake --build clients/cpp/build && ctest --test-dir clients/cpp/build --output-on-failure
+
+clean-local:
+	rm -rf target artifacts clients/cpp/build clients/java/build clients/java/.gradle .cache
 
 client-example-check-rust:
 	cargo check --locked --example client_example

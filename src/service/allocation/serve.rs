@@ -391,21 +391,9 @@ impl TsoService {
         let generator = self.lookup_generator(generator_id)?;
         let mut contention_retries = 0u32;
         let serve_started = Instant::now();
-        let charged_quota = self
-            .charge_timeline_quota_for_allocation(
-                &timeline_state_handle,
-                request.count,
-                options.cancellation.as_ref(),
-                options.path,
-            )
-            .await?;
 
         loop {
-            if let Err(error) = Self::check_request_cancellation(options.cancellation.as_ref()) {
-                let mut timeline_state = timeline_state_handle.lock().await;
-                self.refund_timeline_quota(&mut timeline_state, charged_quota);
-                return Err(error);
-            }
+            Self::check_request_cancellation(options.cancellation.as_ref())?;
             let (resource_tier, timeline_state) = {
                 let timeline_state = timeline_state_handle.lock().await;
                 (timeline_state.route.resource_tier, timeline_state)
@@ -423,11 +411,7 @@ impl TsoService {
                 .await
             {
                 Ok(permit) => permit,
-                Err(error) => {
-                    let mut timeline_state = timeline_state_handle.lock().await;
-                    self.refund_timeline_quota(&mut timeline_state, charged_quota);
-                    return Err(error);
-                }
+                Err(error) => return Err(error),
             };
             Self::record_allocation_stage_latency(
                 options.path,
@@ -436,7 +420,43 @@ impl TsoService {
             );
 
             let mut timeline_state = timeline_state_handle.lock().await;
+            if let Err(error) = Self::check_request_cancellation(options.cancellation.as_ref()) {
+                drop(timeline_state);
+                if let Some(admission_permit) = admission_permit {
+                    admission_permit.release();
+                }
+                return Err(error);
+            }
             let now_ms = self.clock.now_ms();
+            let charged_quota =
+                match self.charge_timeline_quota(&mut timeline_state, request.count, now_ms) {
+                    Ok(charged_quota) => charged_quota,
+                    Err(error) => {
+                        drop(timeline_state);
+                        if let Some(admission_permit) = admission_permit {
+                            admission_permit.release();
+                        }
+                        if matches!(error, TsoError::FutureBorrowExceeded { .. }) {
+                            if let Err(error) = Self::wait_for_future_borrow_error(
+                                &error,
+                                options.cancellation.as_ref(),
+                                options.path,
+                            )
+                            .await
+                            {
+                                Self::record_allocation_stage_latency(
+                                    options.path,
+                                    "serve",
+                                    serve_started,
+                                );
+                                return Err(error);
+                            }
+                            continue;
+                        }
+                        return Err(error);
+                    }
+                };
+
             let outcome = match generator.allocate_after(
                 request.count,
                 timeline_state.last_issued_tso,
@@ -464,14 +484,17 @@ impl TsoService {
                     })
                 }
                 Ok(AllocateAfterResult::Contended) => {
+                    self.refund_timeline_quota(&mut timeline_state, charged_quota);
                     drop(timeline_state);
                     ServeOutcome::Contended
                 }
                 Err(TsoError::IssuedUpperBoundExceeded { .. }) => {
+                    self.refund_timeline_quota(&mut timeline_state, charged_quota);
                     drop(timeline_state);
                     ServeOutcome::RetryAfterLeaseRefresh
                 }
                 Err(error) => {
+                    self.refund_timeline_quota(&mut timeline_state, charged_quota);
                     drop(timeline_state);
                     ServeOutcome::Error(error)
                 }
@@ -493,8 +516,6 @@ impl TsoService {
                             tokio::select! {
                                 _ = sleep(Duration::from_millis(1)) => {}
                                 _ = cancellation.cancelled() => {
-                                    let mut timeline_state = timeline_state_handle.lock().await;
-                                    self.refund_timeline_quota(&mut timeline_state, charged_quota);
                                     return Err(TsoError::RequestCancelled);
                                 }
                             }
@@ -503,17 +524,12 @@ impl TsoService {
                         }
                         Self::record_allocation_outcome(options.path, "contention_exhausted");
                         Self::record_allocation_stage_latency(options.path, "serve", serve_started);
-                        let mut timeline_state = timeline_state_handle.lock().await;
-                        self.refund_timeline_quota(&mut timeline_state, charged_quota);
                         return Err(TsoError::AllocationContention { generator_id });
                     }
                     yield_now().await;
                 }
                 ServeOutcome::RetryAfterLeaseRefresh => {
                     Self::record_allocation_outcome(options.path, "lease_refresh_retry");
-                    let mut timeline_state = timeline_state_handle.lock().await;
-                    self.refund_timeline_quota(&mut timeline_state, charged_quota);
-                    drop(timeline_state);
                     self.refresh_generator_lease_if_unchanged_with_cancellation(
                         generator_id,
                         issued_upper_bound,
@@ -524,68 +540,53 @@ impl TsoService {
                     return Ok(None);
                 }
                 ServeOutcome::Error(error) => {
-                    if let (
-                        TsoError::FutureBorrowExceeded {
-                            requested_physical_ms,
-                            allowed_physical_ms,
-                        },
-                        Some(cancellation),
-                    ) = (&error, options.cancellation.as_ref())
-                    {
-                        let wait_ms = (*requested_physical_ms)
-                            .saturating_sub(*allowed_physical_ms)
-                            .max(1);
-                        Self::record_allocation_outcome(options.path, "future_borrow_wait");
-                        tokio::select! {
-                            _ = sleep(Duration::from_millis(wait_ms)) => {}
-                            _ = cancellation.cancelled() => {
-                                Self::record_allocation_stage_latency(options.path, "serve", serve_started);
-                                let mut timeline_state = timeline_state_handle.lock().await;
-                                self.refund_timeline_quota(&mut timeline_state, charged_quota);
-                                return Err(TsoError::RequestCancelled);
-                            }
+                    if matches!(error, TsoError::FutureBorrowExceeded { .. }) {
+                        if let Err(error) = Self::wait_for_future_borrow_error(
+                            &error,
+                            options.cancellation.as_ref(),
+                            options.path,
+                        )
+                        .await
+                        {
+                            Self::record_allocation_stage_latency(
+                                options.path,
+                                "serve",
+                                serve_started,
+                            );
+                            return Err(error);
                         }
                         continue;
                     }
                     Self::record_allocation_stage_latency(options.path, "serve", serve_started);
-                    let mut timeline_state = timeline_state_handle.lock().await;
-                    self.refund_timeline_quota(&mut timeline_state, charged_quota);
                     return Err(error);
                 }
             }
         }
     }
 
-    async fn charge_timeline_quota_for_allocation(
-        &self,
-        timeline_state_handle: &Arc<Mutex<TimelineState>>,
-        count: u32,
+    async fn wait_for_future_borrow_error(
+        error: &TsoError,
         cancellation: Option<&RequestCancellation>,
         path: AllocationPath,
-    ) -> Result<Option<f64>, TsoError> {
-        loop {
-            let wait_ms = {
-                let mut timeline_state = timeline_state_handle.lock().await;
-                match self.charge_timeline_quota(&mut timeline_state, count, self.clock.now_ms()) {
-                    Ok(charged) => return Ok(charged),
-                    Err(TsoError::FutureBorrowExceeded {
-                        requested_physical_ms,
-                        allowed_physical_ms,
-                    }) if cancellation.is_some() => requested_physical_ms
-                        .saturating_sub(allowed_physical_ms)
-                        .max(1),
-                    Err(error) => return Err(error),
-                }
-            };
-
-            Self::record_allocation_outcome(path, "quota_wait");
-            let Some(cancellation) = cancellation else {
-                return Err(TsoError::RequestCancelled);
-            };
+    ) -> Result<(), TsoError> {
+        let TsoError::FutureBorrowExceeded {
+            requested_physical_ms,
+            allowed_physical_ms,
+        } = error
+        else {
+            return Err(error.clone());
+        };
+        let wait_ms = requested_physical_ms
+            .saturating_sub(*allowed_physical_ms)
+            .max(1);
+        Self::record_allocation_outcome(path, "future_borrow_wait");
+        if let Some(cancellation) = cancellation {
             tokio::select! {
-                _ = sleep(Duration::from_millis(wait_ms)) => {}
-                _ = cancellation.cancelled() => return Err(TsoError::RequestCancelled),
+                _ = sleep(Duration::from_millis(wait_ms)) => Ok(()),
+                _ = cancellation.cancelled() => Err(TsoError::RequestCancelled),
             }
+        } else {
+            Err(error.clone())
         }
     }
 

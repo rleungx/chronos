@@ -1,6 +1,8 @@
 #pragma once
 
 #include <atomic>
+#include <cstddef>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -23,7 +25,7 @@ class Client {
   struct Config {
     chronos::tso::v1::ResourceTier desired_resource_tier =
         chronos::tso::v1::RESOURCE_TIER_SHARED;
-    uint32_t request_timeout_ms = 0;
+    uint32_t request_timeout_ms = 250;
     uint32_t stale_route_retry_attempts = 3;
     uint64_t stale_route_retry_backoff_ms = 5;
     bool idempotency_enabled = false;
@@ -47,6 +49,8 @@ class Client {
   std::vector<chronos::tso::v1::TimestampRange> AllocateTimestamps(uint32_t count);
 
  private:
+  static constexpr std::size_t kMaxRetainedStaleOwnerChannels = 16;
+
   chronos::tso::v1::TimelineRoute EnsureRoute();
   chronos::tso::v1::TimelineRoute EnsureRouteLocked();
   chronos::tso::v1::TimelineRoute RefreshRouteIfUnchangedLocked(
@@ -65,12 +69,15 @@ class Client {
   bool SameRouteIdentity(
       const chronos::tso::v1::TimelineRoute& left,
       const chronos::tso::v1::TimelineRoute& right) const;
+  void ApplyRequestDeadline(grpc::ClientContext* context) const;
+  void RetainStaleOwnerChannelLocked(std::shared_ptr<grpc::Channel> previous);
   std::string NextClientRequestId(const std::string& timeline_key);
   std::shared_ptr<grpc::ChannelCredentials> CreateChannelCredentials() const;
   std::shared_ptr<grpc::Channel> CreateChannel(const std::string& endpoint) const;
 
   std::shared_ptr<grpc::Channel> route_channel_;
   std::shared_ptr<grpc::Channel> tso_channel_;
+  std::deque<std::shared_ptr<grpc::Channel>> stale_tso_channels_;
   std::unique_ptr<chronos::tso::v1::TimelineRouteService::Stub> route_stub_;
   std::shared_ptr<chronos::tso::v1::TimestampService::Stub> tso_stub_;
   chronos::tso::v1::TimelineRoute route_;

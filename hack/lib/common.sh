@@ -1,5 +1,59 @@
 #!/usr/bin/env bash
 
+csv_to_array() {
+  local array_name=$1
+  local value=$2
+  eval "${array_name}=()"
+  local -a raw
+  IFS=',' read -ra raw <<<"${value}"
+  local item
+  for item in "${raw[@]}"; do
+    item="${item#"${item%%[![:space:]]*}"}"
+    item="${item%"${item##*[![:space:]]}"}"
+    [[ -n "${item}" ]] && eval "${array_name}+=(\"\${item}\")"
+  done
+}
+
+join_by_comma() {
+  local joined=""
+  local item
+  for item in "$@"; do
+    if [[ -n "${joined}" ]]; then
+      joined+=","
+    fi
+    joined+="${item}"
+  done
+  printf '%s' "${joined}"
+}
+
+generated_endpoint() {
+  local base_port=$1
+  local index=$2
+  printf '127.0.0.1:%s' "$((base_port + index))"
+}
+
+require_positive_integer() {
+  local name=$1
+  local value=$2
+  if ! [[ "${value}" =~ ^[0-9]+$ ]] || [[ "${value}" -eq 0 ]]; then
+    echo "${name} must be a positive integer, got: ${value}" >&2
+    return 1
+  fi
+}
+
+require_nonnegative_integer() {
+  local name=$1
+  local value=$2
+  if ! [[ "${value}" =~ ^[0-9]+$ ]]; then
+    echo "${name} must be a non-negative integer, got: ${value}" >&2
+    return 1
+  fi
+}
+
+require_non_negative_integer() {
+  require_nonnegative_integer "$@"
+}
+
 write_artifact_index() {
   local artifact_dir=$1
   local index_log=$2

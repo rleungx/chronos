@@ -1,5 +1,4 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::env;
 use std::error::Error;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -15,6 +14,23 @@ use chronos::proto::v1::{
     timestamp_service_client::TimestampServiceClient, AllocateTimestampsRequest,
     AllocateTimestampsResponse, EnsureTimelineRequest, ErrorCode, ErrorDetail, ResourceTier,
 };
+
+#[path = "support/bool_env.rs"]
+mod support_bool_env;
+#[path = "support/endpoint.rs"]
+mod support_endpoint;
+#[path = "support/endpoint_list.rs"]
+mod support_endpoint_list;
+#[path = "support/env.rs"]
+mod support_env;
+#[path = "support/stats.rs"]
+mod support_stats;
+
+use support_bool_env::env_bool_or;
+use support_endpoint::{normalize_endpoint, normalize_endpoint_or_fallback};
+use support_endpoint_list::{parse_endpoint_filter, parse_endpoint_list};
+use support_env::{env_or, env_or_string};
+use support_stats::percentile;
 
 type AppResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 type ChannelPools = BTreeMap<String, Vec<Channel>>;
@@ -34,10 +50,12 @@ struct BenchConfig {
     connect_timeout_ms: u64,
     connect_retry_interval_ms: u64,
     allocation_connection_pool_size: usize,
+    worker_index_offset: usize,
     resource_tier: ResourceTier,
     scenario: String,
     idempotency_enabled: bool,
     route_to_owners: bool,
+    owner_endpoint_filter: BTreeSet<String>,
     owner_affinity: bool,
     cold_probe_enabled: bool,
     cold_probe_concurrency: usize,
@@ -90,64 +108,6 @@ struct ColdProbeStats {
     latencies_us: Vec<u64>,
 }
 
-fn env_or<T>(key: &str, default: T) -> T
-where
-    T: std::str::FromStr,
-{
-    env::var(key)
-        .ok()
-        .and_then(|value| value.parse::<T>().ok())
-        .unwrap_or(default)
-}
-
-fn env_or_string(key: &str, default: &str) -> String {
-    env::var(key).unwrap_or_else(|_| default.to_owned())
-}
-
-fn env_bool_or(key: &str, default: bool) -> bool {
-    match env::var(key) {
-        Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
-            "1" | "true" | "yes" | "on" => true,
-            "0" | "false" | "no" | "off" => false,
-            _ => default,
-        },
-        Err(_) => default,
-    }
-}
-
-fn normalize_endpoint(endpoint: &str) -> String {
-    let endpoint = endpoint.trim();
-    if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
-        endpoint.to_owned()
-    } else {
-        format!("http://{endpoint}")
-    }
-}
-
-fn normalize_endpoint_or_fallback(endpoint: &str, fallback_endpoint: &str) -> String {
-    let endpoint = endpoint.trim();
-    if endpoint.is_empty() {
-        fallback_endpoint.to_owned()
-    } else {
-        normalize_endpoint(endpoint)
-    }
-}
-
-fn parse_endpoint_list(key: &str, fallback_endpoint: &str) -> Vec<String> {
-    let endpoints = env::var(key)
-        .unwrap_or_default()
-        .split(',')
-        .map(str::trim)
-        .filter(|endpoint| !endpoint.is_empty())
-        .map(normalize_endpoint)
-        .collect::<Vec<_>>();
-    if endpoints.is_empty() {
-        vec![fallback_endpoint.to_owned()]
-    } else {
-        endpoints
-    }
-}
-
 fn parse_resource_tier(value: &str) -> ResourceTier {
     match value.to_ascii_lowercase().as_str() {
         "shared" => ResourceTier::Shared,
@@ -182,11 +142,13 @@ fn load_config() -> BenchConfig {
     let connect_retry_interval_ms = env_or("CHRONOS_BENCH_CONNECT_RETRY_INTERVAL_MS", 100u64);
     let allocation_connection_pool_size =
         env_or("CHRONOS_BENCH_ALLOCATION_CONNECTION_POOL_SIZE", 1usize).max(1);
+    let worker_index_offset = env_or("CHRONOS_BENCH_WORKER_INDEX_OFFSET", 0usize);
     let resource_tier =
         parse_resource_tier(&env_or_string("CHRONOS_BENCH_RESOURCE_TIER", "shared"));
     let scenario = env_or_string("CHRONOS_BENCH_SCENARIO", "round_robin");
     let idempotency_enabled = env_bool_or("CHRONOS_BENCH_IDEMPOTENCY", false);
     let route_to_owners = env_bool_or("CHRONOS_BENCH_ROUTE_TO_OWNERS", false);
+    let owner_endpoint_filter = parse_endpoint_filter("CHRONOS_BENCH_OWNER_ENDPOINT_FILTER");
     let owner_affinity = env_bool_or("CHRONOS_BENCH_OWNER_AFFINITY", route_to_owners);
     let cold_probe_enabled = env_bool_or("CHRONOS_BENCH_COLD_PROBE", false);
     let cold_probe_concurrency = env_or(
@@ -209,10 +171,12 @@ fn load_config() -> BenchConfig {
         connect_timeout_ms,
         connect_retry_interval_ms,
         allocation_connection_pool_size,
+        worker_index_offset,
         resource_tier,
         scenario,
         idempotency_enabled,
         route_to_owners,
+        owner_endpoint_filter,
         owner_affinity,
         cold_probe_enabled,
         cold_probe_concurrency,
@@ -254,6 +218,34 @@ async fn ensure_timelines(config: &BenchConfig) -> AppResult<Vec<BenchRoute>> {
         });
     }
     Ok(routes)
+}
+
+fn filter_routes_to_owner_endpoints(
+    routes: Vec<BenchRoute>,
+    owner_endpoint_filter: &BTreeSet<String>,
+    fallback_endpoint: &str,
+) -> AppResult<Vec<BenchRoute>> {
+    if owner_endpoint_filter.is_empty() {
+        return Ok(routes);
+    }
+    let filtered = routes
+        .into_iter()
+        .filter(|route| {
+            owner_endpoint_filter.contains(&route.allocation_endpoint(fallback_endpoint, true))
+        })
+        .collect::<Vec<_>>();
+    if filtered.is_empty() {
+        return Err(format!(
+            "owner endpoint filter matched no routes: {}",
+            owner_endpoint_filter
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+        .into());
+    }
+    Ok(filtered)
 }
 
 async fn connect_channel(
@@ -352,14 +344,6 @@ fn pooled_client_mut<'a>(
     }
     let index = worker_idx % pool.len();
     Ok(&mut pool[index])
-}
-
-fn percentile(sorted: &[u64], pct: f64) -> u64 {
-    if sorted.is_empty() {
-        return 0;
-    }
-    let idx = ((sorted.len() - 1) as f64 * pct).round() as usize;
-    sorted[idx]
 }
 
 fn record_count(counts: &mut BTreeMap<String, u64>, label: &str) {
@@ -505,6 +489,14 @@ fn affinity_groups(
         .collect()
 }
 
+fn affinity_group_assignment(global_worker_idx: usize, group_count: usize) -> (usize, usize) {
+    debug_assert!(group_count > 0);
+    (
+        global_worker_idx % group_count,
+        global_worker_idx / group_count,
+    )
+}
+
 async fn run_cold_probe(
     config: &BenchConfig,
     routes: Arc<Vec<BenchRoute>>,
@@ -585,10 +577,21 @@ async fn run_cold_probe(
     Ok(total)
 }
 
-#[tokio::main]
-async fn main() -> AppResult<()> {
+fn main() -> AppResult<()> {
+    chronos::process_runtime::build_multi_thread_runtime(
+        "CHRONOS_BENCH_RUNTIME_WORKER_THREADS",
+        "chronos-bench-runtime",
+    )?
+    .block_on(run())
+}
+
+async fn run() -> AppResult<()> {
     let config = load_config();
-    let routes = Arc::new(ensure_timelines(&config).await?);
+    let routes = Arc::new(filter_routes_to_owner_endpoints(
+        ensure_timelines(&config).await?,
+        &config.owner_endpoint_filter,
+        &config.endpoint,
+    )?);
     let (
         route_owner_endpoints,
         route_owner_min_timelines,
@@ -619,6 +622,7 @@ async fn main() -> AppResult<()> {
 
     let mut handles = Vec::with_capacity(config.concurrency);
     for worker_idx in 0..config.concurrency {
+        let global_worker_idx = config.worker_index_offset + worker_idx;
         let barrier = barrier.clone();
         let routes = routes.clone();
         let endpoint = config.endpoint.clone();
@@ -634,16 +638,19 @@ async fn main() -> AppResult<()> {
         handles.push(tokio::spawn(async move {
             let mut clients = clients_from_channel_pools(allocation_channels.as_ref());
             let mut stats = WorkerStats::default();
-            let mut route_idx = worker_idx % routes.len();
+            let mut route_idx = global_worker_idx % routes.len();
             let affinity_group = if owner_affinity && !affinity_groups.is_empty() {
-                Some(affinity_groups[worker_idx % affinity_groups.len()].clone())
+                let (group_idx, _) =
+                    affinity_group_assignment(global_worker_idx, affinity_groups.len());
+                Some(affinity_groups[group_idx].clone())
             } else {
                 None
             };
             let mut affinity_route_idx = affinity_group
                 .as_ref()
                 .map(|group| {
-                    let owner_worker_idx = worker_idx / affinity_groups.len();
+                    let (_, owner_worker_idx) =
+                        affinity_group_assignment(global_worker_idx, affinity_groups.len());
                     owner_worker_idx % group.route_indexes.len()
                 })
                 .unwrap_or(0);
@@ -664,9 +671,14 @@ async fn main() -> AppResult<()> {
                     route_idx = (route_idx + 1) % routes.len();
                     (route, route.allocation_endpoint(&endpoint, route_to_owners))
                 };
-                let client = pooled_client_mut(&mut clients, &allocation_endpoint, worker_idx)?;
+                let client =
+                    pooled_client_mut(&mut clients, &allocation_endpoint, global_worker_idx)?;
                 let client_request_id = if idempotency_enabled {
-                    format!("{}-{}", worker_idx, id_gen.fetch_add(1, Ordering::Relaxed))
+                    format!(
+                        "{}-{}",
+                        global_worker_idx,
+                        id_gen.fetch_add(1, Ordering::Relaxed)
+                    )
                 } else {
                     String::new()
                 };
@@ -734,12 +746,25 @@ async fn main() -> AppResult<()> {
     println!("endpoint={}", config.endpoint);
     println!("control_endpoints={}", config.control_endpoints.join(","));
     println!("route_to_owners={}", config.route_to_owners);
+    println!(
+        "owner_endpoint_filter={}",
+        if config.owner_endpoint_filter.is_empty() {
+            "none".to_owned()
+        } else {
+            config
+                .owner_endpoint_filter
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(",")
+        }
+    );
     println!("route_owner_endpoints={}", route_owner_endpoints);
     println!("route_owner_min_timelines={}", route_owner_min_timelines);
     println!("route_owner_max_timelines={}", route_owner_max_timelines);
     println!("route_owner_counts={}", route_owner_counts);
     println!("concurrency={}", config.concurrency);
-    println!("timelines={}", config.timeline_count);
+    println!("timelines={}", routes.len());
     println!("batch={}", config.batch);
     println!("idempotency_enabled={}", config.idempotency_enabled);
     println!("owner_affinity={}", config.owner_affinity);
@@ -754,6 +779,7 @@ async fn main() -> AppResult<()> {
         "allocation_connection_pool_size={}",
         config.allocation_connection_pool_size
     );
+    println!("worker_index_offset={}", config.worker_index_offset);
     println!("cold_probe_enabled={}", config.cold_probe_enabled);
     println!("cold_probe_concurrency={}", config.cold_probe_concurrency);
     println!("cold_request_timeout_ms={}", config.cold_request_timeout_ms);
@@ -858,5 +884,44 @@ mod tests {
             format_counts(&counts),
             "client_timeout:1,temporarily_unavailable:2"
         );
+    }
+
+    #[test]
+    fn owner_affinity_distribution_uses_global_worker_offsets() {
+        let mut group_counts = [0usize; 3];
+        for offset in [0usize, 4, 8] {
+            for worker_idx in 0..4 {
+                let global_worker_idx = offset + worker_idx;
+                let (group_idx, _) = affinity_group_assignment(global_worker_idx, 3);
+                group_counts[group_idx] += 1;
+            }
+        }
+
+        assert_eq!(group_counts, [4, 4, 4]);
+    }
+
+    #[test]
+    fn owner_endpoint_filter_keeps_only_matching_routes() {
+        let routes = vec![
+            BenchRoute {
+                timeline_key: "bench.a".to_owned(),
+                epoch: 1,
+                route_version: 1,
+                owner_worker_endpoint: "127.0.0.1:50051".to_owned(),
+            },
+            BenchRoute {
+                timeline_key: "bench.b".to_owned(),
+                epoch: 1,
+                route_version: 1,
+                owner_worker_endpoint: "127.0.0.1:50052".to_owned(),
+            },
+        ];
+        let filter = BTreeSet::from(["http://127.0.0.1:50052".to_owned()]);
+
+        let filtered =
+            filter_routes_to_owner_endpoints(routes, &filter, "http://127.0.0.1:50051").unwrap();
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].timeline_key, "bench.b");
     }
 }

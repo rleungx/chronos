@@ -58,8 +58,8 @@ data = config.fetch("data", {})
   "CHRONOS_BIND_ADDR" => "0.0.0.0:50051",
   "CHRONOS_HEALTH_BIND_ADDR" => "0.0.0.0:9897",
   "CHRONOS_METRICS_BIND_ADDR" => "0.0.0.0:9898",
-  "CHRONOS_OWNERSHIP_PLAN_ID" => "kubernetes-static-3",
-  "CHRONOS_GENERATOR_OWNERSHIP_MODULO" => "3",
+  "CHRONOS_OWNERSHIP_PLAN_ID" => "kubernetes-rendezvous-shards-256",
+  "CHRONOS_GENERATOR_OWNERSHIP_MODULO" => "256",
   "CHRONOS_AUTO_FAILOVER_ENABLED" => "true"
 }.each do |key, expected|
   fail!("ConfigMap chronos-config #{key} must be #{expected}") unless data[key] == expected
@@ -71,9 +71,11 @@ spec = statefulset.fetch("spec")
 fail!("StatefulSet must use chronos-headless serviceName") unless spec["serviceName"] == "chronos-headless"
 replicas = spec.fetch("replicas", 0).to_i
 ownership_modulo = data.fetch("CHRONOS_GENERATOR_OWNERSHIP_MODULO", "0").to_i
+ownership_workers = data.fetch("CHRONOS_OWNERSHIP_WORKER_COUNT", "0").to_i
 fail!("StatefulSet replicas must be at least 3") unless replicas >= 3
-fail!("StatefulSet replicas must match CHRONOS_GENERATOR_OWNERSHIP_MODULO") unless replicas == ownership_modulo
-fail!("CHRONOS_OWNERSHIP_PLAN_ID should include the static replica count") unless data.fetch("CHRONOS_OWNERSHIP_PLAN_ID", "").end_with?("-#{replicas}")
+fail!("CHRONOS_OWNERSHIP_WORKER_COUNT must match StatefulSet replicas") unless replicas == ownership_workers
+fail!("CHRONOS_GENERATOR_OWNERSHIP_MODULO must be at least StatefulSet replicas") unless ownership_modulo >= replicas
+fail!("CHRONOS_OWNERSHIP_PLAN_ID should include ownership shard count") unless data.fetch("CHRONOS_OWNERSHIP_PLAN_ID", "").end_with?("-#{ownership_modulo}")
 fail!("StatefulSet podManagementPolicy must be Parallel") unless spec["podManagementPolicy"] == "Parallel"
 
 pod_spec = dig(statefulset, "spec", "template", "spec") || {}
@@ -85,14 +87,16 @@ fail!("pod must define topology spread constraints") unless pod_spec["topologySp
 
 init = Array(pod_spec["initContainers"]).find { |container| container["name"] == "install-tls" }
 fail!("missing install-tls initContainer") unless init
-fail!("install-tls image must be pinned by digest") unless init.fetch("image", "").include?("@sha256:")
 
 container = Array(pod_spec["containers"]).find { |entry| entry["name"] == "chronos" }
 fail!("missing chronos container") unless container
 image = container.fetch("image", "")
 fail!("chronos image must not use latest") if image.end_with?(":latest") || image == "latest"
+fail!("install-tls initContainer must reuse the chronos image") unless init.fetch("image", "") == image
+fail!("install-tls initContainer must not introduce a separate Debian runtime image") if init.fetch("image", "").include?("debian:bookworm-slim")
 container_args = Array(container["args"]).join("\n")
-fail!("chronos container must derive ownership remainder from StatefulSet ordinal") unless container_args.include?("CHRONOS_GENERATOR_OWNERSHIP_REMAINDER")
+fail!("chronos container must derive ownership env through chronos") unless container_args.include?("--print-ownership-env")
+fail!("chronos container must not inline ownership hash constants") if container_args.include?("1103515245") || container_args.include?("2147483647")
 fail!("chronos container must exec the chronos binary") unless container_args.include?("exec /usr/local/bin/chronos")
 
 ports = Array(container["ports"]).map { |port| [port["name"], port["containerPort"]] }.to_h

@@ -304,7 +304,6 @@ impl TsoService {
             let page_record_count = page.records.len();
             let mut processed_records = 0usize;
             let mut next_cursor = page.next_start_after_timeline_key.clone();
-            let original_cursor = cursor.clone();
             let mut retry_before_cursor_advance = false;
             for timeline in page.records {
                 scanned += 1;
@@ -350,7 +349,9 @@ impl TsoService {
             }
 
             if retry_before_cursor_advance {
-                next_cursor = original_cursor;
+                crate::metrics::TSO_AUTO_FAILOVER_TOTAL
+                    .with_label_values(&["deferred"])
+                    .inc();
             } else if page_exhausted && processed_records == page_record_count {
                 next_cursor = None;
             }
@@ -698,7 +699,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auto_failover_pass_retries_unexpired_timeline_before_cursor_advance() {
+    async fn auto_failover_pass_defers_unexpired_timeline_without_blocking_later_records() {
         let metadata = Arc::new(MemoryMetadataStore::new());
         let clock = Arc::new(ManualClock::new(1_000));
         let previous_floor = encode_tso(900, 0, 0).expect("floor should encode");
@@ -774,8 +775,21 @@ mod tests {
             .await
             .expect("timeline should load")
             .expect("timeline should exist");
+        assert_eq!(first.route.owner_worker_endpoint, "127.0.0.1:50051");
+        assert_eq!(second.route.owner_worker_endpoint, "127.0.0.1:50052");
+
+        let moved = service
+            .auto_failover_pass()
+            .await
+            .expect("auto failover wraparound retry should complete");
+        assert_eq!(moved, 1);
+
+        let (first, _) = metadata
+            .load_timeline("a.remote.timeline")
+            .await
+            .expect("timeline should load")
+            .expect("timeline should exist");
         assert_eq!(first.route.owner_worker_endpoint, "127.0.0.1:50052");
-        assert_eq!(second.route.owner_worker_endpoint, "127.0.0.1:50051");
 
         service.shutdown().await;
     }

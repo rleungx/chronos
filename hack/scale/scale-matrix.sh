@@ -8,31 +8,10 @@ source "${REPO_ROOT}/hack/lib/common.sh"
 
 cd "${REPO_ROOT}"
 
-csv_to_array() {
-  local array_name=$1
-  local value=$2
-  eval "${array_name}=()"
-  local -a raw
-  IFS=',' read -ra raw <<<"${value}"
-  local item
-  for item in "${raw[@]}"; do
-    item="${item#"${item%%[![:space:]]*}"}"
-    item="${item%"${item##*[![:space:]]}"}"
-    [[ -n "${item}" ]] && eval "${array_name}+=(\"\${item}\")"
-  done
-}
-
-require_positive_integer() {
-  local name=$1
-  local value=$2
-  if ! [[ "${value}" =~ ^[0-9]+$ ]] || [[ "${value}" -eq 0 ]]; then
-    echo "${name} must be a positive integer, got: ${value}" >&2
-    return 1
-  fi
-}
-
 matrix_workers="${CHRONOS_SCALE_MATRIX_WORKERS:-2,3}"
 matrix_efficiency_min="${CHRONOS_SCALE_MATRIX_LINEAR_EFFICIENCY_MIN:-0.55}"
+matrix_allow_single_host_plateau="${CHRONOS_SCALE_MATRIX_ALLOW_SINGLE_HOST_PLATEAU:-false}"
+matrix_single_host_plateau_min="${CHRONOS_SCALE_MATRIX_SINGLE_HOST_PLATEAU_MIN:-0.95}"
 matrix_concurrency_per_worker="${CHRONOS_SCALE_MATRIX_CONCURRENCY_PER_WORKER:-8}"
 matrix_timelines_per_worker="${CHRONOS_SCALE_MATRIX_TIMELINES_PER_WORKER:-32}"
 matrix_bench_client_processes_per_worker="${CHRONOS_SCALE_MATRIX_BENCH_CLIENT_PROCESSES_PER_WORKER:-1}"
@@ -61,6 +40,7 @@ ensure_release_binaries "${release_bin_dir}" chronos chronos-bench
 
 baseline_workers=""
 baseline_req_per_sec=""
+best_req_per_sec=""
 RESULT="failure"
 
 write_summary() {
@@ -68,6 +48,8 @@ write_summary() {
 result=${RESULT}
 worker_counts=${matrix_workers}
 linear_efficiency_min=${matrix_efficiency_min}
+allow_single_host_plateau=${matrix_allow_single_host_plateau}
+single_host_plateau_min=${matrix_single_host_plateau_min}
 concurrency_per_worker=${matrix_concurrency_per_worker}
 timelines_per_worker=${matrix_timelines_per_worker}
 bench_client_processes_per_worker=${matrix_bench_client_processes_per_worker}
@@ -90,6 +72,7 @@ EOF
       local route_owner_min_timelines
       local route_owner_max_timelines
       local route_owner_counts
+      local owner_endpoint_filter
       local concurrency
       local timelines
       local connect_timeout_ms
@@ -98,9 +81,14 @@ EOF
       local allocation_client_channels
       local concurrency_per_allocation_channel
       local client_processes
+      local worker_index_offsets
+      local runtime_worker_threads
+      local bench_runtime_worker_threads
       local owner_affinity
       local linear_efficiency
       local linear_expected_req_per_sec
+      local linear_plateau_accepted
+      local linear_metrics
       req_per_sec="$(extract_metric "req_per_sec" "${run_summary}")"
       latency_p95_us="$(extract_metric "latency_p95_us" "${run_summary}")"
       latency_p99_us="$(extract_metric "latency_p99_us" "${run_summary}")"
@@ -111,6 +99,7 @@ EOF
       route_owner_min_timelines="$(extract_metric "route_owner_min_timelines" "${run_summary}")"
       route_owner_max_timelines="$(extract_metric "route_owner_max_timelines" "${run_summary}")"
       route_owner_counts="$(extract_metric "route_owner_counts" "${run_summary}")"
+      owner_endpoint_filter="$(extract_metric "owner_endpoint_filter" "${run_summary}")"
       concurrency="$(extract_metric "bench_concurrency" "${run_summary}")"
       timelines="$(extract_metric "bench_timelines" "${run_summary}")"
       connect_timeout_ms="$(extract_metric "bench_connect_timeout_ms" "${run_summary}")"
@@ -119,12 +108,16 @@ EOF
       allocation_client_channels="$(extract_metric "allocation_client_channels" "${run_summary}")"
       concurrency_per_allocation_channel="$(extract_metric "concurrency_per_allocation_channel" "${run_summary}")"
       client_processes="$(extract_metric "bench_client_processes" "${run_summary}")"
+      worker_index_offsets="$(extract_metric "worker_index_offsets" "${run_summary}")"
+      runtime_worker_threads="$(extract_metric "runtime_worker_threads" "${run_summary}")"
+      bench_runtime_worker_threads="$(extract_metric "bench_runtime_worker_threads" "${run_summary}")"
       owner_affinity="$(extract_metric "owner_affinity" "${run_summary}")"
       linear_efficiency=""
       linear_expected_req_per_sec=""
+      linear_plateau_accepted="false"
       if [[ -n "${baseline_req_per_sec}" && -n "${baseline_workers}" && -n "${req_per_sec}" ]]; then
-        read -r linear_efficiency linear_expected_req_per_sec < <(
-          python3 - "${req_per_sec}" "${worker_count}" "${baseline_req_per_sec}" "${baseline_workers}" "${matrix_efficiency_min}" <<'PY'
+        linear_metrics="$(
+          python3 - "${req_per_sec}" "${worker_count}" "${baseline_req_per_sec}" "${baseline_workers}" "${matrix_efficiency_min}" "${matrix_allow_single_host_plateau}" "${matrix_single_host_plateau_min}" <<'PY'
 import sys
 
 current = float(sys.argv[1])
@@ -132,13 +125,17 @@ current_workers = float(sys.argv[2])
 baseline = float(sys.argv[3])
 baseline_workers = float(sys.argv[4])
 minimum_efficiency = float(sys.argv[5])
+allow_plateau = sys.argv[6].strip().lower() in {"1", "true", "yes", "on"}
+plateau_min = float(sys.argv[7])
 
 ideal = baseline * (current_workers / baseline_workers)
 efficiency = current / ideal if ideal else 0.0
 expected = ideal * minimum_efficiency
-print(f"{efficiency:.4f} {expected:.2f}")
+plateau_accepted = allow_plateau and current < expected and current >= baseline * plateau_min
+print(f"{efficiency:.4f} {expected:.2f} {str(plateau_accepted).lower()}")
 PY
-        )
+        )"
+        read -r linear_efficiency linear_expected_req_per_sec linear_plateau_accepted <<<"${linear_metrics}"
       fi
       {
         printf 'workers_%s_summary=%s\n' "${worker_count}" "${run_summary}"
@@ -146,6 +143,7 @@ PY
         printf 'workers_%s_route_owner_min_timelines=%s\n' "${worker_count}" "${route_owner_min_timelines}"
         printf 'workers_%s_route_owner_max_timelines=%s\n' "${worker_count}" "${route_owner_max_timelines}"
         printf 'workers_%s_route_owner_counts=%s\n' "${worker_count}" "${route_owner_counts}"
+        printf 'workers_%s_owner_endpoint_filter=%s\n' "${worker_count}" "${owner_endpoint_filter}"
         printf 'workers_%s_concurrency=%s\n' "${worker_count}" "${concurrency}"
         printf 'workers_%s_timelines=%s\n' "${worker_count}" "${timelines}"
         printf 'workers_%s_connect_timeout_ms=%s\n' "${worker_count}" "${connect_timeout_ms}"
@@ -154,10 +152,14 @@ PY
         printf 'workers_%s_allocation_client_channels=%s\n' "${worker_count}" "${allocation_client_channels}"
         printf 'workers_%s_concurrency_per_allocation_channel=%s\n' "${worker_count}" "${concurrency_per_allocation_channel}"
         printf 'workers_%s_bench_client_processes=%s\n' "${worker_count}" "${client_processes}"
+        printf 'workers_%s_worker_index_offsets=%s\n' "${worker_count}" "${worker_index_offsets}"
+        printf 'workers_%s_runtime_worker_threads=%s\n' "${worker_count}" "${runtime_worker_threads}"
+        printf 'workers_%s_bench_runtime_worker_threads=%s\n' "${worker_count}" "${bench_runtime_worker_threads}"
         printf 'workers_%s_owner_affinity=%s\n' "${worker_count}" "${owner_affinity}"
         printf 'workers_%s_req_per_sec=%s\n' "${worker_count}" "${req_per_sec}"
         printf 'workers_%s_linear_efficiency=%s\n' "${worker_count}" "${linear_efficiency}"
         printf 'workers_%s_linear_expected_req_per_sec_at_min_efficiency=%s\n' "${worker_count}" "${linear_expected_req_per_sec}"
+        printf 'workers_%s_linear_single_host_plateau_accepted=%s\n' "${worker_count}" "${linear_plateau_accepted}"
         printf 'workers_%s_latency_p95_us=%s\n' "${worker_count}" "${latency_p95_us}"
         printf 'workers_%s_latency_p99_us=%s\n' "${worker_count}" "${latency_p99_us}"
         printf 'workers_%s_latency_p999_us=%s\n' "${worker_count}" "${latency_p999_us}"
@@ -210,10 +212,11 @@ for worker_count in "${WORKER_COUNTS[@]}"; do
   if [[ -z "${baseline_req_per_sec}" ]]; then
     baseline_workers="${worker_count}"
     baseline_req_per_sec="${req_per_sec}"
+    best_req_per_sec="${req_per_sec}"
     continue
   fi
 
-  python3 - "${req_per_sec}" "${worker_count}" "${baseline_req_per_sec}" "${baseline_workers}" "${matrix_efficiency_min}" <<'PY'
+  python3 - "${req_per_sec}" "${worker_count}" "${baseline_req_per_sec}" "${baseline_workers}" "${matrix_efficiency_min}" "${matrix_allow_single_host_plateau}" "${matrix_single_host_plateau_min}" "${best_req_per_sec}" <<'PY'
 import sys
 
 current = float(sys.argv[1])
@@ -221,9 +224,20 @@ current_workers = float(sys.argv[2])
 baseline = float(sys.argv[3])
 baseline_workers = float(sys.argv[4])
 minimum_efficiency = float(sys.argv[5])
+allow_plateau = sys.argv[6].strip().lower() in {"1", "true", "yes", "on"}
+plateau_min = float(sys.argv[7])
+best = float(sys.argv[8])
 
 expected = baseline * (current_workers / baseline_workers) * minimum_efficiency
 if current < expected:
+    plateau_floor = best * plateau_min
+    if allow_plateau and current >= plateau_floor:
+        print(
+            f"scale matrix single-host plateau accepted: workers={current_workers:g} "
+            f"req_per_sec={current:.2f} linear_expected_at_least={expected:.2f} "
+            f"best_req_per_sec={best:.2f} plateau_floor={plateau_floor:.2f}"
+        )
+        sys.exit(0)
     print(
         f"scale matrix linearity check failed: workers={current_workers:g} "
         f"req_per_sec={current:.2f} expected_at_least={expected:.2f} "
@@ -233,6 +247,12 @@ if current < expected:
     )
     sys.exit(1)
 PY
+  best_req_per_sec="$(python3 - "${best_req_per_sec}" "${req_per_sec}" <<'PY'
+import sys
+
+print(f"{max(float(sys.argv[1]), float(sys.argv[2])):.2f}")
+PY
+  )"
 done
 
 RESULT="success"

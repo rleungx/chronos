@@ -17,7 +17,9 @@ data:
   CHRONOS_LOG_FORMAT: {{ .Values.runtime.logFormat | quote }}
   CHRONOS_LOG_FILTER: {{ .Values.runtime.logFilter | quote }}
   CHRONOS_OWNERSHIP_PLAN_ID: {{ include "chronos.ownershipPlanId" . | quote }}
-  CHRONOS_GENERATOR_OWNERSHIP_MODULO: {{ .Values.replicaCount | quote }}
+  CHRONOS_GENERATOR_OWNERSHIP_MODULO: {{ .Values.ownership.shardCount | quote }}
+  CHRONOS_OWNERSHIP_WORKER_COUNT: {{ .Values.replicaCount | quote }}
+  CHRONOS_OWNERSHIP_ASSIGNMENT_SEED: {{ .Values.ownership.assignmentSeed | quote }}
   CHRONOS_SAFETY_GAP_MS: {{ .Values.runtime.safetyGapMs | quote }}
   CHRONOS_AUTO_FAILOVER_ENABLED: {{ .Values.autoFailover.enabled | quote }}
   CHRONOS_AUTO_FAILOVER_INTERVAL_MS: {{ .Values.autoFailover.intervalMs | quote }}

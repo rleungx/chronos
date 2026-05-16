@@ -30,13 +30,17 @@ spec:
         fsGroup: 10001
         seccompProfile:
           type: RuntimeDefault
-      {{- if or .Values.podAntiAffinity.enabled .Values.affinity }}
+      {{- $affinity := default dict .Values.affinity }}
+      {{- $nodeAffinity := get $affinity "nodeAffinity" }}
+      {{- $podAffinity := get $affinity "podAffinity" }}
+      {{- $customPodAntiAffinity := get $affinity "podAntiAffinity" }}
+      {{- if or .Values.podAntiAffinity.enabled $nodeAffinity $podAffinity $customPodAntiAffinity }}
       affinity:
-        {{- with .Values.affinity.nodeAffinity }}
+        {{- with $nodeAffinity }}
         nodeAffinity:
           {{- toYaml . | nindent 10 }}
         {{- end }}
-        {{- with .Values.affinity.podAffinity }}
+        {{- with $podAffinity }}
         podAffinity:
           {{- toYaml . | nindent 10 }}
         {{- end }}
@@ -47,20 +51,22 @@ spec:
                 matchLabels:
                   {{- include "chronos.selectorLabels" . | nindent 18 }}
               topologyKey: kubernetes.io/hostname
-          {{- with .Values.affinity.podAntiAffinity.preferredDuringSchedulingIgnoredDuringExecution }}
+          {{- with (get (default dict $customPodAntiAffinity) "preferredDuringSchedulingIgnoredDuringExecution") }}
           preferredDuringSchedulingIgnoredDuringExecution:
             {{- toYaml . | nindent 12 }}
           {{- end }}
-        {{- else with .Values.affinity.podAntiAffinity }}
+        {{- else }}
+        {{- with $customPodAntiAffinity }}
         podAntiAffinity:
           {{- toYaml . | nindent 10 }}
+        {{- end }}
         {{- end }}
       {{- end }}
       {{- if .Values.topologySpreadConstraints.enabled }}
       topologySpreadConstraints:
         - maxSkew: 1
-          topologyKey: topology.kubernetes.io/zone
-          whenUnsatisfiable: ScheduleAnyway
+          topologyKey: {{ .Values.topologySpreadConstraints.topologyKey | quote }}
+          whenUnsatisfiable: {{ .Values.topologySpreadConstraints.whenUnsatisfiable | quote }}
           labelSelector:
             matchLabels:
               {{- include "chronos.selectorLabels" . | nindent 14 }}
@@ -75,7 +81,7 @@ spec:
       {{- end }}
       initContainers:
         - name: install-tls
-          image: debian:bookworm-slim@sha256:f9c6a2fd2ddbc23e336b6257a5245e31f996953ef06cd13a59fa0a1df2d5c252
+          image: {{ include "chronos.image" . | quote }}
           imagePullPolicy: IfNotPresent
           command:
             - /bin/sh
@@ -120,25 +126,7 @@ spec:
             - -ec
           args:
             - |
-              ordinal="${POD_NAME##*-}"
-              modulo="${CHRONOS_GENERATOR_OWNERSHIP_MODULO:?missing CHRONOS_GENERATOR_OWNERSHIP_MODULO}"
-              case "${ordinal}" in
-                ""|*[!0-9]*)
-                  echo "POD_NAME must end with a numeric StatefulSet ordinal, got: ${POD_NAME}" >&2
-                  exit 1
-                  ;;
-              esac
-              case "${modulo}" in
-                ""|*[!0-9]*)
-                  echo "CHRONOS_GENERATOR_OWNERSHIP_MODULO must be numeric, got: ${modulo}" >&2
-                  exit 1
-                  ;;
-              esac
-              if [ "${ordinal}" -ge "${modulo}" ]; then
-                echo "pod ordinal ${ordinal} must be < CHRONOS_GENERATOR_OWNERSHIP_MODULO=${modulo}" >&2
-                exit 1
-              fi
-              export CHRONOS_GENERATOR_OWNERSHIP_REMAINDER="${ordinal}"
+              eval "$(/usr/local/bin/chronos --print-ownership-env)"
               exec /usr/local/bin/chronos
           ports:
             - name: grpc

@@ -20,6 +20,7 @@ import com.chronos.tso.v1.TimelineRouteServiceGrpc;
 import com.chronos.tso.v1.TimestampRange;
 import com.chronos.tso.v1.TimestampServiceGrpc;
 import com.google.protobuf.Any;
+import io.grpc.Context;
 import io.grpc.ManagedChannel;
 import io.grpc.Server;
 import io.grpc.Status;
@@ -291,6 +292,8 @@ final class ClientTest {
     var observedTier = new AtomicReference<ResourceTier>();
     var observedTimeoutMs = new AtomicInteger(-1);
     var observedRequestId = new AtomicReference<String>("");
+    var observedEnsureDeadline = new AtomicBoolean(false);
+    var observedAllocateDeadline = new AtomicBoolean(false);
     var getRouteCalls = new AtomicInteger();
     var ownerServerName = InProcessServerBuilder.generateName();
     var routeServerName = InProcessServerBuilder.generateName();
@@ -306,6 +309,7 @@ final class ClientTest {
                       StreamObserver<AllocateTimestampsResponse> responseObserver) {
                     observedTimeoutMs.set(request.getRequestTimeoutMs());
                     observedRequestId.set(request.getClientRequestId());
+                    observedAllocateDeadline.set(Context.current().getDeadline() != null);
                     responseObserver.onNext(
                         AllocateTimestampsResponse.newBuilder()
                             .setTimelineKey(request.getTimelineKey())
@@ -331,6 +335,7 @@ final class ClientTest {
                       EnsureTimelineRequest request,
                       StreamObserver<EnsureTimelineResponse> responseObserver) {
                     observedTier.set(request.getDesiredResourceTier());
+                    observedEnsureDeadline.set(Context.current().getDeadline() != null);
                     responseObserver.onNext(
                         EnsureTimelineResponse.newBuilder()
                             .setRoute(route(request.getTimelineKey(), ownerServerName, 11))
@@ -370,6 +375,8 @@ final class ClientTest {
       assertEquals(ResourceTier.RESOURCE_TIER_WARM, observedTier.get());
       assertEquals(1500, observedTimeoutMs.get());
       assertFalse(observedRequestId.get().isBlank());
+      assertTrue(observedEnsureDeadline.get());
+      assertTrue(observedAllocateDeadline.get());
       assertEquals(0, getRouteCalls.get());
     } finally {
       routeChannel.shutdownNow();

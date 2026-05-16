@@ -15,6 +15,20 @@ env:
   DOCKER_BUILDKIT: 1
 
 jobs:
+  workflow-lint:
+    runs-on: ubuntu-latest
+    if: github.event_name != 'schedule'
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c
+        with:
+          go-version-file: clients/go/go.mod
+      - name: Install actionlint
+        run: go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+      - name: Validate GitHub Actions workflows
+        run: |
+          "$(go env GOPATH)/bin/actionlint" -color
+
   layer-0-3-verify:
     runs-on: ubuntu-latest
     if: github.event_name != 'schedule'
@@ -22,8 +36,8 @@ jobs:
       CHRONOS_BUILD_COMMIT: ${{ github.sha }}
       RUST_BACKTRACE: 1
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
         with:
           toolchain: 1.94.0
           components: rustfmt, clippy
@@ -31,6 +45,11 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler ruby
+          HELM_VERSION=v3.17.3
+          curl -fsSL "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz" -o /tmp/helm.tar.gz
+          tar -C /tmp -xzf /tmp/helm.tar.gz
+          sudo install /tmp/linux-amd64/helm /usr/local/bin/helm
+          helm version
       - name: Run Layer 0 static
         run: make test-layer-0
       - name: Verify client conformance contract
@@ -56,8 +75,8 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name != 'schedule'
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c
         with:
           go-version-file: clients/go/go.mod
       - name: Verify Go client
@@ -69,12 +88,12 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name != 'schedule'
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+      - uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654
         with:
           distribution: temurin
-          java-version: '25'
-      - uses: gradle/actions/setup-gradle@v4
+          java-version: '21'
+      - uses: gradle/actions/setup-gradle@39fdf500b386709a9a4a769f717dad447ac345b9
         with:
           gradle-version: '9.4.0'
       - name: Verify Java client
@@ -88,7 +107,7 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name != 'schedule'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
       - name: Install C++ client dependencies
         run: |
           sudo apt-get update
@@ -107,13 +126,13 @@ jobs:
       CHRONOS_BUILD_COMMIT: ${{ github.sha }}
       RUST_BACKTRACE: 1
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
       - name: Build container image
         run: make CONTAINER_CHECK_IMAGE=chronos:ci CONTAINER_CHECK_FORCE_BUILD=1 container-image-check
       - name: Save container image
         run: docker save chronos:ci -o chronos-ci-image.tar
       - name: Upload container image
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
         with:
           name: chronos-ci-image
           path: chronos-ci-image.tar
@@ -128,9 +147,9 @@ jobs:
       CHRONOS_BUILD_COMMIT: ${{ github.sha }}
       RUST_BACKTRACE: 1
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
       - name: Download container image
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: chronos-ci-image
       - name: Load container image
@@ -146,9 +165,9 @@ jobs:
       CHRONOS_BUILD_COMMIT: ${{ github.sha }}
       RUST_BACKTRACE: 1
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
       - name: Download container image
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: chronos-ci-image
       - name: Load container image
@@ -164,8 +183,8 @@ jobs:
       CHRONOS_BUILD_COMMIT: ${{ github.sha }}
       RUST_BACKTRACE: 1
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
         with:
           toolchain: 1.94.0
       - name: Install protoc
@@ -175,7 +194,7 @@ jobs:
       - name: Package reusable release artifacts
         run: make release-package
       - name: Upload reusable release artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
         with:
           name: chronos-ci-release-artifacts
           path: artifacts/release/
@@ -190,8 +209,8 @@ jobs:
       CHRONOS_BUILD_COMMIT: ${{ github.sha }}
       RUST_BACKTRACE: 1
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
         with:
           toolchain: 1.94.0
       - name: Install protoc
@@ -206,7 +225,9 @@ jobs:
             if make etcd-cluster-health; then
               exit 0
             fi
-            sleep 1
+            if [ "$attempt" -lt 60 ]; then
+              sleep 1
+            fi
           done
           echo "clustered etcd did not become healthy within 60 attempts" >&2
           exit 1
@@ -230,8 +251,8 @@ jobs:
       CHRONOS_SKIP_RELEASE_BUILD: 1
       CHRONOS_RELEASE_BIN_DIR: ${{ github.workspace }}/artifacts/release
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
         with:
           toolchain: 1.94.0
       - name: Install protoc
@@ -239,7 +260,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler
       - name: Download release artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: chronos-ci-release-artifacts
           path: artifacts/release
@@ -262,7 +283,7 @@ jobs:
           fi
       - name: Upload soak artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
         with:
           name: chronos-soak-artifacts
           path: artifacts/soak/
@@ -289,8 +310,8 @@ jobs:
       CHRONOS_SKIP_RELEASE_BUILD: 1
       CHRONOS_RELEASE_BIN_DIR: ${{ github.workspace }}/artifacts/release
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
         with:
           toolchain: 1.94.0
       - name: Install protoc
@@ -298,7 +319,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler
       - name: Download release artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: chronos-ci-release-artifacts
           path: artifacts/release
@@ -321,7 +342,7 @@ jobs:
           fi
       - name: Upload chaos artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
         with:
           name: chronos-chaos-artifacts
           path: artifacts/chaos/
@@ -348,8 +369,8 @@ jobs:
       CHRONOS_SKIP_RELEASE_BUILD: 1
       CHRONOS_RELEASE_BIN_DIR: ${{ github.workspace }}/artifacts/release
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
         with:
           toolchain: 1.94.0
       - name: Install protoc
@@ -357,7 +378,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler
       - name: Download release artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: chronos-ci-release-artifacts
           path: artifacts/release
@@ -380,7 +401,7 @@ jobs:
           fi
       - name: Upload failover artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
         with:
           name: chronos-failover-artifacts
           path: artifacts/failover/
@@ -407,8 +428,8 @@ jobs:
       CHRONOS_SKIP_RELEASE_BUILD: 1
       CHRONOS_RELEASE_BIN_DIR: ${{ github.workspace }}/artifacts/release
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
         with:
           toolchain: 1.94.0
       - name: Install protoc
@@ -416,7 +437,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler
       - name: Download release artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: chronos-ci-release-artifacts
           path: artifacts/release
@@ -439,7 +460,7 @@ jobs:
           fi
       - name: Upload scale artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
         with:
           name: chronos-scale-artifacts
           path: artifacts/scale/
@@ -466,8 +487,8 @@ jobs:
       CHRONOS_SKIP_RELEASE_BUILD: 1
       CHRONOS_RELEASE_BIN_DIR: ${{ github.workspace }}/artifacts/release
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
         with:
           toolchain: 1.94.0
       - name: Install protoc
@@ -475,7 +496,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler
       - name: Download release artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: chronos-ci-release-artifacts
           path: artifacts/release
@@ -498,7 +519,7 @@ jobs:
           fi
       - name: Upload scale matrix artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
         with:
           name: chronos-scale-matrix-artifacts
           path: artifacts/scale-matrix/
@@ -525,8 +546,8 @@ jobs:
       CHRONOS_SKIP_RELEASE_BUILD: 1
       CHRONOS_RELEASE_BIN_DIR: ${{ github.workspace }}/artifacts/release
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
         with:
           toolchain: 1.94.0
       - name: Install protoc
@@ -534,7 +555,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler
       - name: Download release artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: chronos-ci-release-artifacts
           path: artifacts/release
@@ -557,7 +578,7 @@ jobs:
           fi
       - name: Upload rebalance artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
         with:
           name: chronos-rebalance-artifacts
           path: artifacts/rebalance/
@@ -584,8 +605,8 @@ jobs:
       CHRONOS_SKIP_RELEASE_BUILD: 1
       CHRONOS_RELEASE_BIN_DIR: ${{ github.workspace }}/artifacts/release
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
         with:
           toolchain: 1.94.0
       - name: Install protoc
@@ -593,7 +614,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler
       - name: Download release artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: chronos-ci-release-artifacts
           path: artifacts/release
@@ -603,7 +624,7 @@ jobs:
         run: make test-restore-dr
       - name: Upload restore artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
         with:
           name: chronos-restore-artifacts
           path: artifacts/restore/

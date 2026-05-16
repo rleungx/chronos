@@ -13,6 +13,7 @@ enum CliCommand {
     Help,
     PrintEnvTemplate,
     PrintEffectiveConfig,
+    PrintOwnershipEnv,
     CheckConfig,
 }
 
@@ -35,6 +36,11 @@ pub(crate) async fn run_cli_or_service() -> AppResult<()> {
             print_effective_config(&startup, &plan);
             Ok(())
         }
+        CliCommand::PrintOwnershipEnv => {
+            let ownership = ownership_env_from_process_env()?;
+            print_ownership_env(&ownership);
+            Ok(())
+        }
         CliCommand::CheckConfig => {
             let startup = load_startup_config()?;
             let plan = validate_startup_preflight(&startup)?;
@@ -55,6 +61,7 @@ where
         [arg] if matches!(arg.as_str(), "-h" | "--help" | "help") => Ok(CliCommand::Help),
         [arg] if arg == "--print-env-template" => Ok(CliCommand::PrintEnvTemplate),
         [arg] if arg == "--print-effective-config" => Ok(CliCommand::PrintEffectiveConfig),
+        [arg] if arg == "--print-ownership-env" => Ok(CliCommand::PrintOwnershipEnv),
         [arg] if arg == "--check-config" => Ok(CliCommand::CheckConfig),
         _ => Err(format!(
             "unsupported arguments: {}\nrun `chronos --help` to see supported commands",
@@ -66,7 +73,7 @@ where
 
 fn print_help() {
     println!(
-        "Chronos\n\nCommands:\n  chronos                    Start the service using environment variables\n  chronos --check-config     Validate startup configuration and exit\n  chronos --print-effective-config\n                             Print the effective validated startup configuration\n  chronos --print-env-template\n                             Print a minimal environment template for local runs\n  chronos --help             Show this help\n\nQuick start:\n  Local memory metadata:\n    export CHRONOS_SECURITY_MODE=dev-insecure\n    export CHRONOS_BIND_ADDR=127.0.0.1:50051\n    export CHRONOS_ADVERTISE_ENDPOINT=127.0.0.1:50051\n    export CHRONOS_LOG_FORMAT=json\n    export CHRONOS_LOG_FILTER=info\n    cargo run --bin chronos\n\n  Validate config without starting:\n    cargo run --bin chronos -- --check-config\n\n  Inspect what Chronos will use:\n    cargo run --bin chronos -- --print-effective-config\n"
+        "Chronos\n\nCommands:\n  chronos                    Start the service using environment variables\n  chronos --check-config     Validate startup configuration and exit\n  chronos --print-effective-config\n                             Print the effective validated startup configuration\n  chronos --print-env-template\n                             Print a minimal environment template for local runs\n  chronos --print-ownership-env\n                             Print StatefulSet ownership env exports for the current pod\n  chronos --help             Show this help\n\nQuick start:\n  Local memory metadata:\n    export CHRONOS_SECURITY_MODE=dev-insecure\n    export CHRONOS_BIND_ADDR=127.0.0.1:50051\n    export CHRONOS_ADVERTISE_ENDPOINT=127.0.0.1:50051\n    export CHRONOS_LOG_FORMAT=json\n    export CHRONOS_LOG_FILTER=info\n    cargo run --bin chronos\n\n  Validate config without starting:\n    cargo run --bin chronos -- --check-config\n\n  Inspect what Chronos will use:\n    cargo run --bin chronos -- --print-effective-config\n"
     );
 }
 
@@ -118,6 +125,13 @@ fn print_config_lines(config: &TsoConfig) {
         "generator_ownership_remainder={}",
         config.generator_ownership_remainder
     );
+    let remainders = config
+        .effective_generator_ownership_remainders()
+        .into_iter()
+        .map(|remainder| remainder.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    println!("generator_ownership_remainders={}", remainders);
     println!("safety_gap_ms={}", config.safety_gap_ms);
     println!("auto_failover_enabled={}", config.auto_failover_enabled);
     println!(
@@ -135,6 +149,127 @@ fn metrics_transport_label(transport: MetricsTransport) -> &'static str {
         MetricsTransport::Plain => "plain",
         MetricsTransport::Mtls => "mtls",
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OwnershipEnv {
+    primary_remainder: u32,
+    remainders: Vec<u32>,
+}
+
+fn ownership_env_from_process_env() -> AppResult<OwnershipEnv> {
+    let pod_name = env::var("POD_NAME")?;
+    let ordinal = statefulset_ordinal(&pod_name)?;
+    let worker_count = parse_required_u32_env("CHRONOS_OWNERSHIP_WORKER_COUNT")?;
+    let shard_count = parse_required_u32_env("CHRONOS_GENERATOR_OWNERSHIP_MODULO")?;
+    let assignment_seed = parse_optional_u64_env("CHRONOS_OWNERSHIP_ASSIGNMENT_SEED", 0)?;
+    ownership_env_for_ordinal(ordinal, worker_count, shard_count, assignment_seed)
+}
+
+fn parse_required_u32_env(key: &str) -> AppResult<u32> {
+    let value = env::var(key)?;
+    parse_u32_value(key, &value)
+}
+
+fn parse_optional_u64_env(key: &str, default: u64) -> AppResult<u64> {
+    match env::var(key) {
+        Ok(value) => value
+            .parse::<u64>()
+            .map_err(|error| format!("{key} must be numeric, got {value}: {error}").into()),
+        Err(env::VarError::NotPresent) => Ok(default),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn parse_u32_value(name: &str, value: &str) -> AppResult<u32> {
+    value
+        .parse::<u32>()
+        .map_err(|error| format!("{name} must be numeric, got {value}: {error}").into())
+}
+
+fn statefulset_ordinal(pod_name: &str) -> AppResult<u32> {
+    let (_, ordinal) = pod_name.rsplit_once('-').ok_or_else(|| {
+        format!("POD_NAME must end with a numeric StatefulSet ordinal, got: {pod_name}")
+    })?;
+    parse_u32_value("POD_NAME ordinal", ordinal)
+}
+
+fn ownership_env_for_ordinal(
+    ordinal: u32,
+    worker_count: u32,
+    shard_count: u32,
+    assignment_seed: u64,
+) -> AppResult<OwnershipEnv> {
+    if shard_count == 0 {
+        return Err("CHRONOS_GENERATOR_OWNERSHIP_MODULO must be > 0".into());
+    }
+    if worker_count == 0 {
+        return Err("CHRONOS_OWNERSHIP_WORKER_COUNT must be > 0".into());
+    }
+    if ordinal >= worker_count {
+        return Err(format!(
+            "pod ordinal {ordinal} must be < CHRONOS_OWNERSHIP_WORKER_COUNT={worker_count}"
+        )
+        .into());
+    }
+
+    let remainders = (0..shard_count)
+        .filter(|shard| owner_for_shard(worker_count, *shard, assignment_seed) == ordinal)
+        .collect::<Vec<_>>();
+    let Some(primary_remainder) = remainders.first().copied() else {
+        return Err(format!(
+            "pod ordinal {ordinal} owns no generator shards; increase ownership shard count or reduce replicas"
+        )
+        .into());
+    };
+
+    Ok(OwnershipEnv {
+        primary_remainder,
+        remainders,
+    })
+}
+
+fn owner_for_shard(worker_count: u32, shard: u32, assignment_seed: u64) -> u32 {
+    let mut best_worker = 0;
+    let mut best_score = 0;
+    for worker in 0..worker_count {
+        let score = ownership_score(shard as u64, worker as u64, assignment_seed);
+        if worker == 0 || score > best_score {
+            best_score = score;
+            best_worker = worker;
+        }
+    }
+    best_worker
+}
+
+fn ownership_score(shard: u64, worker: u64, assignment_seed: u64) -> u64 {
+    const MODULUS: u64 = 2_147_483_647;
+    const MULTIPLIER: u64 = 1_103_515_245;
+    const INCREMENT: u64 = 12_345;
+    const WORKER_SALT: u64 = 97;
+
+    let mut mixed = ((((shard + 1) * MULTIPLIER) % MODULUS)
+        + (((worker + 1) * INCREMENT) % MODULUS)
+        + (assignment_seed % MODULUS))
+        % MODULUS;
+    mixed = (mixed ^ (mixed >> 16)) & MODULUS;
+    mixed = ((mixed * MULTIPLIER) + INCREMENT) % MODULUS;
+    mixed = (mixed ^ (mixed >> 11)) & MODULUS;
+    ((mixed * MULTIPLIER) + INCREMENT + (worker * WORKER_SALT)) % MODULUS
+}
+
+fn print_ownership_env(ownership: &OwnershipEnv) {
+    let remainders = ownership
+        .remainders
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    println!(
+        "export CHRONOS_GENERATOR_OWNERSHIP_REMAINDER='{}'",
+        ownership.primary_remainder
+    );
+    println!("export CHRONOS_GENERATOR_OWNERSHIP_REMAINDERS='{remainders}'");
 }
 
 #[cfg(test)]
@@ -163,6 +298,57 @@ mod tests {
     fn parse_cli_command_rejects_unknown_arguments() {
         let error = parse_cli_command(vec!["--wat".to_string()]).unwrap_err();
         assert!(error.to_string().contains("chronos --help"));
+    }
+
+    #[test]
+    fn parse_cli_command_accepts_ownership_env_command() {
+        assert_eq!(
+            parse_cli_command(vec!["--print-ownership-env".to_string()]).unwrap(),
+            CliCommand::PrintOwnershipEnv
+        );
+    }
+
+    #[test]
+    fn ownership_env_assigns_every_shard_once() {
+        let mut seen = Vec::new();
+        for ordinal in 0..3 {
+            let env = ownership_env_for_ordinal(ordinal, 3, 8, 20_260_516).unwrap();
+            assert_eq!(env.primary_remainder, env.remainders[0]);
+            seen.extend(env.remainders);
+        }
+        seen.sort_unstable();
+        assert_eq!(seen, (0..8).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn ownership_env_matches_rollout_plan_hashing() {
+        assert_eq!(
+            ownership_env_for_ordinal(0, 3, 8, 20_260_516).unwrap(),
+            OwnershipEnv {
+                primary_remainder: 3,
+                remainders: vec![3, 7],
+            }
+        );
+        assert_eq!(
+            ownership_env_for_ordinal(1, 3, 8, 20_260_516).unwrap(),
+            OwnershipEnv {
+                primary_remainder: 2,
+                remainders: vec![2, 4, 6],
+            }
+        );
+        assert_eq!(
+            ownership_env_for_ordinal(2, 3, 8, 20_260_516).unwrap(),
+            OwnershipEnv {
+                primary_remainder: 0,
+                remainders: vec![0, 1, 5],
+            }
+        );
+    }
+
+    #[test]
+    fn ownership_env_rejects_out_of_range_ordinal() {
+        let error = ownership_env_for_ordinal(3, 3, 8, 0).unwrap_err();
+        assert!(error.to_string().contains("pod ordinal 3"));
     }
 
     #[test]

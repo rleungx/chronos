@@ -17,6 +17,7 @@ use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
 
 use crate::metadata::{ControlPlaneStore, GeneratorRecord};
+use crate::metrics;
 use crate::plane::RequestCancellation;
 use crate::planning::{generator_recovery_floor_tso, pick_owned_generator_by_hash};
 use crate::recovery::record_recovery_event;
@@ -112,6 +113,7 @@ impl GeneratorAdmissionTurnGuard {
         let mut fairness = lock_generator_fairness(&self.fairness);
         if fairness.active_timeline_key.as_deref() == Some(&self.timeline_key) {
             fairness.active_timeline_key = None;
+            metrics::TSO_GENERATOR_FAIRNESS_ACTIVE_TURNS.dec();
             drop(fairness);
             self.notifier.notify_waiters();
         }
@@ -158,6 +160,7 @@ impl Drop for GeneratorAdmissionWaiterGuard {
             .retain(|queued| queued.waiter_id != self.waiter_id);
         let removed = fairness.wait_queue.len() != original_len;
         if removed {
+            metrics::TSO_GENERATOR_FAIRNESS_WAITERS.dec();
             drop(fairness);
             if was_front {
                 self.notifier.notify_waiters();
@@ -211,6 +214,7 @@ fn queue_generator_waiter_if_needed(
             timeline_key: timeline_key.to_owned(),
             waiter_id,
         });
+    metrics::TSO_GENERATOR_FAIRNESS_WAITERS.inc();
     *waiter_guard = Some(GeneratorAdmissionWaiterGuard::new(
         fairness.clone(),
         notifier.clone(),
@@ -230,8 +234,11 @@ impl TsoService {
     }
 
     pub(super) fn owns_generator_id(&self, generator_id: u32) -> bool {
-        generator_id % self.config.generator_ownership_modulo
-            == self.config.generator_ownership_remainder
+        let remainder = generator_id % self.config.generator_ownership_modulo;
+        self.config
+            .effective_generator_ownership_remainders()
+            .into_iter()
+            .any(|owned_remainder| owned_remainder == remainder)
     }
 
     pub(super) fn is_local_endpoint(&self, owner_endpoint: &str) -> bool {
@@ -289,7 +296,9 @@ impl TsoService {
                                 .wait_queue
                                 .pop_front()
                                 .expect("front queue entry must exist");
+                            metrics::TSO_GENERATOR_FAIRNESS_WAITERS.dec();
                             fairness_state.active_timeline_key = Some(queued.timeline_key);
+                            metrics::TSO_GENERATOR_FAIRNESS_ACTIVE_TURNS.inc();
                             if let Some(waiter_guard) = waiter_guard.take() {
                                 waiter_guard.disarm();
                             }
@@ -310,6 +319,7 @@ impl TsoService {
                                 waiter_guard.disarm();
                             }
                             fairness_state.active_timeline_key = Some(timeline_key_owned.clone());
+                            metrics::TSO_GENERATOR_FAIRNESS_ACTIVE_TURNS.inc();
                             true
                         }
                     }

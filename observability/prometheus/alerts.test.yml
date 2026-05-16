@@ -18,10 +18,14 @@ tests:
         values: '0 0 0 0 0 0 1 1 1 1 1 1'
       - series: 'tso_watch_resync_total{job="chronos",event="watch_stream_error"}'
         values: '0 0 0 0 0 0 1 1 1 1 1 1'
+      - series: 'tso_metadata_retries_total{job="chronos",op="cas",reason="grpc_unavailable"}'
+        values: '0 0 0 0 0 1 1 1 1 1 1 1'
       - series: 'tso_shutdown_total{job="chronos",reason="identity_lease_lost"}'
         values: '0 0 0 0 0 0 1 1 1 1 1 1'
       - series: 'tso_startup_bootstrap_fail_total{job="chronos",stage="metadata"}'
         values: '0 0 0 0 0 0 0 0 0 1 1 1 1 1 1 1'
+      - series: 'tso_metrics_render_errors_total{job="chronos"}'
+        values: '0 0 0 0 0 0 1 1 1 1 1 1'
     alert_rule_test:
       - eval_time: 3m
         alertname: ChronosDown
@@ -82,6 +86,15 @@ tests:
             exp_annotations:
               summary: Chronos route watch restarted or resynced
               description: Route watch resync or reset events were recorded in the last 10 minutes.
+      - eval_time: 7m
+        alertname: ChronosMetadataRetries
+        exp_alerts:
+          - exp_labels:
+              alertname: ChronosMetadataRetries
+              severity: warning
+            exp_annotations:
+              summary: Chronos metadata operations are retrying
+              description: Metadata store operations needed retries in the last 5 minutes.
       - eval_time: 11m
         alertname: ChronosShutdownEvents
         exp_alerts:
@@ -100,3 +113,13 @@ tests:
             exp_annotations:
               summary: Chronos startup bootstrap failures detected
               description: Startup bootstrap failures were recorded in the last 15 minutes.
+      - eval_time: 11m
+        alertname: ChronosMetricsRenderFailures
+        exp_alerts:
+          - exp_labels:
+              alertname: ChronosMetricsRenderFailures
+              job: chronos
+              severity: warning
+            exp_annotations:
+              summary: Chronos metrics rendering failed
+              description: Prometheus metrics render failures were recorded in the last 10 minutes.
