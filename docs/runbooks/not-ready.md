@@ -7,8 +7,20 @@
 
 ## Immediate checks
 
-1. `curl http://<metrics-endpoint>/readyz`
-2. `curl http://<metrics-endpoint>/metrics | grep '^tso_worker_readiness_transitions_total'`
+1. Query the plain health listener used by the Kubernetes probe:
+
+   ```bash
+   curl http://<health-endpoint>/readyz
+   ```
+
+2. Query the production mTLS metrics listener with an authorized client certificate:
+
+   ```bash
+   curl --cacert <ca.pem> --cert <client.pem> --key <client.key> \
+     https://<metrics-endpoint>/metrics \
+     | grep '^tso_worker_readiness_transitions_total'
+   ```
+
 3. Inspect `chronos.log` for startup, lease-loss, or shutdown events.
 
 ## Common causes

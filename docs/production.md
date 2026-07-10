@@ -33,18 +33,18 @@ export CHRONOS_GENERATOR_OWNERSHIP_MODULO=2
 export CHRONOS_GENERATOR_OWNERSHIP_REMAINDER=1
 ```
 
-For `N` partitioned workers, set one shared `CHRONOS_OWNERSHIP_PLAN_ID` and
-`CHRONOS_GENERATOR_OWNERSHIP_MODULO=N` on every worker, then assign each worker a unique
-`CHRONOS_GENERATOR_OWNERSHIP_REMAINDER` in `[0, N)`. Startup records the plan in etcd and rejects
+For `N` partitioned workers, set one shared `CHRONOS_OWNERSHIP_PLAN_ID` and a stable virtual-shard
+count in `CHRONOS_GENERATOR_OWNERSHIP_MODULO` on every worker. Assign every virtual shard to one
+worker with `CHRONOS_GENERATOR_OWNERSHIP_REMAINDERS`; the supplied Kubernetes startup helper does
+this with rendezvous hashing over the StatefulSet ordinals. Startup records the plan in etcd and rejects
 mixed plan IDs, mixed modulo values, duplicate remainders, duplicate worker IDs, or duplicate
 advertise endpoints on the same etcd prefix. Clients and benchmarks must route allocation requests
 to the `owner_worker_endpoint` returned by the timeline route service.
 
-The Kubernetes manifest uses this static partitioning model directly: the StatefulSet runs three
-replicas with `CHRONOS_GENERATOR_OWNERSHIP_MODULO=3`, and each pod derives
-`CHRONOS_GENERATOR_OWNERSHIP_REMAINDER` from its StatefulSet ordinal. Do not attach a normal HPA to
-this StatefulSet. Changing replica count changes the ownership modulo and must be handled as a
-planned repartition with a new ownership plan ID, release evidence, and a rebalance/failover window.
+The Kubernetes manifest uses 256 stable virtual shards and three workers. Each pod derives its list
+of owned remainders from its StatefulSet ordinal, worker count, and assignment seed. Do not attach a
+normal HPA to this StatefulSet: changing worker count changes the rendezvous mapping and must use a
+new ownership plan ID and the quiesced migration below.
 
 Before changing worker count, generate an ownership movement plan:
 
@@ -52,9 +52,39 @@ Before changing worker count, generate an ownership movement plan:
 CHRONOS_OWNERSHIP_OLD_WORKERS=2 CHRONOS_OWNERSHIP_NEW_WORKERS=4 make scale-ownership-plan
 ```
 
-Treat a modulo change as a planned repartition, not an in-place toggle. Roll it with an explicit
-rebalance/failover window, verify route-owner distribution, and keep old and new ownership plans
-from running against the same etcd prefix unless the change is part of a controlled migration.
+Treat any worker-count, virtual-shard-count, assignment-seed, ownership-plan, or cluster-format
+change as a planned migration, not an in-place toggle. Old and new writers must never run
+concurrently against the same etcd prefix. Use this safe sequence:
+
+1. Quiesce allocation and control ingress and confirm clients have stopped creating work.
+2. Scale the StatefulSet to zero and wait at least
+   `CHRONOS_LEASE_TTL_MS + CHRONOS_SAFETY_GAP_MS`.
+3. While replicas remain zero, apply the new binary, cluster format, plan ID, worker count, shard
+   count, seed, and PDB.
+4. Scale to the desired replica count.
+5. Wait for every worker to become ready, then restore ingress and verify route-owner distribution.
+
+For Helm, the drain release uses `replicaCount=0` and an explicit nonzero
+`ownership.workerCount` because a zero-replica release cannot derive it. The chart permits topology
+or format updates only in that zero-replica release. The activation release sets the new
+`replicaCount` and returns `ownership.workerCount` to `0` (derive from replicas). The chart refuses
+all online plan/worker/shard/seed and cluster-format changes; there is no unsafe bypass. ConfigMap
+changes roll pods automatically; increment
+`security.tlsRevision` or `security.allowlistRevision` when rotating same-name external Secrets.
+
+Every identity lease declares `CURRENT_CLUSTER_FORMAT_VERSION`, and etcd stores the persistent
+`cluster/format_version` marker. Startup rejects legacy active identities or a different marker.
+Once a prefix is upgraded, never start an older binary against it; rollback requires a compatible
+binary or restoring a pre-upgrade etcd snapshot to a separate prefix.
+
+The `requests/` and `request_cleanup/` readers are temporary v1 idempotency-key compatibility,
+not permanent metadata APIs. Keep them until every worker uses v2, more time than the largest
+deployed `CHRONOS_REQUEST_RECORD_RETENTION_MS` plus one cleanup interval has elapsed, and etcd
+shows both legacy prefixes are empty. Remove that compatibility only in a later cluster-format
+version together with its migration tests.
+
+After activation, verify route-owner distribution and retain the migration plan with release
+evidence.
 During rebalance, route transfer control calls to the target owner and let that owner choose the
 target generator unless you have prevalidated the exact generator. This avoids unsafe shared
 generator jump-ahead and allows the owner to fall back to a dedicated generator when catch-up would
@@ -84,6 +114,7 @@ are absorbed without exposing allocation failures.
    export CHRONOS_MAX_TIMELINE_PROXY_LANES=8192
    export CHRONOS_MAX_TIMELINE_RUNTIME_ENTRIES=8192
    export CHRONOS_MAX_CONCURRENT_TIMELINE_LOADS=128
+   export CHRONOS_MAX_TIMELINE_RECORDS=100000
    ```
 
    Keep `CHRONOS_MAX_TIMELINE_PROXY_LANES` and
@@ -114,6 +145,35 @@ are absorbed without exposing allocation failures.
    a client-routable service address. `localhost`, `*.localhost`, loopback IPs, and wildcard
    addresses are accepted only for explicit `CHRONOS_SECURITY_MODE=dev-insecure` local validation.
 
+6. Certify and monitor the worker clock bound before enabling traffic:
+
+   ```bash
+   export CHRONOS_MAX_CLOCK_SKEW_MS=500
+   export CHRONOS_SAFETY_GAP_MS=500
+   ```
+
+   `CHRONOS_MAX_CLOCK_SKEW_MS` is the maximum pairwise wall-clock error your NTP/PTP monitoring
+   guarantees across workers. Chronos refuses etcd-backed startup when the safety gap is below that
+   bound. Alert externally before observed offset approaches the certified value; increasing the
+   value delays failover but preserves the lease handoff invariant. The chart defaults both values
+   to 500ms instead of assuming a generic Kubernetes cluster can hold 1ms skew.
+
+`CHRONOS_GRPC_MAX_CONCURRENT_REQUESTS` is enforced across the whole process and also per
+connection. Requests above the active limit are rejected with `RESOURCE_EXHAUSTED` instead of being
+queued indefinitely. `CHRONOS_GRPC_MAX_CONNECTIONS` bounds accepted gRPC connections, so opening
+additional HTTP/2 connections cannot create unbounded server tasks. The health and metrics
+listeners separately cap active connections and bound TLS handshake/HTTP connection lifetimes.
+
+Graceful shutdown flushes runtime floors and transfers with bounded concurrency for at most 90
+seconds. Keep Kubernetes `terminationGracePeriodSeconds` at 120 or higher so background-task drain
+and metadata shutdown retain a final 30-second margin; the Helm schema enforces this floor.
+
+The current wire encoding has a 40-bit millisecond physical field starting at
+`2026-01-01T00:00:00Z`; its last encodable instant is `2060-11-03T19:53:47.775Z`. Monitor
+`tso_capacity_remaining_seconds`. The bundled alert fires with five years remaining so a versioned
+encoding and mixed-version migration can be designed, load-tested, and deployed well before the
+horizon; Chronos fails closed with `TSO overflow` after the boundary.
+
 ## Health and readiness
 
 - `/healthz` indicates process liveness.
@@ -125,18 +185,15 @@ are absorbed without exposing allocation failures.
 
 ## Required validation before release
 
-Run the full release gate in order:
+Run the full release gate:
 
 ```bash
 make release-gate
 ```
 
-`make release-check` covers clippy, layer-0/2/3 validation, observability checks, dependency
-policy, release-shape validation, container delivery checks, and release builds. `make
-release-gate` adds release packaging, build metadata, SBOM/hash checks, container vulnerability scanning,
-clustered layer-4 validation, and the long-running etcd-backed soak, chaos, failover, production
-scale matrix, rebalance, and restore validation bundle. The local gate writes retained evidence to
-`artifacts/release-gate` by default and verifies the evidence bundle before returning success.
+The authoritative command composition, promotion criteria, and retained-evidence requirements are
+documented in [`docs/release.md`](release.md). Keep the operational artifact and benchmark guidance
+below with the production deployment; do not duplicate the gate command list here.
 
 ## Interpreting retained artifacts
 
@@ -259,7 +316,9 @@ workers, so production capacity claims should come from isolated benchmark clien
 defaults to two workers; use `CHRONOS_SCALE_WORKERS=N` to run the same harness for one size, or
 `make test-scale-matrix` with `CHRONOS_SCALE_MATRIX_WORKERS=2,3,5,8` for a multi-size local matrix.
 Use `make test-scale-matrix-production` for the stricter production-style linearity gate once the
-benchmark clients are isolated from Chronos workers. Keep the generated `scale-matrix/summary.txt`
+benchmark clients are isolated from Chronos workers. The production target fixes the matrix at
+2/3/5/8 workers, requires at least 80% linear efficiency, and does not accept the single-host
+plateau escape hatch. Keep the generated `scale-matrix/summary.txt`
 with release evidence; it includes per-worker linear efficiency and the minimum expected
 throughput at the configured efficiency floor. Evidence verification also rechecks that each matrix
 entry contains throughput, linear-efficiency, zero-allocation-failure metrics, and profile p95/p99
@@ -274,9 +333,10 @@ For Kubernetes scale changes, generate a planned ownership transition first:
 make kubernetes-scale-plan CHRONOS_OWNERSHIP_OLD_WORKERS=3 CHRONOS_OWNERSHIP_NEW_WORKERS=5
 ```
 
-Apply the generated ownership plan ID, StatefulSet replica count, ConfigMap modulo, and PDB
-`minAvailable=replicas-1` together. The manifest validator rejects mismatched replicas/modulo/PDB
-because a generic or partial scale change can create overlapping generator ownership.
+Follow the generated drain and activation phases exactly. Do not apply a new worker count while old
+pods are alive. The activation phase applies the plan ID, StatefulSet replica count, ConfigMap shard
+mapping, and PDB `minAvailable=replicas-1` together. The manifest validator rejects mismatched
+replicas/worker-count/PDB values, and Helm blocks an in-place worker-count change.
 
 You still need environment evidence for clustered etcd quorum behavior, backup/restore drills,
 larger worker counts, staged rollout safety, and production alert threshold tuning.

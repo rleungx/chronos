@@ -2,6 +2,8 @@
 mod common_etcd_endpoints;
 #[path = "common/etcd_prefix.rs"]
 mod common_etcd_prefix;
+#[path = "common/etcd_store.rs"]
+mod common_etcd_store;
 
 use chronos::{
     metadata::{
@@ -10,8 +12,8 @@ use chronos::{
     },
     ResourceTier, TimelineLifecycleState, TimelineRoute, TsoError,
 };
-use common_etcd_endpoints::test_etcd_endpoints;
 use common_etcd_prefix::unique_test_etcd_prefix;
+use common_etcd_store::test_etcd_store;
 use std::sync::Arc;
 use tokio::sync::Barrier;
 
@@ -61,14 +63,7 @@ fn generator_record(
 }
 
 async fn real_etcd_store(label: &str) -> Arc<EtcdMetadataStore> {
-    Arc::new(
-        EtcdMetadataStore::from_raw_endpoints_unchecked(
-            test_etcd_endpoints(),
-            unique_test_etcd_prefix(label),
-        )
-        .await
-        .expect("etcd store should start"),
-    )
+    Arc::new(test_etcd_store(unique_test_etcd_prefix(label)).await)
 }
 
 async fn assert_metadata_cas_semantics<S>(store: Arc<S>, timeline_key: &str)

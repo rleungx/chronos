@@ -294,6 +294,68 @@ impl TimelineAuthority for EtcdMetadataStore {
             .await
     }
 
+    async fn create_timeline_with_limit(
+        &self,
+        timeline_key: &str,
+        record: &TimelineRecord,
+        max_timelines: usize,
+    ) -> Result<u64, TsoError> {
+        record.validate_schema_version()?;
+        let stamped = record.stamped_for_persistence();
+        let lock_key = self.timeline_creation_lock_key();
+
+        for _ in 0..TIMELINE_CREATION_LOCK_RETRY_ATTEMPTS {
+            let Some(lock) = self
+                .try_acquire_lease_lock(
+                    lock_key.clone(),
+                    TIMELINE_CREATION_LOCK_TTL_SECS,
+                    Vec::new(),
+                    "timeline_creation_lock",
+                )
+                .await?
+            else {
+                sleep(Duration::from_millis(10)).await;
+                continue;
+            };
+
+            let result = async {
+                if self.load_timeline_route(timeline_key).await?.is_some() {
+                    return Err(TsoError::MetadataAlreadyExists);
+                }
+
+                let count = self
+                    .etcd_get(
+                        "timeline_count",
+                        self.route_prefix(),
+                        Some(GetOptions::new().with_prefix().with_count_only()),
+                    )
+                    .await
+                    .map(|response| response.count() as usize)
+                    .map_err(|error| {
+                        TsoError::Internal(format!("Etcd timeline count query failed: {error}"))
+                    })?;
+                if count >= max_timelines {
+                    return Err(TsoError::TimelineLimitReached { max: max_timelines });
+                }
+
+                self.create_timeline_with_indexes_fenced(timeline_key, &stamped, &lock)
+                    .await
+            }
+            .await;
+            self.release_lease_lock(lock, "timeline_creation_lock")
+                .await;
+            if matches!(result, Err(TsoError::CasFailed)) {
+                sleep(Duration::from_millis(10)).await;
+                continue;
+            }
+            return result;
+        }
+
+        Err(TsoError::Internal(
+            "timed out acquiring distributed timeline creation lock".into(),
+        ))
+    }
+
     async fn compare_exchange_timeline(
         &self,
         timeline_key: &str,

@@ -9,6 +9,7 @@ source "${REPO_ROOT}/hack/lib/common.sh"
 cd "${REPO_ROOT}"
 
 matrix_workers="${CHRONOS_SCALE_MATRIX_WORKERS:-2,3}"
+matrix_profile="${CHRONOS_SCALE_MATRIX_PROFILE:-smoke}"
 matrix_efficiency_min="${CHRONOS_SCALE_MATRIX_LINEAR_EFFICIENCY_MIN:-0.55}"
 matrix_allow_single_host_plateau="${CHRONOS_SCALE_MATRIX_ALLOW_SINGLE_HOST_PLATEAU:-false}"
 matrix_single_host_plateau_min="${CHRONOS_SCALE_MATRIX_SINGLE_HOST_PLATEAU_MIN:-0.95}"
@@ -46,6 +47,7 @@ RESULT="failure"
 write_summary() {
   cat >"${summary_log}" <<EOF
 result=${RESULT}
+profile=${matrix_profile}
 worker_counts=${matrix_workers}
 linear_efficiency_min=${matrix_efficiency_min}
 allow_single_host_plateau=${matrix_allow_single_host_plateau}

@@ -21,7 +21,7 @@ use chronos::rpc::{
     TsoTimestampService,
 };
 use chronos::{ManualClock, SystemClock, TsoError};
-use futures::FutureExt;
+use futures::{FutureExt, StreamExt};
 use http_body_util::Empty;
 use std::env;
 use std::net::SocketAddr;
@@ -82,7 +82,7 @@ fn explicit_required_config() -> TsoConfig {
     let fixture = shared_test_tls_fixture();
     TsoConfig {
         security_mode: Some(TsoSecurityMode::Required),
-        safety_gap_ms: 1,
+        safety_gap_ms: 500,
         grpc_tls_cert_file: Some(fixture.server_cert_path.clone()),
         grpc_tls_key_file: Some(fixture.server_key_path.clone()),
         grpc_client_ca_file: Some(fixture.ca_cert_path.clone()),

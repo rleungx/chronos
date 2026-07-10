@@ -1,6 +1,8 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
+use std::{io, pin::Pin};
 
 use futures::stream;
 use http_body_util::Full;
@@ -14,11 +16,15 @@ use prometheus::{Encoder, TextEncoder};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::WebPkiClientVerifier;
 use rustls::{RootCertStore, ServerConfig};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::watch;
+use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
+use tonic::transport::server::{Connected, TcpConnectInfo};
 use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
+use tower::layer::util::{Identity as TowerIdentity, Stack};
+use tower::limit::ConcurrencyLimitLayer;
 use tracing::warn;
 
 use chronos::tls as shared_tls;
@@ -27,6 +33,56 @@ use chronos::{metrics, TsoConfig};
 use crate::AppResult;
 
 type MetricsResponseBody = Full<Bytes>;
+type GrpcServer = Server<Stack<ConcurrencyLimitLayer, TowerIdentity>>;
+
+const DEFAULT_GLOBAL_GRPC_CONCURRENCY_LIMIT: usize = 1024;
+const AUXILIARY_LISTENER_MAX_CONNECTIONS: usize = 128;
+const AUXILIARY_TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+const AUXILIARY_HTTP_CONNECTION_TIMEOUT: Duration = Duration::from_secs(15);
+
+pub(crate) struct ConnectionLimitedTcpStream {
+    stream: TcpStream,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl AsyncRead for ConnectionLimitedTcpStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stream).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for ConnectionLimitedTcpStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, io::Error>> {
+        Pin::new(&mut self.stream).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+        Pin::new(&mut self.stream).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), io::Error>> {
+        Pin::new(&mut self.stream).poll_shutdown(cx)
+    }
+}
+
+impl Connected for ConnectionLimitedTcpStream {
+    type ConnectInfo = TcpConnectInfo;
+
+    fn connect_info(&self) -> Self::ConnectInfo {
+        Connected::connect_info(&self.stream)
+    }
+}
 
 fn plain_text_response(
     status: StatusCode,
@@ -62,6 +118,7 @@ pub(crate) async fn metrics_handler<B>(
         "/healthz" | "/readyz" => health_handler(req, ready).await,
         "/metrics" => {
             let started = Instant::now();
+            metrics::refresh_tso_capacity_remaining_metric();
             let encoder = TextEncoder::new();
             let metric_families = prometheus::gather();
             let mut buffer = Vec::new();
@@ -137,6 +194,7 @@ pub(crate) async fn serve_metrics_listener(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut shutdown = Box::pin(wait_for_shutdown_signal(shutdown_rx));
     let mut connections = JoinSet::new();
+    let connection_limiter = Arc::new(Semaphore::new(AUXILIARY_LISTENER_MAX_CONNECTIONS));
     let listen_addr = listener_addr_label(listener.local_addr().ok());
 
     loop {
@@ -147,26 +205,59 @@ pub(crate) async fn serve_metrics_listener(
                 let ready = ready.clone();
                 let tls_acceptor = tls_acceptor.clone();
                 let listen_addr = listen_addr.clone();
+                let permit = match connection_limiter.clone().try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        warn!(
+                            component = "startup",
+                            event = "listener_connection_rejected",
+                            result = "degraded",
+                            reason = "connection_limit",
+                            transport = "metrics",
+                            listen_addr = %listen_addr
+                        );
+                        continue;
+                    }
+                };
                 connections.spawn(async move {
+                    let _permit = permit;
                     let service = service_fn(move |req| metrics_handler(req, ready.clone()));
                     if let Some(tls_acceptor) = tls_acceptor {
-                        match tls_acceptor.accept(stream).await {
-                            Ok(tls_stream) => {
-                                if let Err(error) = http1::Builder::new()
-                                    .serve_connection(TokioIo::new(tls_stream), service)
-                                    .await
+                        match tokio::time::timeout(
+                            AUXILIARY_TLS_HANDSHAKE_TIMEOUT,
+                            tls_acceptor.accept(stream),
+                        )
+                        .await
+                        {
+                            Ok(Ok(tls_stream)) => {
+                                match tokio::time::timeout(
+                                    AUXILIARY_HTTP_CONNECTION_TIMEOUT,
+                                    http1::Builder::new()
+                                        .keep_alive(false)
+                                        .serve_connection(TokioIo::new(tls_stream), service),
+                                )
+                                .await
                                 {
-                                    warn!(
+                                    Ok(Ok(())) => {}
+                                    Ok(Err(error)) => warn!(
                                         component = "startup",
                                         event = "listener_connection_error",
                                         result = "degraded",
                                         reason = %error,
                                         transport = "mtls",
                                         listen_addr = %listen_addr
-                                    );
+                                    ),
+                                    Err(error) => warn!(
+                                        component = "startup",
+                                        event = "listener_connection_timeout",
+                                        result = "degraded",
+                                        reason = %error,
+                                        transport = "mtls",
+                                        listen_addr = %listen_addr
+                                    ),
                                 }
                             }
-                            Err(error) => {
+                            Ok(Err(error)) => {
                                 warn!(
                                     component = "startup",
                                     event = "listener_connection_error",
@@ -175,18 +266,42 @@ pub(crate) async fn serve_metrics_listener(
                                     transport = "mtls"
                                 );
                             }
+                            Err(error) => warn!(
+                                component = "startup",
+                                event = "listener_handshake_timeout",
+                                result = "degraded",
+                                reason = %error,
+                                transport = "mtls",
+                                listen_addr = %listen_addr
+                            ),
                         }
-                    } else if let Err(error) = http1::Builder::new()
-                        .serve_connection(TokioIo::new(stream), service)
+                    } else {
+                        match tokio::time::timeout(
+                            AUXILIARY_HTTP_CONNECTION_TIMEOUT,
+                            http1::Builder::new()
+                                .keep_alive(false)
+                                .serve_connection(TokioIo::new(stream), service),
+                        )
                         .await
-                    {
-                        warn!(
-                            component = "startup",
-                            event = "listener_connection_error",
-                            result = "degraded",
-                            reason = %error,
-                            transport = "plain"
-                        );
+                        {
+                            Ok(Ok(())) => {}
+                            Ok(Err(error)) => warn!(
+                                component = "startup",
+                                event = "listener_connection_error",
+                                result = "degraded",
+                                reason = %error,
+                                transport = "plain",
+                                listen_addr = %listen_addr
+                            ),
+                            Err(error) => warn!(
+                                component = "startup",
+                                event = "listener_connection_timeout",
+                                result = "degraded",
+                                reason = %error,
+                                transport = "plain",
+                                listen_addr = %listen_addr
+                            ),
+                        }
                     }
                 });
             }
@@ -227,6 +342,7 @@ pub(crate) async fn serve_health_listener(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut shutdown = Box::pin(wait_for_shutdown_signal(shutdown_rx));
     let mut connections = JoinSet::new();
+    let connection_limiter = Arc::new(Semaphore::new(AUXILIARY_LISTENER_MAX_CONNECTIONS));
     let listen_addr = listener_addr_label(listener.local_addr().ok());
 
     loop {
@@ -236,20 +352,48 @@ pub(crate) async fn serve_health_listener(
                 let (stream, _) = accept_result?;
                 let ready = ready.clone();
                 let listen_addr = listen_addr.clone();
-                connections.spawn(async move {
-                    let service = service_fn(move |req| health_handler(req, ready.clone()));
-                    if let Err(error) = http1::Builder::new()
-                        .serve_connection(TokioIo::new(stream), service)
-                        .await
-                    {
+                let permit = match connection_limiter.clone().try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(_) => {
                         warn!(
+                            component = "startup",
+                            event = "listener_connection_rejected",
+                            result = "degraded",
+                            reason = "connection_limit",
+                            transport = "health",
+                            listen_addr = %listen_addr
+                        );
+                        continue;
+                    }
+                };
+                connections.spawn(async move {
+                    let _permit = permit;
+                    let service = service_fn(move |req| health_handler(req, ready.clone()));
+                    match tokio::time::timeout(
+                        AUXILIARY_HTTP_CONNECTION_TIMEOUT,
+                        http1::Builder::new()
+                            .keep_alive(false)
+                            .serve_connection(TokioIo::new(stream), service),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => warn!(
                             component = "startup",
                             event = "listener_connection_error",
                             result = "degraded",
                             reason = %error,
                             transport = "health",
                             listen_addr = %listen_addr
-                        );
+                        ),
+                        Err(error) => warn!(
+                            component = "startup",
+                            event = "listener_connection_timeout",
+                            result = "degraded",
+                            reason = %error,
+                            transport = "health",
+                            listen_addr = %listen_addr
+                        ),
                     }
                 });
             }
@@ -299,12 +443,25 @@ pub(crate) async fn bind_grpc_listener(config: &TsoConfig) -> AppResult<TcpListe
     Ok(TcpListener::bind(addr).await?)
 }
 
-pub(crate) fn grpc_listener_stream(
+pub(crate) fn grpc_listener_stream_with_limit(
     listener: TcpListener,
-) -> impl futures::Stream<Item = Result<TcpStream, std::io::Error>> {
-    stream::try_unfold(listener, |listener| async move {
+    max_connections: usize,
+) -> impl futures::Stream<Item = Result<ConnectionLimitedTcpStream, std::io::Error>> {
+    let limiter = Arc::new(Semaphore::new(max_connections));
+    stream::try_unfold((listener, limiter), |(listener, limiter)| async move {
+        let permit = limiter
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| io::Error::other("gRPC connection limiter closed"))?;
         let (stream, _) = listener.accept().await?;
-        Ok(Some((stream, listener)))
+        Ok(Some((
+            ConnectionLimitedTcpStream {
+                stream,
+                _permit: permit,
+            },
+            (listener, limiter),
+        )))
     })
 }
 
@@ -367,14 +524,20 @@ pub(crate) fn load_metrics_tls_acceptor(config: &TsoConfig) -> AppResult<Option<
     Ok(Some(TlsAcceptor::from(Arc::new(tls_config))))
 }
 
-pub(crate) fn build_grpc_server(config: &TsoConfig) -> AppResult<Server> {
-    let mut builder = Server::builder();
+pub(crate) fn build_grpc_server(config: &TsoConfig) -> AppResult<GrpcServer> {
+    let global_limit = config
+        .grpc_max_concurrent_requests
+        .unwrap_or(DEFAULT_GLOBAL_GRPC_CONCURRENCY_LIMIT);
+    let mut builder = Server::builder()
+        .layer(ConcurrencyLimitLayer::new(global_limit))
+        .load_shed(true);
 
     if let Some(timeout_ms) = config.grpc_request_timeout_ms {
         builder = builder.timeout(Duration::from_millis(timeout_ms));
     }
 
     if let Some(limit) = config.grpc_max_concurrent_requests {
+        // Keep a per-connection bound as a fairness guard in addition to the global Tower limit.
         builder = builder.concurrency_limit_per_connection(limit);
     }
 

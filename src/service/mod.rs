@@ -5,6 +5,7 @@ mod facade;
 mod lease;
 mod runtime_coordination;
 mod transfer;
+mod validation;
 mod worker_readiness;
 
 use std::cmp::max;

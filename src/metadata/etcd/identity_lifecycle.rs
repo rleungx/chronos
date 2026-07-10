@@ -83,9 +83,9 @@ impl EtcdMetadataStore {
         })
     }
 
-    async fn active_identity_member_counts(
+    pub(in crate::metadata::etcd) async fn active_identity_records(
         &self,
-    ) -> Result<HashMap<(String, String), usize>, TsoError> {
+    ) -> Result<Vec<InstanceIdentityLeaseRecord>, TsoError> {
         let prefix = self.instance_identity_prefix();
         let response = self
             .etcd_get(
@@ -101,7 +101,7 @@ impl EtcdMetadataStore {
                 TsoError::Internal(format!("Etcd list_identity_leases failed: {}", error))
             })?;
 
-        let mut counts = HashMap::new();
+        let mut records = Vec::new();
         for kv in response.kvs() {
             if kv.lease() == 0 {
                 continue;
@@ -116,11 +116,9 @@ impl EtcdMetadataStore {
                         error
                     ))
                 })?;
-            *counts
-                .entry((record.worker_id, record.advertise_endpoint))
-                .or_default() += 1;
+            records.push(record);
         }
-        Ok(counts)
+        Ok(records)
     }
 
     pub async fn admit_ownership_plan_member(&self, config: &TsoConfig) -> Result<(), TsoError> {
@@ -144,14 +142,35 @@ impl EtcdMetadataStore {
 
         for _attempt in 0..8 {
             let now_ms = Self::ownership_plan_timestamp_ms();
-            let active_member_counts = self.active_identity_member_counts().await?;
-            if active_member_counts.get(&member_key).copied().unwrap_or(0) > 1 {
+            let active_identities = self.active_identity_records().await?;
+            let active_member_count = active_identities
+                .iter()
+                .filter(|identity| {
+                    identity.worker_id == member_key.0
+                        && identity.advertise_endpoint == member_key.1
+                })
+                .count();
+            if active_member_count > 1 {
                 return Err(TsoError::Internal(format!(
                     "ownership plan worker_id={} advertise_endpoint={} has multiple active identity leases",
                     config.worker_id, config.advertise_endpoint
                 )));
             }
-            let active_members = active_member_counts.keys().cloned().collect::<HashSet<_>>();
+            let identity_declares_expected_plan = active_identities.iter().any(|identity| {
+                identity.worker_id == member_key.0
+                    && identity.advertise_endpoint == member_key.1
+                    && identity.ownership_plan_id == expected_plan_id
+                    && identity.ownership_modulo == expected_modulo
+            });
+            if !identity_declares_expected_plan {
+                return Err(TsoError::Internal(format!(
+                    "active identity for worker_id={} advertise_endpoint={} does not declare ownership plan_id={} modulo={}",
+                    config.worker_id,
+                    config.advertise_endpoint,
+                    expected_plan_id,
+                    expected_modulo
+                )));
+            }
             match self
                 .get_json_record::<OwnershipPlanRecord>(
                     key.clone(),
@@ -161,6 +180,22 @@ impl EtcdMetadataStore {
                 .await?
             {
                 Some((mut record, revision)) => {
+                    let active_members = active_identities
+                        .iter()
+                        .filter(|identity| {
+                            identity_record_belongs_to_ownership_plan(
+                                identity,
+                                &record.plan_id,
+                                record.modulo,
+                            )
+                        })
+                        .map(|identity| {
+                            (
+                                identity.worker_id.clone(),
+                                identity.advertise_endpoint.clone(),
+                            )
+                        })
+                        .collect::<HashSet<_>>();
                     let pruned = record.prune_inactive_members(&active_members, now_ms)?;
                     if pruned > 0 {
                         info!(
@@ -172,6 +207,18 @@ impl EtcdMetadataStore {
                             ownership_plan_id = %expected_plan_id
                         );
                     }
+                    let replaced =
+                        record.replace_if_empty(expected_plan_id, expected_modulo, now_ms)?;
+                    if replaced {
+                        info!(
+                            component = "metadata",
+                            event = "ownership_plan_replaced",
+                            result = "success",
+                            reason = "all_previous_members_inactive",
+                            ownership_plan_id = %expected_plan_id,
+                            ownership_modulo = expected_modulo
+                        );
+                    }
                     let mut admitted = false;
                     for member in &members {
                         admitted |= record.admit_member(
@@ -181,7 +228,7 @@ impl EtcdMetadataStore {
                             now_ms,
                         )?;
                     }
-                    if pruned == 0 && !admitted {
+                    if pruned == 0 && !replaced && !admitted {
                         return Ok(());
                     }
                     match self
@@ -250,6 +297,8 @@ impl EtcdMetadataStore {
         instance_id: &str,
         worker_id: &str,
         advertise_endpoint: &str,
+        ownership_plan_id: &str,
+        ownership_modulo: u32,
         ttl: Duration,
     ) -> Result<InstanceIdentityLease, TsoError> {
         info!(
@@ -267,6 +316,9 @@ impl EtcdMetadataStore {
             instance_id: instance_id.to_owned(),
             worker_id: worker_id.to_owned(),
             advertise_endpoint: advertise_endpoint.to_owned(),
+            ownership_plan_id: ownership_plan_id.to_owned(),
+            ownership_modulo,
+            cluster_format_version: CURRENT_CLUSTER_FORMAT_VERSION,
         };
 
         let revoke_client = self.client.clone();
@@ -405,6 +457,8 @@ impl EtcdMetadataStore {
         instance_id: &str,
         worker_id: &str,
         advertise_endpoint: &str,
+        ownership_plan_id: &str,
+        ownership_modulo: u32,
     ) -> Result<(), TsoError> {
         let key = self.instance_identity_key(instance_id);
         let response = self
@@ -440,13 +494,19 @@ impl EtcdMetadataStore {
             )));
         }
 
+        let expected_record = InstanceIdentityLeaseRecord {
+            instance_id: instance_id.to_owned(),
+            worker_id: worker_id.to_owned(),
+            advertise_endpoint: advertise_endpoint.to_owned(),
+            ownership_plan_id: ownership_plan_id.to_owned(),
+            ownership_modulo,
+            cluster_format_version: CURRENT_CLUSTER_FORMAT_VERSION,
+        };
         verify_instance_identity_lease_record(
             expected_lease_id,
             kv.lease(),
             kv.value(),
-            instance_id,
-            worker_id,
-            advertise_endpoint,
+            &expected_record,
         )
         .inspect_err(|error| {
             let label = match error.to_string().contains("decode failed") {

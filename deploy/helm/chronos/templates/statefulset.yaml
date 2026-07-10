@@ -20,9 +20,13 @@ spec:
     metadata:
       labels:
         {{- include "chronos.selectorLabels" . | nindent 8 }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        chronos.io/tls-revision: {{ .Values.security.tlsRevision | quote }}
+        chronos.io/allowlist-revision: {{ .Values.security.allowlistRevision | quote }}
     spec:
       serviceAccountName: {{ include "chronos.serviceAccountName" . }}
-      terminationGracePeriodSeconds: 30
+      terminationGracePeriodSeconds: {{ .Values.runtime.terminationGracePeriodSeconds }}
       securityContext:
         runAsNonRoot: true
         runAsUser: 10001

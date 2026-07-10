@@ -202,18 +202,18 @@ Client::Client(
 }
 
 std::vector<chronos::tso::v1::TimestampRange> Client::AllocateTimestamps(uint32_t count) {
-  auto route = EnsureRoute();
-  std::shared_ptr<TimestampService::Stub> tso_stub;
-  {
-    std::lock_guard<std::mutex> lock(mu_);
-    tso_stub = tso_stub_;
-  }
+  auto snapshot = EnsureRoute();
   AllocateTimestampsResponse response;
-  const auto client_request_id = NextClientRequestId(route.timeline_key());
+  const auto client_request_id = NextClientRequestId();
   uint32_t stale_retries = 0;
 
   while (true) {
-    auto status = AllocateOnce(*tso_stub, route, &response, count, client_request_id);
+    auto status = AllocateOnce(
+        *snapshot->tso_stub,
+        snapshot->route,
+        &response,
+        count,
+        client_request_id);
     if (status.ok()) {
       return {response.ranges().begin(), response.ranges().end()};
     }
@@ -224,22 +224,21 @@ std::vector<chronos::tso::v1::TimestampRange> Client::AllocateTimestamps(uint32_
     ++stale_retries;
     {
       std::lock_guard<std::mutex> lock(mu_);
-      route = RefreshRouteIfUnchangedLocked(route);
-      tso_stub = tso_stub_;
+      snapshot = RefreshRouteIfUnchangedLocked(snapshot);
     }
     SleepBeforeStaleRouteRetry();
     response.Clear();
   }
 }
 
-TimelineRoute Client::EnsureRoute() {
+std::shared_ptr<const Client::RouteSnapshot> Client::EnsureRoute() {
   std::lock_guard<std::mutex> lock(mu_);
   return EnsureRouteLocked();
 }
 
-TimelineRoute Client::EnsureRouteLocked() {
-  if (has_route_) {
-    return route_;
+std::shared_ptr<const Client::RouteSnapshot> Client::EnsureRouteLocked() {
+  if (route_snapshot_ != nullptr) {
+    return route_snapshot_;
   }
   grpc::ClientContext ctx;
   ApplyRequestDeadline(&ctx);
@@ -261,14 +260,16 @@ TimelineRoute Client::EnsureRouteLocked() {
   return InstallRouteLocked(response.route());
 }
 
-TimelineRoute Client::RefreshRouteIfUnchangedLocked(const TimelineRoute& observed_route) {
-  if (has_route_ && !SameRouteIdentity(route_, observed_route)) {
-    return route_;
+std::shared_ptr<const Client::RouteSnapshot> Client::RefreshRouteIfUnchangedLocked(
+    const std::shared_ptr<const RouteSnapshot>& observed) {
+  if (route_snapshot_ != nullptr &&
+      !SameRouteIdentity(route_snapshot_->route, observed->route)) {
+    return route_snapshot_;
   }
   return RefreshRouteLocked();
 }
 
-TimelineRoute Client::RefreshRouteLocked() {
+std::shared_ptr<const Client::RouteSnapshot> Client::RefreshRouteLocked() {
   grpc::ClientContext ctx;
   ApplyRequestDeadline(&ctx);
   GetTimelineRouteRequest request;
@@ -289,22 +290,34 @@ TimelineRoute Client::RefreshRouteLocked() {
   return InstallRouteLocked(route);
 }
 
-TimelineRoute Client::InstallRouteLocked(const TimelineRoute& route) {
-  if (has_route_ &&
-      route.owner_worker_endpoint() == route_.owner_worker_endpoint() &&
-      tso_stub_ != nullptr) {
-    route_ = route;
-    return route_;
+std::shared_ptr<const Client::RouteSnapshot> Client::InstallRouteLocked(
+    const TimelineRoute& route) {
+  if (route_snapshot_ != nullptr &&
+      route.owner_worker_endpoint() ==
+          route_snapshot_->route.owner_worker_endpoint()) {
+    auto next = std::make_shared<RouteSnapshot>(RouteSnapshot{
+        route,
+        route_snapshot_->owner_channel,
+        route_snapshot_->tso_stub,
+    });
+    route_snapshot_ = next;
+    return next;
   }
 
-  auto previous_channel = tso_channel_;
-  tso_channel_ = CreateChannel(route.owner_worker_endpoint());
-  tso_stub_ = std::shared_ptr<TimestampService::Stub>(
-      TimestampService::NewStub(tso_channel_).release());
-  route_ = route;
-  has_route_ = true;
+  auto previous_channel = route_snapshot_ == nullptr
+      ? nullptr
+      : route_snapshot_->owner_channel;
+  auto owner_channel = CreateChannel(route.owner_worker_endpoint());
+  auto tso_stub = std::shared_ptr<TimestampService::Stub>(
+      TimestampService::NewStub(owner_channel).release());
+  auto next = std::make_shared<RouteSnapshot>(RouteSnapshot{
+      route,
+      std::move(owner_channel),
+      std::move(tso_stub),
+  });
+  route_snapshot_ = next;
   RetainStaleOwnerChannelLocked(std::move(previous_channel));
-  return route;
+  return next;
 }
 
 void Client::SleepBeforeStaleRouteRetry() const {
@@ -351,11 +364,11 @@ void Client::RetainStaleOwnerChannelLocked(std::shared_ptr<grpc::Channel> previo
   }
 }
 
-std::string Client::NextClientRequestId(const std::string& timeline_key) {
+std::string Client::NextClientRequestId() {
   if (!config_.idempotency_enabled) {
     return "";
   }
-  return timeline_key + "-" + idempotency_scope_ + "-" + std::to_string(request_id_++);
+  return idempotency_scope_ + "-" + std::to_string(request_id_++);
 }
 
 bool Client::SameRouteIdentity(

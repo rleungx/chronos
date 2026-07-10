@@ -129,6 +129,12 @@ pub(super) struct InstanceIdentityLeaseRecord {
     pub(super) instance_id: String,
     pub(super) worker_id: String,
     pub(super) advertise_endpoint: String,
+    #[serde(default)]
+    pub(super) ownership_plan_id: String,
+    #[serde(default)]
+    pub(super) ownership_modulo: u32,
+    #[serde(default)]
+    pub(super) cluster_format_version: u32,
 }
 
 #[cfg(test)]

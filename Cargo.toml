@@ -40,6 +40,7 @@ tokio-rustls = "0.26.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 sha2 = "0.10"
+tower = { version = "0.5", features = ["limit"] }
 
 [build-dependencies]
 tonic-build = "0.14.5"

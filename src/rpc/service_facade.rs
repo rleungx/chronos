@@ -158,7 +158,8 @@ mod tests {
         GetTimelineStatusRequest, ListTimelineStatusesRequest, ResourceTier as ProtoResourceTier,
     };
     use crate::{
-        ManualClock, ResourceTier, TimelineLifecycleState, TimelineRoute, TsoConfig, TsoService,
+        ManualClock, ResourceTier, TimelineLifecycleState, TimelineRoute, TsoConfig,
+        TsoSecurityMode, TsoService,
     };
 
     fn required_test_config(config: TsoConfig) -> TsoConfig {
@@ -183,6 +184,25 @@ mod tests {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
+        )
+    }
+
+    async fn real_etcd_store(label: &str) -> Arc<EtcdMetadataStore> {
+        let endpoints = test_etcd_endpoints();
+        let config = TsoConfig {
+            metadata_kind: "etcd".into(),
+            etcd_endpoints: endpoints,
+            security_mode: Some(TsoSecurityMode::DevInsecure),
+            worker_id: "rpc-etcd-store".into(),
+            advertise_endpoint: "127.0.0.1:50051".into(),
+            safety_gap_ms: 500,
+            max_clock_skew_ms: 500,
+            ..TsoConfig::default()
+        };
+        Arc::new(
+            EtcdMetadataStore::from_config(&config, unique_test_etcd_prefix(label))
+                .await
+                .expect("etcd store should start"),
         )
     }
 
@@ -568,12 +588,7 @@ mod tests {
     #[ignore]
     async fn etcd_list_timeline_statuses_supports_authoritative_inventory_scan() {
         let clock = Arc::new(ManualClock::new(800));
-        let prefix = unique_test_etcd_prefix("list-timeline-statuses");
-        let metadata = Arc::new(
-            EtcdMetadataStore::from_raw_endpoints_unchecked(test_etcd_endpoints(), prefix)
-                .await
-                .unwrap(),
-        );
+        let metadata = real_etcd_store("list-timeline-statuses").await;
         let service = TsoService::new(
             required_test_config(TsoConfig::default()),
             clock,

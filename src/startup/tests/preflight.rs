@@ -159,6 +159,25 @@ fn startup_preflight_requires_nonzero_safety_gap_for_etcd_metadata() {
 }
 
 #[test]
+fn startup_preflight_requires_safety_gap_to_cover_certified_clock_skew() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    clear_tso_env();
+    let config = TsoConfig {
+        metadata_kind: "etcd".into(),
+        etcd_endpoints: vec!["127.0.0.1:2379".into()],
+        worker_id: "worker-a".into(),
+        advertise_endpoint: "10.0.0.10:50051".into(),
+        safety_gap_ms: 499,
+        max_clock_skew_ms: 500,
+        ..explicit_required_config()
+    };
+    let error = validate_startup_preflight(&etcd_startup_config(config, "/chronos")).unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("CHRONOS_SAFETY_GAP_MS"));
+    assert!(message.contains("CHRONOS_MAX_CLOCK_SKEW_MS"));
+}
+
+#[test]
 fn startup_preflight_rejects_localhost_advertise_endpoint_for_etcd_metadata() {
     let _guard = ENV_LOCK.lock().unwrap();
     clear_tso_env();
@@ -261,7 +280,7 @@ fn startup_preflight_accepts_loopback_advertise_endpoint_for_dev_insecure_local_
         metadata_kind: "etcd".into(),
         etcd_endpoints: vec!["127.0.0.1:2379".into()],
         worker_id: "worker-a".into(),
-        safety_gap_ms: 1,
+        safety_gap_ms: 500,
         ..explicit_dev_insecure_local_config(bind_addr)
     };
     validate_startup_preflight(&etcd_startup_config(config, "/chronos")).unwrap();

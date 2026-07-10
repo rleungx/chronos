@@ -19,6 +19,7 @@ impl TsoService {
         timeline_key: &str,
         resource_tier: ResourceTier,
     ) -> Result<TimelineRoute, TsoError> {
+        super::super::validation::validate_timeline_key(timeline_key)?;
         loop {
             self.reject_new_work_if_shutting_down()?;
             let cached_timeline = self.timeline_runtime.timeline_handle(timeline_key);
@@ -82,7 +83,15 @@ impl TsoService {
                         updated_at_ms: self.clock.now_ms(),
                     };
 
-                    match self.metadata.create_timeline(timeline_key, &record).await {
+                    match self
+                        .metadata
+                        .create_timeline_with_limit(
+                            timeline_key,
+                            &record,
+                            self.config.max_timeline_records,
+                        )
+                        .await
+                    {
                         Ok(revision) => {
                             let timeline =
                                 Arc::new(Mutex::new(build_timeline_state(&record, revision, None)));

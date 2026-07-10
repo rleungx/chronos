@@ -1,16 +1,19 @@
 use crate::metrics;
-use crate::{ResourceTier, TsoConfig};
+use crate::{ResourceTier, TimelineLifecycleState, TsoConfig};
 
 use super::EtcdMetadataStore;
 use super::{
-    identity_claim_matches_record, parse_prev_route, parse_timeline_filter_record,
+    cluster_format::active_identity_formats_are_compatible, identity_claim_matches_record,
+    identity_record_belongs_to_ownership_plan, parse_prev_route, parse_timeline_filter_record,
     route_update_for_watch_event, verify_instance_identity_lease_record,
     InstanceIdentityLeaseRecord, RouteOnlyTimelineRecord, TimelineRoute, TimelineRouteRecord,
 };
-use crate::metadata::types::CURRENT_METADATA_SCHEMA_VERSION;
+use crate::metadata::types::{CURRENT_CLUSTER_FORMAT_VERSION, CURRENT_METADATA_SCHEMA_VERSION};
 use crate::metadata::{
     AllocationRequestFingerprint, RequestRecord, RequestRecordState, RouteUpdateSignal,
+    TimelineRecord,
 };
+use etcd_client::{PutOptions, Txn, TxnOp};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::time::Duration;
 
@@ -28,11 +31,52 @@ fn sample_route(generator_id: u32, route_version: u64) -> TimelineRoute {
 fn sample_request_record(state: RequestRecordState, updated_at_ms: u64) -> RequestRecord {
     RequestRecord {
         schema_version: 1,
-        fingerprint: AllocationRequestFingerprint { count: 1 },
+        fingerprint: AllocationRequestFingerprint {
+            timeline_key: "timeline".into(),
+            count: 1,
+        },
         state,
         response: None,
         updated_at_ms,
     }
+}
+
+fn test_instance_identity_record() -> InstanceIdentityLeaseRecord {
+    InstanceIdentityLeaseRecord {
+        instance_id: "instance-a".into(),
+        worker_id: "worker-a".into(),
+        advertise_endpoint: "worker-a:50051".into(),
+        ownership_plan_id: "plan-a".into(),
+        ownership_modulo: 2,
+        cluster_format_version: CURRENT_CLUSTER_FORMAT_VERSION,
+    }
+}
+
+async fn test_etcd_store(label: &str) -> (EtcdMetadataStore, String) {
+    let endpoints = std::env::var("CHRONOS_TEST_ETCD_ENDPOINTS")
+        .unwrap_or_else(|_| "127.0.0.1:2379".into())
+        .split(',')
+        .map(|endpoint| endpoint.trim().to_string())
+        .filter(|endpoint| !endpoint.is_empty())
+        .collect();
+    let prefix = format!(
+        "/chronos-test-{label}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let store = EtcdMetadataStore::connect_with_options(
+        endpoints,
+        prefix.clone(),
+        None,
+        Duration::from_millis(super::retry::DEFAULT_ETCD_REQUEST_RETRY_BUDGET_MS),
+    )
+    .await
+    .expect("etcd store should start");
+    store.rebuild_timeline_status_indexes().await.unwrap();
+    (store, prefix)
 }
 
 #[test]
@@ -254,7 +298,7 @@ fn etcd_request_retry_budget_uses_default_when_etcd_timeout_is_lower() {
 
     assert_eq!(
         super::etcd_request_retry_budget(&config),
-        Duration::from_millis(super::DEFAULT_ETCD_REQUEST_RETRY_BUDGET_MS)
+        Duration::from_millis(super::retry::DEFAULT_ETCD_REQUEST_RETRY_BUDGET_MS)
     );
 }
 
@@ -267,7 +311,7 @@ fn etcd_request_retry_budget_uses_default_when_grpc_timeout_is_lower() {
 
     assert_eq!(
         super::etcd_request_retry_budget(&config),
-        Duration::from_millis(super::DEFAULT_ETCD_REQUEST_RETRY_BUDGET_MS)
+        Duration::from_millis(super::retry::DEFAULT_ETCD_REQUEST_RETRY_BUDGET_MS)
     );
 }
 
@@ -291,16 +335,17 @@ fn verify_instance_identity_lease_record_accepts_exact_matching_lease_and_payloa
     let payload = serde_json::json!({
         "instance_id": "instance-a",
         "worker_id": "worker-a",
-        "advertise_endpoint": "worker-a:50051"
+        "advertise_endpoint": "worker-a:50051",
+        "ownership_plan_id": "plan-a",
+        "ownership_modulo": 2,
+        "cluster_format_version": CURRENT_CLUSTER_FORMAT_VERSION
     });
 
     verify_instance_identity_lease_record(
         17,
         17,
         payload.to_string().as_bytes(),
-        "instance-a",
-        "worker-a",
-        "worker-a:50051",
+        &test_instance_identity_record(),
     )
     .expect("matching lease record should verify");
 }
@@ -310,16 +355,17 @@ fn verify_instance_identity_lease_record_rejects_wrong_lease_id() {
     let payload = serde_json::json!({
         "instance_id": "instance-a",
         "worker_id": "worker-a",
-        "advertise_endpoint": "worker-a:50051"
+        "advertise_endpoint": "worker-a:50051",
+        "ownership_plan_id": "plan-a",
+        "ownership_modulo": 2,
+        "cluster_format_version": CURRENT_CLUSTER_FORMAT_VERSION
     });
 
     let error = verify_instance_identity_lease_record(
         17,
         18,
         payload.to_string().as_bytes(),
-        "instance-a",
-        "worker-a",
-        "worker-a:50051",
+        &test_instance_identity_record(),
     )
     .expect_err("wrong lease id should fail verification");
 
@@ -332,9 +378,7 @@ fn verify_instance_identity_lease_record_rejects_invalid_payload() {
         17,
         17,
         br#"{not-json}"#,
-        "instance-a",
-        "worker-a",
-        "worker-a:50051",
+        &test_instance_identity_record(),
     )
     .expect_err("invalid payload should fail verification");
 
@@ -346,16 +390,17 @@ fn verify_instance_identity_lease_record_rejects_mismatched_identity_fields() {
     let payload = serde_json::json!({
         "instance_id": "instance-a",
         "worker_id": "worker-b",
-        "advertise_endpoint": "worker-a:50051"
+        "advertise_endpoint": "worker-a:50051",
+        "ownership_plan_id": "plan-a",
+        "ownership_modulo": 2,
+        "cluster_format_version": CURRENT_CLUSTER_FORMAT_VERSION
     });
 
     let error = verify_instance_identity_lease_record(
         17,
         17,
         payload.to_string().as_bytes(),
-        "instance-a",
-        "worker-a",
-        "worker-a:50051",
+        &test_instance_identity_record(),
     )
     .expect_err("mismatched payload should fail verification");
 
@@ -364,11 +409,7 @@ fn verify_instance_identity_lease_record_rejects_mismatched_identity_fields() {
 
 #[test]
 fn identity_claim_matches_record_accepts_matching_claim() {
-    let expected = InstanceIdentityLeaseRecord {
-        instance_id: "instance-a".into(),
-        worker_id: "worker-a".into(),
-        advertise_endpoint: "worker-a:50051".into(),
-    };
+    let expected = test_instance_identity_record();
     let payload = serde_json::to_vec(&expected).unwrap();
 
     assert!(identity_claim_matches_record(17, 17, &payload, &expected)
@@ -377,11 +418,7 @@ fn identity_claim_matches_record_accepts_matching_claim() {
 
 #[test]
 fn identity_claim_matches_record_rejects_other_lease_without_error() {
-    let expected = InstanceIdentityLeaseRecord {
-        instance_id: "instance-a".into(),
-        worker_id: "worker-a".into(),
-        advertise_endpoint: "worker-a:50051".into(),
-    };
+    let expected = test_instance_identity_record();
     let payload = serde_json::to_vec(&expected).unwrap();
 
     assert!(!identity_claim_matches_record(17, 18, &payload, &expected)
@@ -390,15 +427,10 @@ fn identity_claim_matches_record_rejects_other_lease_without_error() {
 
 #[test]
 fn identity_claim_matches_record_rejects_mismatched_payload() {
-    let expected = InstanceIdentityLeaseRecord {
-        instance_id: "instance-a".into(),
-        worker_id: "worker-a".into(),
-        advertise_endpoint: "worker-a:50051".into(),
-    };
+    let expected = test_instance_identity_record();
     let payload = serde_json::to_vec(&InstanceIdentityLeaseRecord {
-        instance_id: "instance-a".into(),
         worker_id: "worker-b".into(),
-        advertise_endpoint: "worker-a:50051".into(),
+        ..test_instance_identity_record()
     })
     .unwrap();
 
@@ -408,11 +440,7 @@ fn identity_claim_matches_record_rejects_mismatched_payload() {
 
 #[test]
 fn identity_claim_matches_record_rejects_invalid_own_payload() {
-    let expected = InstanceIdentityLeaseRecord {
-        instance_id: "instance-a".into(),
-        worker_id: "worker-a".into(),
-        advertise_endpoint: "worker-a:50051".into(),
-    };
+    let expected = test_instance_identity_record();
 
     let error = identity_claim_matches_record(17, 17, br#"{not-json}"#, &expected)
         .expect_err("invalid payload on the expected lease should fail verification");
@@ -422,28 +450,156 @@ fn identity_claim_matches_record_rejects_invalid_own_payload() {
         .contains("claim verification decode failed"));
 }
 
+#[test]
+fn ownership_plan_membership_uses_identity_plan_and_treats_legacy_as_blocking() {
+    let current = InstanceIdentityLeaseRecord {
+        instance_id: "instance-a".into(),
+        worker_id: "worker-a".into(),
+        advertise_endpoint: "worker-a:50051".into(),
+        ownership_plan_id: "plan-b".into(),
+        ownership_modulo: 4,
+        cluster_format_version: CURRENT_CLUSTER_FORMAT_VERSION,
+    };
+    assert!(identity_record_belongs_to_ownership_plan(
+        &current, "plan-b", 4
+    ));
+    assert!(!identity_record_belongs_to_ownership_plan(
+        &current, "plan-a", 2
+    ));
+
+    let legacy = InstanceIdentityLeaseRecord {
+        ownership_plan_id: String::new(),
+        ownership_modulo: 0,
+        ..current
+    };
+    assert!(identity_record_belongs_to_ownership_plan(
+        &legacy, "plan-a", 2
+    ));
+}
+
+#[test]
+fn active_identity_cluster_format_rejects_legacy_workers() {
+    let current = test_instance_identity_record();
+    active_identity_formats_are_compatible(std::slice::from_ref(&current)).unwrap();
+
+    let legacy = InstanceIdentityLeaseRecord {
+        cluster_format_version: 0,
+        ..current
+    };
+    let error = active_identity_formats_are_compatible(&[legacy]).unwrap_err();
+    assert!(error.to_string().contains("stop every old worker"));
+}
+
 #[tokio::test]
 #[ignore = "requires a reachable etcd; set CHRONOS_TEST_ETCD_ENDPOINTS or run one on 127.0.0.1:2379"]
 async fn etcd_route_watch_shutdown_completes() {
-    let endpoints = std::env::var("CHRONOS_TEST_ETCD_ENDPOINTS")
-        .unwrap_or_else(|_| "127.0.0.1:2379".into())
-        .split(',')
-        .map(|endpoint| endpoint.trim().to_string())
-        .filter(|endpoint| !endpoint.is_empty())
-        .collect();
-    let prefix = format!(
-        "/chronos-test-watch-shutdown-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    );
-    let store = EtcdMetadataStore::from_raw_endpoints_unchecked(endpoints, prefix)
-        .await
-        .expect("etcd store should start");
+    let (store, _) = test_etcd_store("watch-shutdown").await;
 
     tokio::time::timeout(Duration::from_secs(5), store.shutdown_route_watch())
         .await
         .expect("route watch shutdown should complete");
+}
+
+#[tokio::test]
+#[ignore = "requires a reachable etcd; set CHRONOS_TEST_ETCD_ENDPOINTS or run one on 127.0.0.1:2379"]
+async fn etcd_expired_lease_lock_fences_stale_holder_writes() {
+    let (store, prefix) = test_etcd_store("lock-fence").await;
+    let lock = store
+        .try_acquire_lease_lock(
+            format!("{prefix}/cluster/fence_test_lock"),
+            3,
+            Vec::new(),
+            "fence_test_lock",
+        )
+        .await
+        .unwrap()
+        .expect("test lock should be acquired");
+    let stale_fence = lock.fence_compare();
+    drop(lock);
+    tokio::time::sleep(Duration::from_secs(4)).await;
+
+    let response = store
+        .etcd_txn(
+            "fence_test_write",
+            Txn::new().when(vec![stale_fence]).and_then(vec![TxnOp::put(
+                format!("{prefix}/fenced_write").as_bytes(),
+                "must-not-commit",
+                None,
+            )]),
+        )
+        .await
+        .unwrap();
+    assert!(!response.succeeded());
+    store.shutdown_route_watch().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a reachable etcd; set CHRONOS_TEST_ETCD_ENDPOINTS or run one on 127.0.0.1:2379"]
+async fn etcd_status_index_rebuild_upgrades_stale_marker() {
+    let (store, _) = test_etcd_store("index-version").await;
+    let record = TimelineRecord {
+        schema_version: CURRENT_METADATA_SCHEMA_VERSION,
+        route: sample_route(7, 1),
+        state: TimelineLifecycleState::Active,
+        recovery_floor_tso: None,
+        issued_upper_bound: Some(10),
+        last_graceful_issued: Some(9),
+        lease_expire_at_ms: Some(100),
+        updated_at_ms: 1,
+    };
+    store
+        .create_timeline_with_indexes(&record.route.timeline_key, &record)
+        .await
+        .unwrap();
+
+    let marker_key = store.timeline_status_index_marker_key();
+    let owner_index_key = store.timeline_status_owner_index_key(&record);
+    let mut client = store.client.clone();
+    client.delete(owner_index_key.clone(), None).await.unwrap();
+    client.put(marker_key.clone(), "1", None).await.unwrap();
+
+    store.rebuild_timeline_status_indexes().await.unwrap();
+
+    let marker = client.get(marker_key, None).await.unwrap();
+    assert_eq!(
+        marker.kvs().first().map(|kv| kv.value()),
+        Some(super::CURRENT_STATUS_INDEX_VERSION.as_bytes())
+    );
+    assert!(!client
+        .get(owner_index_key, None)
+        .await
+        .unwrap()
+        .kvs()
+        .is_empty());
+    store.shutdown_route_watch().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a reachable etcd; set CHRONOS_TEST_ETCD_ENDPOINTS or run one on 127.0.0.1:2379"]
+async fn etcd_cluster_format_initialization_rejects_active_legacy_identity() {
+    let (store, _) = test_etcd_store("format-fence").await;
+    let mut client = store.client.clone();
+    let lease_id = client.lease_grant(30, None).await.unwrap().id();
+    let legacy_payload = serde_json::json!({
+        "instance_id": "legacy-instance",
+        "worker_id": "legacy-worker",
+        "advertise_endpoint": "legacy-worker:50051"
+    });
+    client
+        .put(
+            store.instance_identity_key("legacy-instance"),
+            legacy_payload.to_string(),
+            Some(PutOptions::new().with_lease(lease_id)),
+        )
+        .await
+        .unwrap();
+
+    let error = store
+        .initialize_cluster_format_and_indexes()
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("incompatible cluster format"));
+
+    client.lease_revoke(lease_id).await.unwrap();
+    store.shutdown_route_watch().await;
 }

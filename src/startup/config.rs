@@ -319,6 +319,10 @@ fn apply_transport_limit_env(config: &mut TsoConfig) -> AppResult<()> {
         "CHRONOS_GRPC_MAX_CONCURRENT_REQUESTS",
         &mut config.grpc_max_concurrent_requests,
     )?;
+    apply_parsed_env(
+        "CHRONOS_GRPC_MAX_CONNECTIONS",
+        &mut config.grpc_max_connections,
+    )?;
     apply_optional_parsed_env("CHRONOS_ETCD_TIMEOUT_MS", &mut config.etcd_timeout_ms)?;
     Ok(())
 }
@@ -344,6 +348,10 @@ fn apply_capacity_env(config: &mut TsoConfig) -> AppResult<()> {
     apply_parsed_env(
         "CHRONOS_MAX_CONCURRENT_TIMELINE_LOADS",
         &mut config.max_concurrent_timeline_loads,
+    )?;
+    apply_parsed_env(
+        "CHRONOS_MAX_TIMELINE_RECORDS",
+        &mut config.max_timeline_records,
     )?;
     apply_parsed_env(
         "CHRONOS_REQUEST_RECORD_CLEANUP_BATCH_SIZE",
@@ -383,6 +391,7 @@ fn apply_timing_env(config: &mut TsoConfig) -> AppResult<()> {
         "CHRONOS_MAX_CLOCK_REWIND_MS",
         &mut config.max_clock_rewind_ms,
     )?;
+    apply_parsed_env("CHRONOS_MAX_CLOCK_SKEW_MS", &mut config.max_clock_skew_ms)?;
     apply_parsed_env(
         "CHRONOS_RECOVERY_CATCHUP_BUDGET_MS",
         &mut config.recovery_catchup_budget_ms,
@@ -443,9 +452,25 @@ fn reject_removed_startup_tuning_env_vars() -> AppResult<()> {
     .into())
 }
 
+fn validate_cluster_format_env() -> AppResult<()> {
+    let Ok(value) = env::var("CHRONOS_CLUSTER_FORMAT_VERSION") else {
+        return Ok(());
+    };
+    let configured: u32 = value.parse()?;
+    let expected = chronos::metadata::CURRENT_CLUSTER_FORMAT_VERSION;
+    if configured != expected {
+        return Err(format!(
+            "CHRONOS_CLUSTER_FORMAT_VERSION must match this binary: expected {expected}, got {configured}"
+        )
+        .into());
+    }
+    Ok(())
+}
+
 fn build_config_and_metadata_env() -> AppResult<(TsoConfig, MetadataEnvConfig, StartupLoggingConfig)>
 {
     reject_removed_startup_tuning_env_vars()?;
+    validate_cluster_format_env()?;
 
     let mut config = TsoConfig::default();
     let metadata = load_metadata_env();

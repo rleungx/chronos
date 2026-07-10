@@ -25,6 +25,41 @@ async fn repeated_client_request_id_returns_recorded_allocation_response() {
 }
 
 #[tokio::test]
+async fn idempotency_records_are_isolated_for_legacy_path_collision_inputs() {
+    let clock = Arc::new(ManualClock::new(21_250));
+    let metadata = Arc::new(MemoryMetadataStore::new());
+    let service =
+        TsoService::new(required_test_config(TsoConfig::default()), clock, metadata).unwrap();
+    let route_a = service.ensure_timeline("a/b").await.unwrap();
+    let route_b = service.ensure_timeline("a").await.unwrap();
+
+    let response_a = service
+        .allocate_timestamps(AllocateTimestampsRequest {
+            timeline_key: route_a.timeline_key.clone(),
+            count: 1,
+            expected_epoch: route_a.epoch,
+            expected_route_version: route_a.route_version,
+            client_request_id: "c".into(),
+        })
+        .await
+        .unwrap();
+    let response_b = service
+        .allocate_timestamps(AllocateTimestampsRequest {
+            timeline_key: route_b.timeline_key.clone(),
+            count: 1,
+            expected_epoch: route_b.epoch,
+            expected_route_version: route_b.route_version,
+            client_request_id: "b/c".into(),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(response_a.timeline_key, "a/b");
+    assert_eq!(response_b.timeline_key, "a");
+    assert_ne!(response_a.ranges, response_b.ranges);
+}
+
+#[tokio::test]
 async fn repeated_client_request_id_with_different_fingerprint_is_rejected() {
     let clock = Arc::new(ManualClock::new(21_500));
     let metadata = Arc::new(MemoryMetadataStore::new());
@@ -87,7 +122,10 @@ async fn pending_client_request_id_is_rejected_until_timeout() {
             "pending-logical-request",
             &RequestRecord {
                 schema_version: 1,
-                fingerprint: AllocationRequestFingerprint { count: 1 },
+                fingerprint: AllocationRequestFingerprint {
+                    timeline_key: route.timeline_key.clone(),
+                    count: 1,
+                },
                 state: RequestRecordState::Pending,
                 response: None,
                 updated_at_ms: clock.now_ms(),

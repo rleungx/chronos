@@ -110,6 +110,7 @@ docker_run_args=(
   -e CHRONOS_GRPC_REQUEST_TIMEOUT_MS=100
   -e CHRONOS_GRPC_MAX_REQUEST_BYTES=1024
   -e CHRONOS_GRPC_MAX_CONCURRENT_REQUESTS=16
+  -e CHRONOS_GRPC_MAX_CONNECTIONS=64
 )
 
 if [[ "${MODE}" == "memory" ]]; then
@@ -131,7 +132,8 @@ elif [[ "${MODE}" == "etcd" ]]; then
     -e CHRONOS_ETCD_ENDPOINTS=127.0.0.1:2379
     -e CHRONOS_ETCD_PREFIX=${PREFIX}
     -e CHRONOS_WORKER_ID=container-smoke-worker
-    -e CHRONOS_SAFETY_GAP_MS=1
+    -e CHRONOS_SAFETY_GAP_MS=500
+    -e CHRONOS_MAX_CLOCK_SKEW_MS=500
   )
 else
   echo "unsupported CHRONOS_CONTAINER_SMOKE_MODE: ${MODE}" >&2

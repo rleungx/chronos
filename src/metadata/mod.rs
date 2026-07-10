@@ -16,7 +16,7 @@ pub use types::{
     RequestRecord, RequestRecordAuthority, RequestRecordState, RouteUpdateSignal,
     RouteUpdateSource, TimelineAuthority, TimelineBatchOp, TimelineFilterRecord,
     TimelineFilterRecordListPage, TimelineRecord, TimelineRecordListPage, TimelineRouteRecord,
-    CURRENT_METADATA_SCHEMA_VERSION,
+    CURRENT_CLUSTER_FORMAT_VERSION, CURRENT_METADATA_SCHEMA_VERSION,
 };
 
 #[async_trait]
@@ -30,6 +30,8 @@ pub trait IdentityLeaseAuthority: Send + Sync {
         instance_id: &str,
         worker_id: &str,
         advertise_endpoint: &str,
+        ownership_plan_id: &str,
+        ownership_modulo: u32,
         ttl: Duration,
     ) -> Result<InstanceIdentityLease, crate::TsoError>;
 }

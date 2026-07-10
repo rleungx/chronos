@@ -26,6 +26,8 @@ tests:
         values: '0 0 0 0 0 0 0 0 0 1 1 1 1 1 1 1'
       - series: 'tso_metrics_render_errors_total{job="chronos"}'
         values: '0 0 0 0 0 0 1 1 1 1 1 1'
+      - series: 'tso_capacity_remaining_seconds{job="chronos"}'
+        values: '157679999 157679999 157679999 157679999 157679999 157679999 157679999'
     alert_rule_test:
       - eval_time: 3m
         alertname: ChronosDown
@@ -123,3 +125,13 @@ tests:
             exp_annotations:
               summary: Chronos metrics rendering failed
               description: Prometheus metrics render failures were recorded in the last 10 minutes.
+      - eval_time: 6m
+        alertname: ChronosTimestampCapacityHorizon
+        exp_alerts:
+          - exp_labels:
+              alertname: ChronosTimestampCapacityHorizon
+              job: chronos
+              severity: warning
+            exp_annotations:
+              summary: Chronos timestamp encoding has less than five years remaining
+              description: Plan and validate a versioned timestamp encoding migration before the 40-bit physical field is exhausted.

@@ -110,7 +110,7 @@ fn load_config() -> BenchConfig {
     let duration_secs = env_or("CHRONOS_FAILOVER_BENCH_DURATION_SECS", 10u64);
     let warmup_secs = env_or("CHRONOS_FAILOVER_BENCH_WARMUP_SECS", 2u64);
     let allocate_batch = env_or("CHRONOS_FAILOVER_BENCH_ALLOCATE_BATCH", 1u32);
-    let safety_gap_ms = env_or("CHRONOS_FAILOVER_BENCH_SAFETY_GAP_MS", 200u64);
+    let safety_gap_ms = env_or("CHRONOS_FAILOVER_BENCH_SAFETY_GAP_MS", 500u64);
     let failover_poll_interval_ms =
         env_or("CHRONOS_FAILOVER_BENCH_FAILOVER_POLL_INTERVAL_MS", 100u64);
     let failover_timeout_secs = env_or("CHRONOS_FAILOVER_BENCH_FAILOVER_TIMEOUT_SECS", 15u64);
@@ -967,7 +967,7 @@ mod tests {
             duration_secs: 1,
             warmup_secs: 0,
             allocate_batch: 1,
-            safety_gap_ms: 1,
+            safety_gap_ms: 500,
             failover_poll_interval_ms: 100,
             failover_timeout_secs: 1,
             allocate_request_timeout_ms: 100,

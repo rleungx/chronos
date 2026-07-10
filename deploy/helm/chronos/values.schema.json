@@ -5,7 +5,10 @@
   "properties": {
     "replicaCount": {
       "type": "integer",
-      "minimum": 3
+      "anyOf": [
+        { "const": 0 },
+        { "minimum": 3 }
+      ]
     },
     "image": {
       "type": "object",
@@ -32,8 +35,10 @@
     },
     "ownership": {
       "type": "object",
+      "additionalProperties": false,
       "properties": {
         "planId": { "type": "string" },
+        "workerCount": { "type": "integer", "minimum": 0 },
         "shardCount": {
           "type": "integer",
           "minimum": 3
@@ -70,15 +75,22 @@
         "mode": { "const": "required" },
         "clientCertAllowlistSecretName": { "type": "string", "minLength": 1 },
         "grpcTlsSecretName": { "type": "string", "minLength": 1 },
-        "metricsTlsSecretName": { "type": "string", "minLength": 1 }
+        "metricsTlsSecretName": { "type": "string", "minLength": 1 },
+        "tlsRevision": { "type": "string", "minLength": 1 },
+        "allowlistRevision": { "type": "string", "minLength": 1 }
       }
     },
     "runtime": {
       "type": "object",
       "properties": {
+        "safetyGapMs": { "type": "integer", "minimum": 1 },
+        "maxClockSkewMs": { "type": "integer", "minimum": 1 },
         "grpcRequestTimeoutMs": { "type": "integer", "minimum": 1 },
         "grpcMaxRequestBytes": { "type": "integer", "minimum": 1024 },
-        "grpcMaxConcurrentRequests": { "type": "integer", "minimum": 1 }
+        "grpcMaxConcurrentRequests": { "type": "integer", "minimum": 1 },
+        "grpcMaxConnections": { "type": "integer", "minimum": 1 },
+        "maxTimelineRecords": { "type": "integer", "minimum": 1 },
+        "terminationGracePeriodSeconds": { "type": "integer", "minimum": 120 }
       }
     },
     "resources": {

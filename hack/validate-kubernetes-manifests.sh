@@ -58,13 +58,17 @@ data = config.fetch("data", {})
   "CHRONOS_BIND_ADDR" => "0.0.0.0:50051",
   "CHRONOS_HEALTH_BIND_ADDR" => "0.0.0.0:9897",
   "CHRONOS_METRICS_BIND_ADDR" => "0.0.0.0:9898",
-  "CHRONOS_OWNERSHIP_PLAN_ID" => "kubernetes-rendezvous-shards-256",
+  "CHRONOS_CLUSTER_FORMAT_VERSION" => "2",
+  "CHRONOS_OWNERSHIP_PLAN_ID" => "kubernetes-rendezvous-shards-256-workers-3-seed-20260516",
   "CHRONOS_GENERATOR_OWNERSHIP_MODULO" => "256",
   "CHRONOS_AUTO_FAILOVER_ENABLED" => "true"
 }.each do |key, expected|
   fail!("ConfigMap chronos-config #{key} must be #{expected}") unless data[key] == expected
 end
 fail!("CHRONOS_ETCD_ENDPOINTS must use https") unless data.fetch("CHRONOS_ETCD_ENDPOINTS", "").start_with?("https://")
+fail!("CHRONOS_SAFETY_GAP_MS must cover CHRONOS_MAX_CLOCK_SKEW_MS") unless data.fetch("CHRONOS_SAFETY_GAP_MS", "0").to_i >= data.fetch("CHRONOS_MAX_CLOCK_SKEW_MS", "0").to_i && data.fetch("CHRONOS_MAX_CLOCK_SKEW_MS", "0").to_i > 0
+fail!("CHRONOS_MAX_TIMELINE_RECORDS must be positive") unless data.fetch("CHRONOS_MAX_TIMELINE_RECORDS", "0").to_i > 0
+fail!("CHRONOS_GRPC_MAX_CONNECTIONS must be positive") unless data.fetch("CHRONOS_GRPC_MAX_CONNECTIONS", "0").to_i > 0
 
 statefulset = named(docs, "StatefulSet", "chronos")
 spec = statefulset.fetch("spec")
@@ -75,10 +79,16 @@ ownership_workers = data.fetch("CHRONOS_OWNERSHIP_WORKER_COUNT", "0").to_i
 fail!("StatefulSet replicas must be at least 3") unless replicas >= 3
 fail!("CHRONOS_OWNERSHIP_WORKER_COUNT must match StatefulSet replicas") unless replicas == ownership_workers
 fail!("CHRONOS_GENERATOR_OWNERSHIP_MODULO must be at least StatefulSet replicas") unless ownership_modulo >= replicas
-fail!("CHRONOS_OWNERSHIP_PLAN_ID should include ownership shard count") unless data.fetch("CHRONOS_OWNERSHIP_PLAN_ID", "").end_with?("-#{ownership_modulo}")
+plan_id = data.fetch("CHRONOS_OWNERSHIP_PLAN_ID", "")
+fail!("CHRONOS_OWNERSHIP_PLAN_ID must include shards, workers, and assignment seed") unless plan_id.include?("shards-#{ownership_modulo}-workers-#{ownership_workers}-seed-#{data.fetch("CHRONOS_OWNERSHIP_ASSIGNMENT_SEED", "")}")
 fail!("StatefulSet podManagementPolicy must be Parallel") unless spec["podManagementPolicy"] == "Parallel"
 
 pod_spec = dig(statefulset, "spec", "template", "spec") || {}
+pod_annotations = dig(statefulset, "spec", "template", "metadata", "annotations") || {}
+%w[chronos.io/config-revision chronos.io/tls-revision chronos.io/allowlist-revision].each do |annotation|
+  fail!("StatefulSet pod template must carry #{annotation}") if pod_annotations.fetch(annotation, "").to_s.empty?
+end
+fail!("terminationGracePeriodSeconds must leave time for bounded shutdown") unless pod_spec.fetch("terminationGracePeriodSeconds", 0).to_i >= 120
 pod_security = pod_spec.fetch("securityContext", {})
 fail!("pod must run as non-root") unless pod_security["runAsNonRoot"] == true
 fail!("pod seccompProfile must be RuntimeDefault") unless dig(pod_security, "seccompProfile", "type") == "RuntimeDefault"

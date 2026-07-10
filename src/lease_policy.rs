@@ -17,6 +17,23 @@ mod tests {
     }
 
     #[test]
+    fn fast_takeover_clock_waits_for_the_full_certified_pairwise_skew() {
+        let persisted_expiry = 10_000;
+        let certified_pairwise_skew_ms = 500;
+
+        assert!(!lease_expired_with_safety_gap(
+            persisted_expiry,
+            10_499,
+            certified_pairwise_skew_ms
+        ));
+        assert!(lease_expired_with_safety_gap(
+            persisted_expiry,
+            10_500,
+            certified_pairwise_skew_ms
+        ));
+    }
+
+    #[test]
     fn lease_expiry_check_saturates_at_u64_max() {
         assert!(!lease_expired_with_safety_gap(
             u64::MAX - 2,

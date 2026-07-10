@@ -9,6 +9,8 @@ use crate::{
 };
 
 pub const CURRENT_METADATA_SCHEMA_VERSION: u32 = 1;
+/// Cluster-wide writer format. A change requires a quiesced, all-at-once worker upgrade.
+pub const CURRENT_CLUSTER_FORMAT_VERSION: u32 = 2;
 
 fn default_metadata_schema_version() -> u32 {
     CURRENT_METADATA_SCHEMA_VERSION
@@ -95,11 +97,15 @@ pub enum RequestRecordState {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AllocationRequestFingerprint {
+    #[serde(default)]
+    pub timeline_key: String,
     pub count: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AllocationResponseRecord {
+    #[serde(default)]
+    pub timeline_key: String,
     pub generator_id: u32,
     pub epoch: u64,
     pub route_version: u64,
@@ -212,6 +218,25 @@ impl OwnershipPlanRecord {
 
         self.members.push(member);
         self.members.sort_by_key(|member| member.remainder);
+        self.updated_at_ms = updated_at_ms;
+        Ok(true)
+    }
+
+    pub fn replace_if_empty(
+        &mut self,
+        expected_plan_id: &str,
+        expected_modulo: u32,
+        updated_at_ms: u64,
+    ) -> Result<bool, TsoError> {
+        self.validate_schema_version()?;
+        self.validate_integrity()?;
+        if !self.members.is_empty()
+            || (self.plan_id == expected_plan_id && self.modulo == expected_modulo)
+        {
+            return Ok(false);
+        }
+        self.plan_id = expected_plan_id.to_owned();
+        self.modulo = expected_modulo;
         self.updated_at_ms = updated_at_ms;
         Ok(true)
     }
@@ -336,6 +361,12 @@ impl RequestRecord {
         match (&self.state, &self.response) {
             (RequestRecordState::Pending, _) => Ok(None),
             (RequestRecordState::Completed, Some(response)) => {
+                if !response.timeline_key.is_empty() && response.timeline_key != timeline_key {
+                    return Err(TsoError::Internal(format!(
+                        "request response timeline mismatch: stored={} requested={}",
+                        response.timeline_key, timeline_key
+                    )));
+                }
                 Ok(Some(AllocateTimestampsResponse {
                     timeline_key: timeline_key.to_string(),
                     generator_id: response.generator_id,
@@ -574,6 +605,18 @@ pub trait TimelineAuthority: Send + Sync {
         timeline_key: &str,
         record: &TimelineRecord,
     ) -> Result<u64, TsoError>;
+    async fn create_timeline_with_limit(
+        &self,
+        timeline_key: &str,
+        record: &TimelineRecord,
+        max_timelines: usize,
+    ) -> Result<u64, TsoError> {
+        let page = self.list_timelines_page(None, max_timelines).await?;
+        if page.records.len() >= max_timelines {
+            return Err(TsoError::TimelineLimitReached { max: max_timelines });
+        }
+        self.create_timeline(timeline_key, record).await
+    }
     async fn compare_exchange_timeline(
         &self,
         timeline_key: &str,
@@ -823,6 +866,23 @@ mod tests {
         assert!(plan
             .admit_member("plan-a", 2, plan_member(0, "worker-b", "worker-b:50051"), 3)
             .expect("replacement member should be admitted after stale member pruning"));
+    }
+
+    #[test]
+    fn ownership_plan_can_change_identity_only_after_all_old_members_are_inactive() {
+        let mut plan = OwnershipPlanRecord::new(
+            "plan-a".into(),
+            2,
+            plan_member(0, "worker-a", "worker-a:50051"),
+            1,
+        );
+        assert!(!plan.replace_if_empty("plan-b", 4, 2).unwrap());
+
+        plan.prune_inactive_members(&HashSet::new(), 3).unwrap();
+        assert!(plan.replace_if_empty("plan-b", 4, 4).unwrap());
+        assert_eq!(plan.plan_id, "plan-b");
+        assert_eq!(plan.modulo, 4);
+        assert!(plan.members.is_empty());
     }
 
     #[test]

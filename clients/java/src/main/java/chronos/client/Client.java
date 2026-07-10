@@ -196,12 +196,24 @@ public class Client implements AutoCloseable {
     ManagedChannel create(String ownerWorkerEndpoint);
   }
 
+  private static final class RouteSnapshot {
+    private final TimelineRoute route;
+    private final ManagedChannel ownerChannel;
+    private final TimestampServiceGrpc.TimestampServiceBlockingStub tsoStub;
+
+    private RouteSnapshot(
+        TimelineRoute route,
+        ManagedChannel ownerChannel,
+        TimestampServiceGrpc.TimestampServiceBlockingStub tsoStub) {
+      this.route = route;
+      this.ownerChannel = ownerChannel;
+      this.tsoStub = tsoStub;
+    }
+  }
+
   private final ManagedChannel routeChannel;
   private final TimelineRouteServiceGrpc.TimelineRouteServiceBlockingStub routeStub;
-  private final AtomicReference<ManagedChannel> tsoChannel = new AtomicReference<>();
-  private final AtomicReference<TimestampServiceGrpc.TimestampServiceBlockingStub> tsoStub =
-      new AtomicReference<>();
-  private final AtomicReference<TimelineRoute> route = new AtomicReference<>();
+  private final AtomicReference<RouteSnapshot> routeSnapshot = new AtomicReference<>();
   private final AtomicLong requestId = new AtomicLong(1);
   private final String timelineKey;
   private final AllocationChannelFactory allocationChannelFactory;
@@ -209,7 +221,6 @@ public class Client implements AutoCloseable {
   private final String idempotencyScope;
   private final Object routeRefreshLock = new Object();
   private final Deque<ManagedChannel> staleOwnerChannels = new ArrayDeque<>();
-  private String ownerEndpoint = "";
 
   public Client(String addr, String timelineKey) {
     this(addr, timelineKey, Config.defaults());
@@ -282,19 +293,19 @@ public class Client implements AutoCloseable {
   }
 
   public List<TimestampRange> allocateTimestamps(int count) {
-    TimelineRoute route = ensureRoute();
-    String clientRequestId = nextClientRequestId(route.getTimelineKey());
+    RouteSnapshot snapshot = ensureRoute();
+    String clientRequestId = nextClientRequestId();
     int staleRetries = 0;
 
     while (true) {
       try {
-        return allocateOnce(route, count, clientRequestId).getRangesList();
+        return allocateOnce(snapshot, count, clientRequestId).getRangesList();
       } catch (RuntimeException err) {
         if (!isStaleRouteError(err) || staleRetries >= config.staleRouteRetryAttempts) {
           throw err;
         }
         staleRetries++;
-        route = refreshRouteIfUnchanged(route);
+        snapshot = refreshRouteIfUnchanged(snapshot);
         sleepBeforeStaleRouteRetry();
       }
     }
@@ -314,14 +325,14 @@ public class Client implements AutoCloseable {
     }
   }
 
-  private TimelineRoute ensureRoute() {
-    TimelineRoute cached = route.get();
+  private RouteSnapshot ensureRoute() {
+    RouteSnapshot cached = routeSnapshot.get();
     if (cached != null) {
       return cached;
     }
 
     synchronized (routeRefreshLock) {
-      cached = route.get();
+      cached = routeSnapshot.get();
       if (cached != null) {
         return cached;
       }
@@ -338,18 +349,17 @@ public class Client implements AutoCloseable {
     }
   }
 
-  private TimelineRoute refreshRouteIfUnchanged(TimelineRoute observedRoute) {
+  private RouteSnapshot refreshRouteIfUnchanged(RouteSnapshot observed) {
     synchronized (routeRefreshLock) {
-      TimelineRoute currentRoute = route.get();
-      if (currentRoute != null && !sameRouteIdentity(currentRoute, observedRoute)) {
-        ensureOwnerChannelLocked(currentRoute.getOwnerWorkerEndpoint());
-        return currentRoute;
+      RouteSnapshot current = routeSnapshot.get();
+      if (current != null && !sameRouteIdentity(current.route, observed.route)) {
+        return current;
       }
       return refreshRouteLocked();
     }
   }
 
-  private TimelineRoute refreshRouteLocked() {
+  private RouteSnapshot refreshRouteLocked() {
     var response =
         routeStubWithDeadline()
             .getTimelineRoute(
@@ -358,22 +368,21 @@ public class Client implements AutoCloseable {
     return installRouteLocked(route);
   }
 
-  private TimelineRoute installRouteLocked(TimelineRoute route) {
-    ensureOwnerChannelLocked(route.getOwnerWorkerEndpoint());
-    this.route.set(route);
-    return route;
-  }
-
-  private void ensureOwnerChannelLocked(String nextOwnerEndpoint) {
-    if (nextOwnerEndpoint.equals(ownerEndpoint) && tsoStub.get() != null) {
-      return;
+  private RouteSnapshot installRouteLocked(TimelineRoute route) {
+    RouteSnapshot current = routeSnapshot.get();
+    if (current != null
+        && route.getOwnerWorkerEndpoint().equals(current.route.getOwnerWorkerEndpoint())) {
+      RouteSnapshot next = new RouteSnapshot(route, current.ownerChannel, current.tsoStub);
+      routeSnapshot.set(next);
+      return next;
     }
 
-    ManagedChannel nextChannel = allocationChannelFactory.create(nextOwnerEndpoint);
-    ManagedChannel previous = tsoChannel.getAndSet(nextChannel);
-    tsoStub.set(TimestampServiceGrpc.newBlockingStub(nextChannel));
-    ownerEndpoint = nextOwnerEndpoint;
-    retainStaleOwnerChannelLocked(previous);
+    ManagedChannel nextChannel = allocationChannelFactory.create(route.getOwnerWorkerEndpoint());
+    RouteSnapshot next =
+        new RouteSnapshot(route, nextChannel, TimestampServiceGrpc.newBlockingStub(nextChannel));
+    routeSnapshot.set(next);
+    retainStaleOwnerChannelLocked(current == null ? null : current.ownerChannel);
+    return next;
   }
 
   private void retainStaleOwnerChannelLocked(ManagedChannel previous) {
@@ -399,8 +408,9 @@ public class Client implements AutoCloseable {
   }
 
   private AllocateTimestampsResponse allocateOnce(
-      TimelineRoute route, int count, String clientRequestId) {
-    return stubWithDeadline(tsoStub.get()).allocateTimestamps(
+      RouteSnapshot snapshot, int count, String clientRequestId) {
+    TimelineRoute route = snapshot.route;
+    return stubWithDeadline(snapshot.tsoStub).allocateTimestamps(
         AllocateTimestampsRequest.newBuilder()
             .setTimelineKey(route.getTimelineKey())
             .setCount(count)
@@ -426,11 +436,11 @@ public class Client implements AutoCloseable {
     return stub.withDeadlineAfter(config.requestTimeoutMs, TimeUnit.MILLISECONDS);
   }
 
-  private String nextClientRequestId(String timelineKey) {
+  private String nextClientRequestId() {
     if (!config.idempotencyEnabled) {
       return "";
     }
-    return timelineKey + "-" + idempotencyScope + "-" + requestId.getAndIncrement();
+    return idempotencyScope + "-" + requestId.getAndIncrement();
   }
 
   private static boolean sameRouteIdentity(TimelineRoute left, TimelineRoute right) {
@@ -472,11 +482,10 @@ public class Client implements AutoCloseable {
         stale.shutdownNow();
       }
       staleOwnerChannels.clear();
-      ManagedChannel currentTsoChannel = tsoChannel.getAndSet(null);
-      if (currentTsoChannel != null) {
-        currentTsoChannel.shutdownNow();
+      RouteSnapshot current = routeSnapshot.getAndSet(null);
+      if (current != null) {
+        current.ownerChannel.shutdownNow();
       }
-      route.set(null);
       routeChannel.shutdownNow();
     }
   }

@@ -79,7 +79,29 @@ fn print_help() {
 
 fn print_env_template() {
     println!(
-        "# Minimal local memory-backed startup\nexport CHRONOS_SECURITY_MODE=dev-insecure\nexport CHRONOS_BIND_ADDR=127.0.0.1:50051\nexport CHRONOS_ADVERTISE_ENDPOINT=127.0.0.1:50051\nexport CHRONOS_LOG_FORMAT=json\nexport CHRONOS_LOG_FILTER=info\n\n# Optional identity\n# export CHRONOS_WORKER_ID=worker-a\n# export CHRONOS_INSTANCE_ID=instance-a\n\n# To switch to etcd-backed metadata, also set:\n# export CHRONOS_METADATA=etcd\n# export CHRONOS_ETCD_ENDPOINTS=127.0.0.1:2379\n# export CHRONOS_ETCD_PREFIX=/chronos-local\n# export CHRONOS_WORKER_ID=worker-a\n# export CHRONOS_SAFETY_GAP_MS=1\n\n# Optional multi-node generator partitioning:\n# export CHRONOS_OWNERSHIP_PLAN_ID=scale-2026-05-10-a\n# export CHRONOS_GENERATOR_OWNERSHIP_MODULO=2\n# export CHRONOS_GENERATOR_OWNERSHIP_REMAINDER=0\n"
+        r#"# Minimal local memory-backed startup
+export CHRONOS_SECURITY_MODE=dev-insecure
+export CHRONOS_BIND_ADDR=127.0.0.1:50051
+export CHRONOS_ADVERTISE_ENDPOINT=127.0.0.1:50051
+export CHRONOS_LOG_FORMAT=json
+export CHRONOS_LOG_FILTER=info
+
+# Optional identity
+# export CHRONOS_WORKER_ID=worker-a
+# export CHRONOS_INSTANCE_ID=instance-a
+
+# To switch to etcd-backed metadata, also set:
+# export CHRONOS_METADATA=etcd
+# export CHRONOS_ETCD_ENDPOINTS=127.0.0.1:2379
+# export CHRONOS_ETCD_PREFIX=/chronos-local
+# export CHRONOS_WORKER_ID=worker-a
+# export CHRONOS_MAX_CLOCK_SKEW_MS=500
+# export CHRONOS_SAFETY_GAP_MS=500
+
+# Optional multi-node generator partitioning:
+# export CHRONOS_OWNERSHIP_PLAN_ID=scale-2026-05-10-a
+# export CHRONOS_GENERATOR_OWNERSHIP_MODULO=2
+# export CHRONOS_GENERATOR_OWNERSHIP_REMAINDER=0"#
     );
 }
 
@@ -133,6 +155,7 @@ fn print_config_lines(config: &TsoConfig) {
         .join(",");
     println!("generator_ownership_remainders={}", remainders);
     println!("safety_gap_ms={}", config.safety_gap_ms);
+    println!("max_clock_skew_ms={}", config.max_clock_skew_ms);
     println!("auto_failover_enabled={}", config.auto_failover_enabled);
     println!(
         "auto_failover_interval_ms={}",
@@ -142,6 +165,13 @@ fn print_config_lines(config: &TsoConfig) {
         "auto_failover_batch_size={}",
         config.auto_failover_batch_size
     );
+    println!("max_timeline_records={}", config.max_timeline_records);
+    println!("grpc_max_connections={}", config.grpc_max_connections);
+    println!(
+        "cluster_format_version={}",
+        chronos::metadata::CURRENT_CLUSTER_FORMAT_VERSION
+    );
+    println!("tso_max_supported_unix_ms={}", chronos::MAX_UNIX_MS);
 }
 
 fn metrics_transport_label(transport: MetricsTransport) -> &'static str {

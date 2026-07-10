@@ -78,6 +78,7 @@ impl TsoService {
     }
 
     pub async fn get_timeline_route(&self, timeline_key: &str) -> Result<TimelineRoute, TsoError> {
+        super::validation::validate_timeline_key(timeline_key)?;
         let (record, _) = self
             .load_timeline_route_with_singleflight(timeline_key)
             .await?
@@ -92,6 +93,7 @@ impl TsoService {
         &self,
         timeline_key: &str,
     ) -> Result<TimelineRecord, TsoError> {
+        super::validation::validate_timeline_key(timeline_key)?;
         let (record, _) = self
             .load_timeline_with_singleflight(timeline_key)
             .await?
@@ -105,6 +107,7 @@ impl TsoService {
         &self,
         timeline_key: &str,
     ) -> Result<TimelineStatusSnapshot, TsoError> {
+        super::validation::validate_timeline_key(timeline_key)?;
         let (timeline, _) = self
             .load_timeline_with_singleflight(timeline_key)
             .await?
@@ -132,6 +135,9 @@ impl TsoService {
         start_after_timeline_key: Option<&str>,
         limit: usize,
     ) -> Result<TimelineStatusListPage, TsoError> {
+        if let Some(start_after_timeline_key) = start_after_timeline_key {
+            super::validation::validate_timeline_key(start_after_timeline_key)?;
+        }
         if limit == 0 {
             return Ok(TimelineStatusListPage {
                 statuses: Vec::new(),
@@ -216,6 +222,7 @@ impl TsoService {
     }
 
     pub async fn renew_timeline_lease(&self, timeline_key: &str) -> Result<(), TsoError> {
+        super::validation::validate_timeline_key(timeline_key)?;
         let (record, _) = self
             .load_timeline_route_with_singleflight(timeline_key)
             .await?

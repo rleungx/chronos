@@ -12,6 +12,12 @@ pub enum TsoError {
     EpochMismatch { expected: u64, actual: u64 },
     #[error("count must be positive")]
     InvalidCount,
+    #[error("invalid timeline_key: {reason}")]
+    InvalidTimelineKey { reason: String },
+    #[error("invalid client_request_id: {reason}")]
+    InvalidClientRequestId { reason: String },
+    #[error("timeline record limit reached: max {max}")]
+    TimelineLimitReached { max: usize },
     #[error("batch too large: requested {requested}, max {max}")]
     BatchTooLarge { requested: u32, max: u32 },
     #[error("future borrow exceeded: requested physical_ms {requested_physical_ms}, allowed {allowed_physical_ms}")]

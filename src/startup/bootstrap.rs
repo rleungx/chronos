@@ -41,6 +41,8 @@ pub(crate) async fn build_tso_service(
                     config.effective_instance_id(),
                     &config.worker_id,
                     &config.advertise_endpoint,
+                    &config.ownership_plan_id,
+                    config.generator_ownership_modulo,
                     Duration::from_millis(config.lease_ttl_ms),
                 )
                 .await?;
@@ -61,6 +63,8 @@ async fn finalize_etcd_startup(
             config.effective_instance_id(),
             &config.worker_id,
             &config.advertise_endpoint,
+            &config.ownership_plan_id,
+            config.generator_ownership_modulo,
         )
         .await
     {

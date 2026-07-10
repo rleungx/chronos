@@ -395,8 +395,7 @@ impl Client {
     fn next_client_request_id(&self) -> String {
         if self.config.idempotency_enabled {
             format!(
-                "{}-{}-{}",
-                self.config.timeline_key,
+                "{}-{}",
                 self.idempotency_scope,
                 self.request_id.fetch_add(1, Ordering::Relaxed)
             )

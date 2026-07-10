@@ -3,6 +3,7 @@ use prometheus::{
     IntGauge, IntGaugeVec, Opts,
 };
 use std::sync::LazyLock;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const LATENCY_BUCKETS_SECONDS: &[f64] = &[
     0.000001, 0.0000025, 0.000005, 0.00001, 0.000025, 0.00005, 0.0001, 0.00025, 0.0005, 0.001,
@@ -353,6 +354,21 @@ pub static TSO_BUILD_INFO: LazyLock<IntGaugeVec> = LazyLock::new(|| {
         &["version", "commit"],
     )
 });
+pub static TSO_CAPACITY_REMAINING_SECONDS: LazyLock<IntGauge> = LazyLock::new(|| {
+    register_int_gauge_metric(
+        "tso_capacity_remaining_seconds",
+        "Seconds remaining before the current 40-bit physical timestamp encoding is exhausted",
+    )
+});
+
+pub fn refresh_tso_capacity_remaining_metric() {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u64::MAX as u128) as u64)
+        .unwrap_or_default();
+    let remaining_seconds = crate::MAX_UNIX_MS.saturating_sub(now_ms) / 1_000;
+    TSO_CAPACITY_REMAINING_SECONDS.set(remaining_seconds.min(i64::MAX as u64) as i64);
+}
 pub fn init_build_info_metric() {
     TSO_BUILD_INFO
         .with_label_values(&[
@@ -392,6 +408,12 @@ mod tests {
                 .get(),
             1
         );
+    }
+
+    #[test]
+    fn capacity_remaining_metric_is_registered_and_non_negative() {
+        refresh_tso_capacity_remaining_metric();
+        assert!(TSO_CAPACITY_REMAINING_SECONDS.get() >= 0);
     }
 
     #[test]

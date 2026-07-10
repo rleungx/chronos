@@ -48,6 +48,9 @@ layer4_cargo_targets=(
 
 required_layer4_tests=(
   etcd_route_watch_shutdown_completes
+  etcd_expired_lease_lock_fences_stale_holder_writes
+  etcd_status_index_rebuild_upgrades_stale_marker
+  etcd_cluster_format_initialization_rejects_active_legacy_identity
   etcd_list_timeline_statuses_supports_authoritative_inventory_scan
   etcd_identity_lease_loss_flips_readiness_and_triggers_shutdown
   etcd_startup_rejects_duplicate_instance_identity

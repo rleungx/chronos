@@ -16,6 +16,19 @@ if [[ $# -eq 0 ]]; then
   set -- soak chaos failover auto-failover scale-matrix rebalance restore
 fi
 
+BUILD_INFO="${ARTIFACT_ROOT%/}/BUILD_INFO"
+[[ -f "${BUILD_INFO}" ]] || {
+  echo "missing release BUILD_INFO: ${BUILD_INFO}" >&2
+  exit 1
+}
+expected_commit="$(git rev-parse HEAD)"
+evidence_git_commit="$(extract_metric "git_commit" "${BUILD_INFO}")"
+evidence_build_commit="$(extract_metric "chronos_build_commit" "${BUILD_INFO}")"
+if [[ "${evidence_git_commit}" != "${expected_commit}" || "${evidence_build_commit}" != "${expected_commit}" ]]; then
+  echo "release evidence commit mismatch: expected=${expected_commit} git_commit=${evidence_git_commit} chronos_build_commit=${evidence_build_commit}" >&2
+  exit 1
+fi
+
 verify_dir() {
   local name=$1
   shift
@@ -65,27 +78,16 @@ assert_metric_file_exists() {
   fi
 }
 
-assert_linear_efficiency_or_plateau() {
-  local worker=$1
-  local summary=$2
-  local efficiency_min=$3
-  local allow_plateau
-  local plateau_accepted
-  allow_plateau="$(extract_metric "allow_single_host_plateau" "${summary}")"
-  plateau_accepted="$(extract_metric "workers_${worker}_linear_single_host_plateau_accepted" "${summary}")"
-
-  if assert_metric_at_least "workers_${worker}_linear_efficiency" "${summary}" "${efficiency_min}" 2>/dev/null; then
-    return 0
-  fi
-  if [[ "${allow_plateau}" == "true" && "${plateau_accepted}" == "true" ]]; then
-    return 0
-  fi
-
-  assert_metric_at_least "workers_${worker}_linear_efficiency" "${summary}" "${efficiency_min}"
-}
-
 verify_scale_matrix_summary() {
   local summary=$1
+  [[ "$(extract_metric "profile" "${summary}")" == "production" ]] || {
+    echo "scale matrix evidence must use profile=production: ${summary}" >&2
+    return 1
+  }
+  [[ "$(extract_metric "allow_single_host_plateau" "${summary}")" == "false" ]] || {
+    echo "production scale matrix must not allow a single-host plateau: ${summary}" >&2
+    return 1
+  }
   assert_metric_present "worker_counts" "${summary}"
   assert_metric_present "linear_efficiency_min" "${summary}"
   assert_metric_present "baseline_workers" "${summary}"
@@ -95,6 +97,16 @@ verify_scale_matrix_summary() {
   local efficiency_min
   worker_counts="$(extract_metric "worker_counts" "${summary}")"
   efficiency_min="$(extract_metric "linear_efficiency_min" "${summary}")"
+  assert_metric_at_least "linear_efficiency_min" "${summary}" "0.80"
+  for required_worker in 2 3 5 8; do
+    case ",${worker_counts}," in
+      *",${required_worker},"*) ;;
+      *)
+        echo "production scale matrix is missing worker count ${required_worker}: ${summary}" >&2
+        return 1
+        ;;
+    esac
+  done
 
   local -a workers
   IFS=',' read -ra workers <<<"${worker_counts}"
@@ -123,7 +135,7 @@ verify_scale_matrix_summary() {
     }
     assert_positive_metric "workers_${worker}_req_per_sec" "${summary}"
     assert_metric_present "workers_${worker}_linear_expected_req_per_sec_at_min_efficiency" "${summary}"
-    assert_linear_efficiency_or_plateau "${worker}" "${summary}" "${efficiency_min}"
+    assert_metric_at_least "workers_${worker}_linear_efficiency" "${summary}" "${efficiency_min}"
     assert_zero_metric "workers_${worker}_allocation_failed_total" "${summary}"
     assert_metric_present "workers_${worker}_latency_p95_us" "${summary}"
     assert_metric_present "workers_${worker}_latency_p99_us" "${summary}"
@@ -211,15 +223,22 @@ for target in "$@"; do
   case "${target}" in
     soak)
       verify_dir soak summary.txt artifact-index.txt chronos.log bench.log status.log status-filtered.log
+      assert_metric_at_least "soak_duration_secs" "${ARTIFACT_ROOT%/}/soak/summary.txt" "3600"
+      assert_metric_at_least "soak_warmup_secs" "${ARTIFACT_ROOT%/}/soak/summary.txt" "60"
       ;;
     chaos)
       verify_dir chaos summary.txt artifact-index.txt chronos.log recovery-bench.log
+      assert_metric_at_least "bench_duration_secs" "${ARTIFACT_ROOT%/}/chaos/summary.txt" "30"
       ;;
     failover)
       verify_dir failover summary.txt artifact-index.txt failover-bench.log
+      assert_metric_at_least "bench_duration_secs" "${ARTIFACT_ROOT%/}/failover/summary.txt" "60"
+      assert_metric_at_least "bench_warmup_secs" "${ARTIFACT_ROOT%/}/failover/summary.txt" "10"
       ;;
     auto-failover)
       verify_dir auto-failover summary.txt artifact-index.txt failover-bench.log
+      assert_metric_at_least "bench_duration_secs" "${ARTIFACT_ROOT%/}/auto-failover/summary.txt" "60"
+      assert_metric_at_least "bench_warmup_secs" "${ARTIFACT_ROOT%/}/auto-failover/summary.txt" "10"
       ;;
     scale)
       verify_scale_run_dir "${ARTIFACT_ROOT%/}/scale"

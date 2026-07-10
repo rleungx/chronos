@@ -501,6 +501,7 @@ impl TsoService {
         target_generator_id: Option<u32>,
         reason: TransferReason,
     ) -> Result<(TimelineRoute, u32, TimelineLifecycleState), TsoError> {
+        super::validation::validate_timeline_key(timeline_key)?;
         log_transfer_requested(
             timeline_key,
             &target_owner_endpoint,
@@ -665,6 +666,7 @@ impl TsoService {
         target_owner_endpoint: String,
         target_generator_id: Option<u32>,
     ) -> Result<TimelineRoute, TsoError> {
+        super::validation::validate_timeline_key(timeline_key)?;
         if let Err(error) = validate_transfer_target(
             &self.config.advertise_endpoint,
             timeline_key,

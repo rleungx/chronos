@@ -349,6 +349,48 @@ func TestClientBoundsRetainedStaleOwnerConnections(t *testing.T) {
 	}
 }
 
+func TestConcurrentStaleAllocationsSingleflightRouteRefresh(t *testing.T) {
+	server, addr := startFakeChronosServer(t, false)
+	client, err := NewWithOptions(context.Background(), addr, "orders.primary", WithInsecureTransport())
+	if err != nil {
+		t.Fatalf("New returned error: %v", err)
+	}
+	defer client.Close()
+
+	server.mu.Lock()
+	server.route.RouteVersion++
+	server.mu.Unlock()
+
+	const callers = 32
+	start := make(chan struct{})
+	errCh := make(chan error, callers)
+	var wg sync.WaitGroup
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			_, allocateErr := client.AllocateTimestamps(context.Background(), 1)
+			errCh <- allocateErr
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errCh)
+	for allocateErr := range errCh {
+		if allocateErr != nil {
+			t.Fatalf("concurrent allocation returned error: %v", allocateErr)
+		}
+	}
+
+	server.mu.Lock()
+	getRouteCalls := server.getRouteCalls
+	server.mu.Unlock()
+	if getRouteCalls != 1 {
+		t.Fatalf("expected one singleflight route refresh, got %d", getRouteCalls)
+	}
+}
+
 func TestClientRejectsMissingEnsureRoute(t *testing.T) {
 	server, addr := startFakeChronosServer(t, false)
 	server.mu.Lock()

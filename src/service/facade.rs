@@ -4,6 +4,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
 
+use futures::{stream, StreamExt};
 use tokio::sync::Semaphore;
 use tokio::time::Duration;
 use tracing::{info, warn};
@@ -24,6 +25,10 @@ use super::TsoService;
 
 static INSTANCE_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 static CONTENTION_SEED_COUNTER: AtomicU64 = AtomicU64::new(1);
+const SHUTDOWN_FLUSH_TIMEOUT: Duration = Duration::from_secs(90);
+const SHUTDOWN_TIMELINE_FLUSH_CONCURRENCY: usize = 32;
+const SHUTDOWN_GENERATOR_FLUSH_CONCURRENCY: usize = 16;
+const SHUTDOWN_TRANSFER_CONCURRENCY: usize = 8;
 
 impl TsoService {
     pub fn new<C, M>(
@@ -172,7 +177,23 @@ impl TsoService {
             advertise_endpoint = %self.config.advertise_endpoint,
             metadata_kind = %self.config.metadata_kind
         );
-        self.best_effort_persist_runtime_before_shutdown().await;
+        if tokio::time::timeout(
+            SHUTDOWN_FLUSH_TIMEOUT,
+            self.best_effort_persist_runtime_before_shutdown(),
+        )
+        .await
+        .is_err()
+        {
+            warn!(
+                component = "shutdown",
+                event = "runtime_flush_timed_out",
+                result = "degraded",
+                reason = "shutdown_deadline",
+                timeout_ms = SHUTDOWN_FLUSH_TIMEOUT.as_millis(),
+                worker_id = %self.config.worker_id,
+                instance_id = %self.instance_id
+            );
+        }
         self.background.drain_tasks().await;
         self.invalidate_local_runtime_after_shutdown();
         self.metadata.shutdown().await;
@@ -205,35 +226,42 @@ impl TsoService {
                 }
             };
 
-        for timeline in &local_timelines {
-            if let Err(error) = self
-                .best_effort_persist_local_timeline_floor(&timeline.timeline_key)
-                .await
-            {
-                warn!(
-                    component = "shutdown",
-                    event = "timeline_flush_failed",
-                    result = "degraded",
-                    reason = %error,
-                    timeline_key = %timeline.timeline_key
-                );
-            }
-        }
+        stream::iter(local_timelines.iter())
+            .for_each_concurrent(SHUTDOWN_TIMELINE_FLUSH_CONCURRENCY, |timeline| async move {
+                if let Err(error) = self
+                    .best_effort_persist_local_timeline_floor(&timeline.timeline_key)
+                    .await
+                {
+                    warn!(
+                        component = "shutdown",
+                        event = "timeline_flush_failed",
+                        result = "degraded",
+                        reason = %error,
+                        timeline_key = %timeline.timeline_key
+                    );
+                }
+            })
+            .await;
 
-        for generator_id in local_generator_ids {
-            if let Err(error) = self
-                .best_effort_persist_local_generator_floor(generator_id)
-                .await
-            {
-                warn!(
-                    component = "shutdown",
-                    event = "generator_flush_failed",
-                    result = "degraded",
-                    reason = %error,
-                    generator_id
-                );
-            }
-        }
+        stream::iter(local_generator_ids)
+            .for_each_concurrent(
+                SHUTDOWN_GENERATOR_FLUSH_CONCURRENCY,
+                |generator_id| async move {
+                    if let Err(error) = self
+                        .best_effort_persist_local_generator_floor(generator_id)
+                        .await
+                    {
+                        warn!(
+                            component = "shutdown",
+                            event = "generator_flush_failed",
+                            result = "degraded",
+                            reason = %error,
+                            generator_id
+                        );
+                    }
+                },
+            )
+            .await;
 
         self.best_effort_transfer_local_timelines_before_shutdown(&local_timelines, &candidates)
             .await;
@@ -311,6 +339,7 @@ impl TsoService {
             return;
         }
         let mut transfer_state = ShutdownTransferState::default();
+        let mut transfers = Vec::new();
 
         for timeline in timelines {
             if !self.is_local_endpoint(&timeline.owner_worker_endpoint) {
@@ -324,26 +353,39 @@ impl TsoService {
                 continue;
             };
 
-            if let Err(error) = self
-                .transfer_timeline_for_rpc(
-                    &timeline.timeline_key,
-                    target_endpoint.clone(),
-                    Some(target_generator_id),
-                    TransferReason::Rebalance,
-                )
-                .await
-            {
-                warn!(
-                    component = "shutdown",
-                    event = "timeline_transfer_failed",
-                    result = "degraded",
-                    reason = %error,
-                    timeline_key = %timeline.timeline_key,
-                    target_owner_endpoint = %target_endpoint,
-                    target_generator_id
-                );
-            }
+            transfers.push((
+                timeline.timeline_key.clone(),
+                target_endpoint,
+                target_generator_id,
+            ));
         }
+
+        stream::iter(transfers)
+            .for_each_concurrent(
+                SHUTDOWN_TRANSFER_CONCURRENCY,
+                |(timeline_key, target_endpoint, target_generator_id)| async move {
+                    if let Err(error) = self
+                        .transfer_timeline_for_rpc(
+                            &timeline_key,
+                            target_endpoint.clone(),
+                            Some(target_generator_id),
+                            TransferReason::Rebalance,
+                        )
+                        .await
+                    {
+                        warn!(
+                            component = "shutdown",
+                            event = "timeline_transfer_failed",
+                            result = "degraded",
+                            reason = %error,
+                            timeline_key = %timeline_key,
+                            target_owner_endpoint = %target_endpoint,
+                            target_generator_id
+                        );
+                    }
+                },
+            )
+            .await;
     }
 
     fn shutdown_transfer_target(

@@ -84,6 +84,8 @@ pub(super) fn map_tso_error(err: TsoError) -> Status {
         TsoError::ClockBackwards { .. } => status_with_error_detail(Code::Internal, err),
         TsoError::BatchTooLarge { .. }
         | TsoError::InvalidCount
+        | TsoError::InvalidTimelineKey { .. }
+        | TsoError::InvalidClientRequestId { .. }
         | TsoError::InvalidResourceTier { .. }
         | TsoError::InvalidTargetOwnerEndpoint
         | TsoError::InvalidTransferReason { .. } => {
@@ -108,6 +110,9 @@ pub(super) fn map_tso_error(err: TsoError) -> Status {
             status_with_error_detail(Code::ResourceExhausted, err)
         }
         TsoError::GeneratorPoolExhausted => status_with_error_detail(Code::ResourceExhausted, err),
+        TsoError::TimelineLimitReached { .. } => {
+            status_with_error_detail(Code::ResourceExhausted, err)
+        }
         TsoError::GeneratorIdOutOfRange { .. } => status_with_error_detail(Code::OutOfRange, err),
         TsoError::TsoOverflow => status_with_error_detail(Code::OutOfRange, err),
         TsoError::MetadataAlreadyExists => status_with_error_detail(Code::AlreadyExists, err),
@@ -140,6 +145,8 @@ fn error_detail_code(err: &TsoError) -> ErrorCode {
         | TsoError::GeneratorNotOwnedByThisWorker { .. } => ErrorCode::NotTimelineOwner,
         TsoError::BatchTooLarge { .. }
         | TsoError::InvalidCount
+        | TsoError::InvalidTimelineKey { .. }
+        | TsoError::InvalidClientRequestId { .. }
         | TsoError::InvalidResourceTier { .. }
         | TsoError::InvalidTargetOwnerEndpoint
         | TsoError::InvalidTransferReason { .. }
@@ -152,7 +159,8 @@ fn error_detail_code(err: &TsoError) -> ErrorCode {
         | TsoError::ClientRequestConflict { .. } => ErrorCode::InvalidArgument,
         TsoError::FutureBorrowExceeded { .. }
         | TsoError::IssuedUpperBoundExceeded { .. }
-        | TsoError::GeneratorPoolExhausted => ErrorCode::RateLimited,
+        | TsoError::GeneratorPoolExhausted
+        | TsoError::TimelineLimitReached { .. } => ErrorCode::RateLimited,
         TsoError::FailoverRequiresExpiredLease { .. }
         | TsoError::FailoverLeaseExpiryUnknown { .. }
         | TsoError::CasFailed

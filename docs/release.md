@@ -12,7 +12,8 @@ make release-gate
 ```
 
 `make release-gate` retains long-running validation evidence under `artifacts/release-gate` by
-default and verifies it before the gate passes.
+default and verifies it before the gate passes. The gate copies `BUILD_INFO` into that directory
+and rejects evidence whose git/build commit differs from the current release commit.
 
 This is equivalent to the following validation bundle:
 
@@ -29,6 +30,12 @@ make test-rebalance-bench
 make test-restore-dr
 bash hack/verify-evidence.sh artifacts/release-gate
 ```
+
+The production gate runs a one-hour soak, at least 30 seconds of post-chaos traffic, 60-second
+failover windows, and the fixed 2/3/5/8 scale matrix with an 80% linear-efficiency floor. It does
+not accept the single-host plateau escape hatch. For local iteration use `make test-soak-quick`,
+`make test-chaos-quick`, and `make test-failover-bench-quick`; quick evidence is intentionally not
+eligible for release promotion.
 
 For production scale evidence, also run `make test-scale-matrix-production` on production-like
 hosts with benchmark clients isolated from Chronos workers. Archive the generated
@@ -73,6 +80,9 @@ Before publishing or deploying, ensure you have:
 ## Rollback expectation
 
 If any benchmark budget or observability validation fails after a release candidate build, do not
-promote the artifact. Revert to the last candidate whose validation bundle is intact.
+promote the artifact. Revert to the last candidate whose validation bundle is intact. A release
+that advances `CURRENT_CLUSTER_FORMAT_VERSION` requires a quiesced all-worker upgrade; after its
+etcd marker is written, an older binary must not be restarted on that prefix. Restore a pre-upgrade
+snapshot to a separate prefix when a format-level rollback is required.
 
 For the full rollback procedure, see `docs/rollback.md`.

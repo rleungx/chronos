@@ -4,12 +4,14 @@ mod common_config;
 mod common_etcd_endpoints;
 #[path = "common/etcd_prefix.rs"]
 mod common_etcd_prefix;
+#[path = "common/etcd_store.rs"]
+mod common_etcd_store;
 
 use std::sync::Arc;
 
 use common_config::required_test_config;
-use common_etcd_endpoints::test_etcd_endpoints;
 use common_etcd_prefix::unique_test_etcd_prefix;
+use common_etcd_store::test_etcd_store;
 use tonic::{Code, Request};
 
 use chronos::lifecycle::TimelineLifecycleContract;
@@ -80,11 +82,7 @@ fn proto_timeline_state(state: TimelineLifecycleState) -> i32 {
 }
 
 async fn real_etcd_store(prefix: &str) -> Arc<EtcdMetadataStore> {
-    Arc::new(
-        EtcdMetadataStore::from_raw_endpoints_unchecked(test_etcd_endpoints(), prefix.to_string())
-            .await
-            .expect("etcd store should start"),
-    )
+    Arc::new(test_etcd_store(prefix).await)
 }
 
 async fn assert_owner_filtered_inventory_supports_planned_drain<M>(

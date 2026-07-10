@@ -1,3 +1,31 @@
+{{- $ownershipWorkerCount := int (include "chronos.ownershipWorkerCount" .) -}}
+{{- $ownershipPlanId := include "chronos.ownershipPlanId" . -}}
+{{- $clusterFormatVersion := int (include "chronos.clusterFormatVersion" .) -}}
+{{- $desiredReplicas := int .Values.replicaCount -}}
+{{- if lt $ownershipWorkerCount 1 -}}
+{{- fail "ownership workerCount must be greater than zero; during a drain set replicaCount=0 and ownership.workerCount to the target count" -}}
+{{- end -}}
+{{- $existingConfig := lookup "v1" "ConfigMap" .Release.Namespace (printf "%s-config" (include "chronos.fullname" .)) -}}
+{{- $existingStatefulSet := lookup "apps/v1" "StatefulSet" .Release.Namespace (include "chronos.fullname" .) -}}
+{{- if and $existingConfig $existingStatefulSet -}}
+{{- $existingWorkerCount := int (get $existingConfig.data "CHRONOS_OWNERSHIP_WORKER_COUNT") -}}
+{{- $existingShardCount := int (get $existingConfig.data "CHRONOS_GENERATOR_OWNERSHIP_MODULO") -}}
+{{- $existingAssignmentSeed := printf "%v" (get $existingConfig.data "CHRONOS_OWNERSHIP_ASSIGNMENT_SEED") -}}
+{{- $existingPlanId := printf "%v" (get $existingConfig.data "CHRONOS_OWNERSHIP_PLAN_ID") -}}
+{{- $existingFormatVersion := int (default "0" (get $existingConfig.data "CHRONOS_CLUSTER_FORMAT_VERSION")) -}}
+{{- $existingDesiredReplicas := int (default 0 $existingStatefulSet.spec.replicas) -}}
+{{- $existingStatusReplicas := int (default 0 $existingStatefulSet.status.replicas) -}}
+{{- $existingReadyReplicas := int (default 0 $existingStatefulSet.status.readyReplicas) -}}
+{{- $existingCurrentReplicas := int (default 0 $existingStatefulSet.status.currentReplicas) -}}
+{{- $existingReplicas := max $existingDesiredReplicas $existingStatusReplicas $existingReadyReplicas $existingCurrentReplicas -}}
+{{- $topologyChanged := or (ne $existingWorkerCount $ownershipWorkerCount) (ne $existingShardCount (int .Values.ownership.shardCount)) (ne $existingAssignmentSeed (printf "%d" (int64 .Values.ownership.assignmentSeed))) (ne $existingPlanId $ownershipPlanId) -}}
+{{- if and (ne $existingFormatVersion $clusterFormatVersion) (gt $existingReplicas 0) (gt $desiredReplicas 0) -}}
+{{- fail (printf "refusing cluster-format change from v%d to v%d while %d old replicas are running; deploy a drain release with replicaCount=0 first" $existingFormatVersion $clusterFormatVersion $existingReplicas) -}}
+{{- end -}}
+{{- if and $topologyChanged (gt $existingReplicas 0) (gt $desiredReplicas 0) -}}
+{{- fail (printf "refusing ownership topology change (plan/worker/shard/seed) while %d old replicas are running; deploy a drain release with replicaCount=0 first" $existingReplicas) -}}
+{{- end -}}
+{{- end -}}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -16,15 +44,19 @@ data:
   CHRONOS_METRICS_BIND_ADDR: 0.0.0.0:9898
   CHRONOS_LOG_FORMAT: {{ .Values.runtime.logFormat | quote }}
   CHRONOS_LOG_FILTER: {{ .Values.runtime.logFilter | quote }}
-  CHRONOS_OWNERSHIP_PLAN_ID: {{ include "chronos.ownershipPlanId" . | quote }}
-  CHRONOS_GENERATOR_OWNERSHIP_MODULO: {{ .Values.ownership.shardCount | quote }}
-  CHRONOS_OWNERSHIP_WORKER_COUNT: {{ .Values.replicaCount | quote }}
-  CHRONOS_OWNERSHIP_ASSIGNMENT_SEED: {{ .Values.ownership.assignmentSeed | quote }}
-  CHRONOS_SAFETY_GAP_MS: {{ .Values.runtime.safetyGapMs | quote }}
+  CHRONOS_CLUSTER_FORMAT_VERSION: {{ $clusterFormatVersion | quote }}
+  CHRONOS_OWNERSHIP_PLAN_ID: {{ $ownershipPlanId | quote }}
+  CHRONOS_GENERATOR_OWNERSHIP_MODULO: {{ printf "%d" (int64 .Values.ownership.shardCount) | quote }}
+  CHRONOS_OWNERSHIP_WORKER_COUNT: {{ printf "%d" (int64 $ownershipWorkerCount) | quote }}
+  CHRONOS_OWNERSHIP_ASSIGNMENT_SEED: {{ printf "%d" (int64 .Values.ownership.assignmentSeed) | quote }}
+  CHRONOS_SAFETY_GAP_MS: {{ printf "%d" (int64 .Values.runtime.safetyGapMs) | quote }}
+  CHRONOS_MAX_CLOCK_SKEW_MS: {{ printf "%d" (int64 .Values.runtime.maxClockSkewMs) | quote }}
   CHRONOS_AUTO_FAILOVER_ENABLED: {{ .Values.autoFailover.enabled | quote }}
-  CHRONOS_AUTO_FAILOVER_INTERVAL_MS: {{ .Values.autoFailover.intervalMs | quote }}
-  CHRONOS_AUTO_FAILOVER_BATCH_SIZE: {{ .Values.autoFailover.batchSize | quote }}
-  CHRONOS_GRPC_REQUEST_TIMEOUT_MS: {{ .Values.runtime.grpcRequestTimeoutMs | quote }}
-  CHRONOS_GRPC_MAX_REQUEST_BYTES: {{ .Values.runtime.grpcMaxRequestBytes | quote }}
-  CHRONOS_GRPC_MAX_CONCURRENT_REQUESTS: {{ .Values.runtime.grpcMaxConcurrentRequests | quote }}
-  CHRONOS_ETCD_TIMEOUT_MS: {{ .Values.etcd.timeoutMs | quote }}
+  CHRONOS_AUTO_FAILOVER_INTERVAL_MS: {{ printf "%d" (int64 .Values.autoFailover.intervalMs) | quote }}
+  CHRONOS_AUTO_FAILOVER_BATCH_SIZE: {{ printf "%d" (int64 .Values.autoFailover.batchSize) | quote }}
+  CHRONOS_GRPC_REQUEST_TIMEOUT_MS: {{ printf "%d" (int64 .Values.runtime.grpcRequestTimeoutMs) | quote }}
+  CHRONOS_GRPC_MAX_REQUEST_BYTES: {{ printf "%d" (int64 .Values.runtime.grpcMaxRequestBytes) | quote }}
+  CHRONOS_GRPC_MAX_CONCURRENT_REQUESTS: {{ printf "%d" (int64 .Values.runtime.grpcMaxConcurrentRequests) | quote }}
+  CHRONOS_GRPC_MAX_CONNECTIONS: {{ printf "%d" (int64 .Values.runtime.grpcMaxConnections) | quote }}
+  CHRONOS_MAX_TIMELINE_RECORDS: {{ printf "%d" (int64 .Values.runtime.maxTimelineRecords) | quote }}
+  CHRONOS_ETCD_TIMEOUT_MS: {{ printf "%d" (int64 .Values.etcd.timeoutMs) | quote }}

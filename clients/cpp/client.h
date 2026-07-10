@@ -51,12 +51,18 @@ class Client {
  private:
   static constexpr std::size_t kMaxRetainedStaleOwnerChannels = 16;
 
-  chronos::tso::v1::TimelineRoute EnsureRoute();
-  chronos::tso::v1::TimelineRoute EnsureRouteLocked();
-  chronos::tso::v1::TimelineRoute RefreshRouteIfUnchangedLocked(
-      const chronos::tso::v1::TimelineRoute& observed_route);
-  chronos::tso::v1::TimelineRoute RefreshRouteLocked();
-  chronos::tso::v1::TimelineRoute InstallRouteLocked(
+  struct RouteSnapshot {
+    chronos::tso::v1::TimelineRoute route;
+    std::shared_ptr<grpc::Channel> owner_channel;
+    std::shared_ptr<chronos::tso::v1::TimestampService::Stub> tso_stub;
+  };
+
+  std::shared_ptr<const RouteSnapshot> EnsureRoute();
+  std::shared_ptr<const RouteSnapshot> EnsureRouteLocked();
+  std::shared_ptr<const RouteSnapshot> RefreshRouteIfUnchangedLocked(
+      const std::shared_ptr<const RouteSnapshot>& observed);
+  std::shared_ptr<const RouteSnapshot> RefreshRouteLocked();
+  std::shared_ptr<const RouteSnapshot> InstallRouteLocked(
       const chronos::tso::v1::TimelineRoute& route);
   void SleepBeforeStaleRouteRetry() const;
   grpc::Status AllocateOnce(
@@ -71,17 +77,14 @@ class Client {
       const chronos::tso::v1::TimelineRoute& right) const;
   void ApplyRequestDeadline(grpc::ClientContext* context) const;
   void RetainStaleOwnerChannelLocked(std::shared_ptr<grpc::Channel> previous);
-  std::string NextClientRequestId(const std::string& timeline_key);
+  std::string NextClientRequestId();
   std::shared_ptr<grpc::ChannelCredentials> CreateChannelCredentials() const;
   std::shared_ptr<grpc::Channel> CreateChannel(const std::string& endpoint) const;
 
   std::shared_ptr<grpc::Channel> route_channel_;
-  std::shared_ptr<grpc::Channel> tso_channel_;
   std::deque<std::shared_ptr<grpc::Channel>> stale_tso_channels_;
   std::unique_ptr<chronos::tso::v1::TimelineRouteService::Stub> route_stub_;
-  std::shared_ptr<chronos::tso::v1::TimestampService::Stub> tso_stub_;
-  chronos::tso::v1::TimelineRoute route_;
-  bool has_route_ = false;
+  std::shared_ptr<const RouteSnapshot> route_snapshot_;
   std::string timeline_key_;
   Config config_;
   std::string idempotency_scope_;

@@ -33,7 +33,9 @@ pub(crate) use runtime::{
     spawn_identity_lease_loss_monitor, supervise_critical_servers, StartupWorkerReadinessSink,
 };
 #[cfg(test)]
-pub(crate) use transport::{build_grpc_server, wait_for_shutdown_signal};
+pub(crate) use transport::{
+    build_grpc_server, grpc_listener_stream_with_limit, wait_for_shutdown_signal,
+};
 #[cfg(test)]
 pub(crate) use transport::{
     health_handler, load_metrics_tls_acceptor, load_root_cert_store, metrics_handler,

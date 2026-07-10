@@ -26,10 +26,19 @@ impl IdentityLeaseAuthority for EtcdMetadataStore {
         instance_id: &str,
         worker_id: &str,
         advertise_endpoint: &str,
+        ownership_plan_id: &str,
+        ownership_modulo: u32,
         ttl: Duration,
     ) -> Result<InstanceIdentityLease, TsoError> {
-        self.acquire_identity_lease_internal(instance_id, worker_id, advertise_endpoint, ttl)
-            .await
+        self.acquire_identity_lease_internal(
+            instance_id,
+            worker_id,
+            advertise_endpoint,
+            ownership_plan_id,
+            ownership_modulo,
+            ttl,
+        )
+        .await
     }
 }
 

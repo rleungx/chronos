@@ -17,6 +17,7 @@ fn load_tso_config_reads_security_mode_and_surface_inputs() {
         env::set_var("CHRONOS_MAX_TIMELINE_PROXY_LANES", "8192");
         env::set_var("CHRONOS_MAX_TIMELINE_RUNTIME_ENTRIES", "16384");
         env::set_var("CHRONOS_MAX_CONCURRENT_TIMELINE_LOADS", "128");
+        env::set_var("CHRONOS_GRPC_MAX_CONNECTIONS", "64");
         env::set_var(
             "CHRONOS_GRPC_CONTROL_CERT_ALLOWLIST",
             "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
@@ -67,6 +68,7 @@ fn load_tso_config_reads_security_mode_and_surface_inputs() {
     assert_eq!(config.max_timeline_proxy_lanes, 8192);
     assert_eq!(config.max_timeline_runtime_entries, 16384);
     assert_eq!(config.max_concurrent_timeline_loads, 128);
+    assert_eq!(config.grpc_max_connections, 64);
 }
 
 #[test]
@@ -306,4 +308,16 @@ fn load_startup_config_accepts_production_capacity_env_vars() {
     assert_eq!(startup.config.max_timeline_proxy_lanes, 8192);
     assert_eq!(startup.config.max_timeline_runtime_entries, 16384);
     assert_eq!(startup.config.max_concurrent_timeline_loads, 128);
+}
+
+#[test]
+fn load_tso_config_rejects_cluster_format_mismatch() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    clear_tso_env();
+    unsafe { env::set_var("CHRONOS_CLUSTER_FORMAT_VERSION", "1") };
+
+    let error = load_tso_config().unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("CHRONOS_CLUSTER_FORMAT_VERSION must match this binary"));
 }

@@ -27,6 +27,10 @@ const (
 // TimelineRouteServiceClient is the client API for TimelineRouteService service.
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
+//
+// Route-management RPCs are used by language clients internally.
+// Application code should prefer a language-level Client wrapper instead of calling these
+// methods directly.
 type TimelineRouteServiceClient interface {
 	GetTimelineRoute(ctx context.Context, in *GetTimelineRouteRequest, opts ...grpc.CallOption) (*GetTimelineRouteResponse, error)
 	EnsureTimeline(ctx context.Context, in *EnsureTimelineRequest, opts ...grpc.CallOption) (*EnsureTimelineResponse, error)
@@ -63,6 +67,10 @@ func (c *timelineRouteServiceClient) EnsureTimeline(ctx context.Context, in *Ens
 // TimelineRouteServiceServer is the server API for TimelineRouteService service.
 // All implementations must embed UnimplementedTimelineRouteServiceServer
 // for forward compatibility.
+//
+// Route-management RPCs are used by language clients internally.
+// Application code should prefer a language-level Client wrapper instead of calling these
+// methods directly.
 type TimelineRouteServiceServer interface {
 	GetTimelineRoute(context.Context, *GetTimelineRouteRequest) (*GetTimelineRouteResponse, error)
 	EnsureTimeline(context.Context, *EnsureTimelineRequest) (*EnsureTimelineResponse, error)
@@ -166,6 +174,8 @@ const (
 // TimestampServiceClient is the client API for TimestampService service.
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
+//
+// Timestamp allocation is the primary application-facing operation.
 type TimestampServiceClient interface {
 	AllocateTimestamps(ctx context.Context, in *AllocateTimestampsRequest, opts ...grpc.CallOption) (*AllocateTimestampsResponse, error)
 }
@@ -191,6 +201,8 @@ func (c *timestampServiceClient) AllocateTimestamps(ctx context.Context, in *All
 // TimestampServiceServer is the server API for TimestampService service.
 // All implementations must embed UnimplementedTimestampServiceServer
 // for forward compatibility.
+//
+// Timestamp allocation is the primary application-facing operation.
 type TimestampServiceServer interface {
 	AllocateTimestamps(context.Context, *AllocateTimestampsRequest) (*AllocateTimestampsResponse, error)
 	mustEmbedUnimplementedTimestampServiceServer()
@@ -269,6 +281,8 @@ const (
 // TimelineControlServiceClient is the client API for TimelineControlService service.
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
+//
+// Control and health RPCs are intended for operators, control planes, and diagnostics.
 type TimelineControlServiceClient interface {
 	TransferTimeline(ctx context.Context, in *TransferTimelineRequest, opts ...grpc.CallOption) (*TransferTimelineResponse, error)
 	Health(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*HealthResponse, error)
@@ -305,6 +319,8 @@ func (c *timelineControlServiceClient) Health(ctx context.Context, in *emptypb.E
 // TimelineControlServiceServer is the server API for TimelineControlService service.
 // All implementations must embed UnimplementedTimelineControlServiceServer
 // for forward compatibility.
+//
+// Control and health RPCs are intended for operators, control planes, and diagnostics.
 type TimelineControlServiceServer interface {
 	TransferTimeline(context.Context, *TransferTimelineRequest) (*TransferTimelineResponse, error)
 	Health(context.Context, *emptypb.Empty) (*HealthResponse, error)
@@ -410,6 +426,8 @@ const (
 // TimelineStatusServiceClient is the client API for TimelineStatusService service.
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
+//
+// Status RPCs are intended for diagnostics and operator tooling.
 type TimelineStatusServiceClient interface {
 	GetTimelineStatus(ctx context.Context, in *GetTimelineStatusRequest, opts ...grpc.CallOption) (*GetTimelineStatusResponse, error)
 	ListTimelineStatuses(ctx context.Context, in *ListTimelineStatusesRequest, opts ...grpc.CallOption) (*ListTimelineStatusesResponse, error)
@@ -446,6 +464,8 @@ func (c *timelineStatusServiceClient) ListTimelineStatuses(ctx context.Context, 
 // TimelineStatusServiceServer is the server API for TimelineStatusService service.
 // All implementations must embed UnimplementedTimelineStatusServiceServer
 // for forward compatibility.
+//
+// Status RPCs are intended for diagnostics and operator tooling.
 type TimelineStatusServiceServer interface {
 	GetTimelineStatus(context.Context, *GetTimelineStatusRequest) (*GetTimelineStatusResponse, error)
 	ListTimelineStatuses(context.Context, *ListTimelineStatusesRequest) (*ListTimelineStatusesResponse, error)

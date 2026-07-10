@@ -21,6 +21,7 @@ pub const DEFAULT_METADATA_KIND: &str = "memory";
 pub const DEFAULT_MAX_TIMELINE_PROXY_LANES: usize = 8_192;
 pub const DEFAULT_MAX_TIMELINE_RUNTIME_ENTRIES: usize = 16_384;
 pub const DEFAULT_MAX_CONCURRENT_TIMELINE_LOADS: usize = 64;
+pub const DEFAULT_MAX_TIMELINE_RECORDS: usize = 100_000;
 pub const DEFAULT_MAX_BATCH_PER_REQUEST: u32 = 4_096;
 pub const PRODUCTION_MAX_BATCH_PER_REQUEST: u32 = 4_096;
 pub const PRODUCTION_MAX_TIMELINE_PROXY_LANES: usize = 8_192;
@@ -31,6 +32,8 @@ pub const DEFAULT_REQUEST_RECORD_CLEANUP_INTERVAL_MS: u64 = 60_000;
 pub const DEFAULT_REQUEST_RECORD_CLEANUP_BATCH_SIZE: usize = 512;
 pub const DEFAULT_AUTO_FAILOVER_INTERVAL_MS: u64 = 1_000;
 pub const DEFAULT_AUTO_FAILOVER_BATCH_SIZE: usize = 16;
+pub const DEFAULT_MAX_CLOCK_SKEW_MS: u64 = 500;
+pub const DEFAULT_GRPC_MAX_CONNECTIONS: usize = 1_024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TsoSecurityMode {
@@ -94,6 +97,10 @@ pub enum TsoConfigValidationError {
     ZeroMaxTimelineRuntimeEntries,
     #[error("max_concurrent_timeline_loads must be greater than 0")]
     ZeroMaxConcurrentTimelineLoads,
+    #[error("max_timeline_records must be greater than 0")]
+    ZeroMaxTimelineRecords,
+    #[error("grpc_max_connections must be greater than 0")]
+    ZeroGrpcMaxConnections,
     #[error("default resource tier {resource_tier} has no configured generators")]
     MissingDefaultTierCapacity { resource_tier: ResourceTier },
     #[error("{0}")]
@@ -171,6 +178,7 @@ pub struct TsoConfig {
     pub grpc_request_timeout_ms: Option<u64>,
     pub grpc_max_request_bytes: Option<usize>,
     pub grpc_max_concurrent_requests: Option<usize>,
+    pub grpc_max_connections: usize,
     pub metrics_tls_cert_file: Option<String>,
     pub metrics_tls_key_file: Option<String>,
     pub metrics_client_ca_file: Option<String>,
@@ -180,12 +188,15 @@ pub struct TsoConfig {
     pub etcd_timeout_ms: Option<u64>,
     pub pre_borrow_ms: u64,
     pub max_clock_rewind_ms: u64,
+    /// Maximum certified pairwise wall-clock skew between workers.
+    pub max_clock_skew_ms: u64,
     pub recovery_catchup_budget_ms: u64,
     pub shared_jump_ahead_threshold_ms: u64,
     pub safety_gap_ms: u64,
     pub max_timeline_proxy_lanes: usize,
     pub max_timeline_runtime_entries: usize,
     pub max_concurrent_timeline_loads: usize,
+    pub max_timeline_records: usize,
     pub request_record_pending_timeout_ms: u64,
     pub request_record_retention_ms: u64,
     pub request_record_cleanup_interval_ms: u64,
@@ -230,6 +241,7 @@ impl Default for TsoConfig {
             grpc_request_timeout_ms: None,
             grpc_max_request_bytes: None,
             grpc_max_concurrent_requests: None,
+            grpc_max_connections: DEFAULT_GRPC_MAX_CONNECTIONS,
             metrics_tls_cert_file: None,
             metrics_tls_key_file: None,
             metrics_client_ca_file: None,
@@ -239,12 +251,14 @@ impl Default for TsoConfig {
             etcd_timeout_ms: None,
             pre_borrow_ms: 1000,
             max_clock_rewind_ms: 30_000,
+            max_clock_skew_ms: DEFAULT_MAX_CLOCK_SKEW_MS,
             recovery_catchup_budget_ms: 5_000,
             shared_jump_ahead_threshold_ms: 5_000,
             safety_gap_ms: 0,
             max_timeline_proxy_lanes: DEFAULT_MAX_TIMELINE_PROXY_LANES,
             max_timeline_runtime_entries: DEFAULT_MAX_TIMELINE_RUNTIME_ENTRIES,
             max_concurrent_timeline_loads: DEFAULT_MAX_CONCURRENT_TIMELINE_LOADS,
+            max_timeline_records: DEFAULT_MAX_TIMELINE_RECORDS,
             request_record_pending_timeout_ms: DEFAULT_REQUEST_RECORD_PENDING_TIMEOUT_MS,
             request_record_retention_ms: DEFAULT_REQUEST_RECORD_RETENTION_MS,
             request_record_cleanup_interval_ms: DEFAULT_REQUEST_RECORD_CLEANUP_INTERVAL_MS,
@@ -273,6 +287,10 @@ impl TsoConfig {
                 self.max_batch_per_request = PRODUCTION_MAX_BATCH_PER_REQUEST;
                 self.max_timeline_proxy_lanes = PRODUCTION_MAX_TIMELINE_PROXY_LANES;
                 self.max_timeline_runtime_entries = PRODUCTION_MAX_TIMELINE_RUNTIME_ENTRIES;
+                self.safety_gap_ms = self
+                    .safety_gap_ms
+                    .max(DEFAULT_MAX_CLOCK_SKEW_MS)
+                    .max(self.max_clock_skew_ms);
                 Ok(())
             }
             other => Err(format!("unknown CHRONOS_PROFILE: {}", other)),
@@ -393,6 +411,17 @@ impl TsoConfig {
             return Err(TsoConfigValidationError::Security(
                 "CHRONOS_SAFETY_GAP_MS must be greater than 0 when metadata=etcd".into(),
             ));
+        }
+        if self.max_clock_skew_ms == 0 {
+            return Err(TsoConfigValidationError::Security(
+                "CHRONOS_MAX_CLOCK_SKEW_MS must be greater than 0 when metadata=etcd".into(),
+            ));
+        }
+        if self.safety_gap_ms < self.max_clock_skew_ms {
+            return Err(TsoConfigValidationError::Security(format!(
+                "CHRONOS_SAFETY_GAP_MS ({}) must be greater than or equal to the certified CHRONOS_MAX_CLOCK_SKEW_MS ({}) when metadata=etcd",
+                self.safety_gap_ms, self.max_clock_skew_ms
+            )));
         }
         if self.generator_ownership_modulo > 1
             && self
@@ -543,6 +572,12 @@ impl TsoConfig {
         }
         if self.max_concurrent_timeline_loads == 0 {
             return Err(TsoConfigValidationError::ZeroMaxConcurrentTimelineLoads);
+        }
+        if self.max_timeline_records == 0 {
+            return Err(TsoConfigValidationError::ZeroMaxTimelineRecords);
+        }
+        if self.grpc_max_connections == 0 {
+            return Err(TsoConfigValidationError::ZeroGrpcMaxConnections);
         }
         validate_positive_u64_value(
             "CHRONOS_REQUEST_RECORD_PENDING_TIMEOUT_MS",

@@ -27,6 +27,8 @@ impl TsoService {
     ) -> Result<AllocateTimestampsResponse, TsoError> {
         let _timer = metrics::TSO_ALLOCATE_LATENCY.start_timer();
 
+        super::validation::validate_timeline_key(&request.timeline_key)?;
+        super::validation::validate_client_request_id(&request.client_request_id)?;
         if request.count == 0 {
             return Err(TsoError::InvalidCount);
         }

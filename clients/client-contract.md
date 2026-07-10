@@ -13,11 +13,15 @@ Every client must support the same behavior:
 
 - ensure the bound timeline on first connect
 - install the route returned by `EnsureTimeline` without an extra initial `GetTimelineRoute`
-- cache the current route and allocation owner endpoint internally
+- cache the route, owner channel, and allocation stub as one immutable snapshot so an allocation
+  can never combine a route from one refresh generation with another owner's channel
+- singleflight concurrent route refreshes for the same observed stale snapshot
 - allocate against the `owner_worker_endpoint` returned by the route service
 - refresh the route and retry only for Chronos stale-route error details:
   `NOT_TIMELINE_OWNER`, `ROUTE_VERSION_MISMATCH`, and `EPOCH_MISMATCH`
 - reuse the same logical client request id across stale-route retries when idempotency is enabled
+- keep generated request IDs independent of user-controlled timeline length and within the server's
+  128-byte request-ID limit
 - reject missing routes and routes with an empty owner endpoint
 - return non-route RPC failures directly to the caller
 

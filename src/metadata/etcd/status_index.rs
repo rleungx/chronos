@@ -1,4 +1,10 @@
+use super::lease_lock::EtcdLeaseLock;
 use super::*;
+
+enum StatusIndexRebuildWait {
+    Ready,
+    LockReleased,
+}
 
 impl EtcdMetadataStore {
     pub(super) fn timeline_status_index_keys(&self, record: &TimelineRecord) -> [String; 2] {
@@ -43,29 +49,74 @@ impl EtcdMetadataStore {
 
     pub(super) async fn rebuild_timeline_status_indexes(&self) -> Result<(), TsoError> {
         let marker_key = self.timeline_status_index_marker_key();
-        if self.status_index_ready_marker_exists(&marker_key).await? {
-            return Ok(());
-        }
-        let Some(lock_key) = self
-            .try_acquire_status_index_rebuild_lock(&marker_key)
-            .await?
-        else {
-            return self.wait_for_status_index_rebuild(&marker_key).await;
+        let lock_key = self.timeline_status_index_rebuild_lock_key();
+        let lock = loop {
+            if self.status_index_marker_is_current(&marker_key).await? {
+                return Ok(());
+            }
+            if let Some(lock) = self
+                .try_acquire_lease_lock(
+                    lock_key.clone(),
+                    STATUS_INDEX_REBUILD_LOCK_TTL_SECS,
+                    Vec::new(),
+                    "status_index_rebuild_lock",
+                )
+                .await?
+            {
+                // The marker may have become current after the pre-lock read. Recheck while
+                // holding the lock so a waiter never performs a redundant destructive rebuild.
+                if self.status_index_marker_is_current(&marker_key).await? {
+                    self.release_lease_lock(lock, "status_index_rebuild_lock")
+                        .await;
+                    return Ok(());
+                }
+                break lock;
+            }
+            match self
+                .wait_for_status_index_rebuild(&marker_key, &lock_key)
+                .await?
+            {
+                StatusIndexRebuildWait::Ready => return Ok(()),
+                StatusIndexRebuildWait::LockReleased => continue,
+            }
         };
 
+        let result = self
+            .rebuild_timeline_status_indexes_with_lock(&marker_key, &lock)
+            .await;
+        self.release_lease_lock(lock, "status_index_rebuild_lock")
+            .await;
+        result
+    }
+
+    async fn rebuild_timeline_status_indexes_with_lock(
+        &self,
+        marker_key: &str,
+        lock: &EtcdLeaseLock,
+    ) -> Result<(), TsoError> {
         let index_prefix = self.timeline_status_index_prefix();
-        self.etcd_delete(
-            "status_index_rebuild",
-            index_prefix.clone(),
-            Some(DeleteOptions::new().with_prefix()),
-        )
-        .await
-        .map_err(|error| {
-            metrics::TSO_METADATA_ERRORS_TOTAL
-                .with_label_values(&["status_index_rebuild"])
-                .inc();
-            TsoError::Internal(format!("Etcd status index cleanup failed: {}", error))
-        })?;
+        let cleanup = self
+            .etcd_txn(
+                "status_index_rebuild",
+                Txn::new()
+                    .when(vec![lock.fence_compare()])
+                    .and_then(vec![TxnOp::delete(
+                        index_prefix.as_bytes(),
+                        Some(DeleteOptions::new().with_prefix()),
+                    )]),
+            )
+            .await
+            .map_err(|error| {
+                metrics::TSO_METADATA_ERRORS_TOTAL
+                    .with_label_values(&["status_index_rebuild"])
+                    .inc();
+                TsoError::Internal(format!("Etcd status index cleanup failed: {error}"))
+            })?;
+        if !cleanup.succeeded() {
+            return Err(TsoError::Internal(
+                "Etcd status index rebuild lock was lost before cleanup".into(),
+            ));
+        }
 
         let route_prefix = self.route_prefix();
         let route_range_end = prefix_range_end(&route_prefix);
@@ -92,8 +143,9 @@ impl EtcdMetadataStore {
                 break;
             }
 
-            let mut ops = Vec::with_capacity(response.kvs().len() * 2);
             for kv in response.kvs() {
+                let route_key = kv.key().to_vec();
+                let route_revision = kv.mod_revision();
                 let record: TimelineRecord =
                     serde_json::from_slice(kv.value()).map_err(|error| {
                         metrics::TSO_METADATA_ERRORS_TOTAL
@@ -105,11 +157,17 @@ impl EtcdMetadataStore {
                         ))
                     })?;
                 record.validate_schema_version()?;
-                ops.extend(self.timeline_status_index_put_ops(&record, "status_index_rebuild")?);
-            }
-
-            if !ops.is_empty() {
-                self.etcd_txn("status_index_rebuild", Txn::new().and_then(ops))
+                let ops = self.timeline_status_index_put_ops(&record, "status_index_rebuild")?;
+                let response = self
+                    .etcd_txn(
+                        "status_index_rebuild",
+                        Txn::new()
+                            .when(vec![
+                                lock.fence_compare(),
+                                Compare::mod_revision(route_key, CompareOp::Equal, route_revision),
+                            ])
+                            .and_then(ops),
+                    )
                     .await
                     .map_err(|error| {
                         metrics::TSO_METADATA_ERRORS_TOTAL
@@ -120,6 +178,11 @@ impl EtcdMetadataStore {
                             error
                         ))
                     })?;
+                if !response.succeeded() && !self.lease_lock_is_owned(lock).await? {
+                    return Err(TsoError::Internal(
+                        "Etcd status index rebuild lock was lost while indexing routes".into(),
+                    ));
+                }
             }
 
             let last_key = response
@@ -130,27 +193,30 @@ impl EtcdMetadataStore {
             start_key = next_etcd_key_after(&last_key);
         }
 
-        self.etcd_txn(
-            "status_index_rebuild",
-            Txn::new().and_then(vec![
-                TxnOp::put(marker_key.as_bytes(), "1", None),
-                TxnOp::delete(lock_key.as_bytes(), None),
-            ]),
-        )
-        .await
-        .map_err(|error| {
-            metrics::TSO_METADATA_ERRORS_TOTAL
-                .with_label_values(&["status_index_rebuild"])
-                .inc();
-            TsoError::Internal(format!("Etcd status index marker write failed: {}", error))
-        })?;
+        let response = self
+            .etcd_txn(
+                "status_index_rebuild",
+                Txn::new().when(vec![lock.fence_compare()]).and_then(vec![
+                    TxnOp::put(marker_key.as_bytes(), CURRENT_STATUS_INDEX_VERSION, None),
+                    TxnOp::delete(lock.key().as_bytes(), None),
+                ]),
+            )
+            .await
+            .map_err(|error| {
+                metrics::TSO_METADATA_ERRORS_TOTAL
+                    .with_label_values(&["status_index_rebuild"])
+                    .inc();
+                TsoError::Internal(format!("Etcd status index marker write failed: {error}"))
+            })?;
+        if !response.succeeded() {
+            return Err(TsoError::Internal(
+                "Etcd status index rebuild lock was lost before publishing the marker".into(),
+            ));
+        }
         Ok(())
     }
 
-    pub(super) async fn status_index_ready_marker_exists(
-        &self,
-        marker_key: &str,
-    ) -> Result<bool, TsoError> {
+    async fn status_index_marker_is_current(&self, marker_key: &str) -> Result<bool, TsoError> {
         let marker = self
             .etcd_get("status_index_rebuild", marker_key.as_bytes().to_vec(), None)
             .await
@@ -160,62 +226,36 @@ impl EtcdMetadataStore {
                     .inc();
                 TsoError::Internal(format!("Etcd status index marker lookup failed: {}", error))
             })?;
-        Ok(!marker.kvs().is_empty())
+        Ok(marker
+            .kvs()
+            .first()
+            .is_some_and(|kv| kv.value() == CURRENT_STATUS_INDEX_VERSION.as_bytes()))
     }
 
-    pub(super) async fn try_acquire_status_index_rebuild_lock(
+    async fn wait_for_status_index_rebuild(
         &self,
         marker_key: &str,
-    ) -> Result<Option<String>, TsoError> {
-        let lock_key = self.timeline_status_index_rebuild_lock_key();
-        let lease_id = self
-            .etcd_lease_grant(STATUS_INDEX_REBUILD_LOCK_TTL_SECS)
-            .await
-            .map_err(|error| {
-                metrics::TSO_METADATA_ERRORS_TOTAL
-                    .with_label_values(&["status_index_rebuild"])
-                    .inc();
-                TsoError::Internal(format!("Etcd status index lock lease failed: {}", error))
-            })?
-            .id();
-        let lock_value = format!(
-            "{}:{}:{}",
-            std::process::id(),
-            Self::ownership_plan_timestamp_ms(),
-            marker_key
-        );
-        let response = self
-            .etcd_txn(
-                "status_index_rebuild",
-                Txn::new()
-                    .when(vec![
-                        Compare::mod_revision(marker_key.as_bytes(), CompareOp::Equal, 0),
-                        Compare::mod_revision(lock_key.as_bytes(), CompareOp::Equal, 0),
-                    ])
-                    .and_then(vec![TxnOp::put(
-                        lock_key.as_bytes(),
-                        lock_value,
-                        Some(PutOptions::new().with_lease(lease_id)),
-                    )]),
-            )
-            .await
-            .map_err(|error| {
-                metrics::TSO_METADATA_ERRORS_TOTAL
-                    .with_label_values(&["status_index_rebuild"])
-                    .inc();
-                TsoError::Internal(format!("Etcd status index lock txn failed: {}", error))
-            })?;
-        Ok(response.succeeded().then_some(lock_key))
-    }
-
-    pub(super) async fn wait_for_status_index_rebuild(
-        &self,
-        marker_key: &str,
-    ) -> Result<(), TsoError> {
+        lock_key: &str,
+    ) -> Result<StatusIndexRebuildWait, TsoError> {
         let deadline = Instant::now() + Duration::from_millis(STATUS_INDEX_REBUILD_WAIT_TIMEOUT_MS);
         loop {
-            if self.status_index_ready_marker_exists(marker_key).await? {
-                return Ok(());
+            if self.status_index_marker_is_current(marker_key).await? {
+                return Ok(StatusIndexRebuildWait::Ready);
+            }
+            let lock = self
+                .etcd_get(
+                    "status_index_rebuild_wait",
+                    lock_key.as_bytes().to_vec(),
+                    None,
+                )
+                .await
+                .map_err(|error| {
+                    TsoError::Internal(format!(
+                        "Etcd status index rebuild lock lookup failed: {error}"
+                    ))
+                })?;
+            if lock.kvs().is_empty() {
+                return Ok(StatusIndexRebuildWait::LockReleased);
             }
             if Instant::now() >= deadline {
                 return Err(TsoError::Internal(
@@ -231,22 +271,37 @@ impl EtcdMetadataStore {
         timeline_key: &str,
         record: &TimelineRecord,
     ) -> Result<u64, TsoError> {
+        self.create_timeline_with_indexes_internal(timeline_key, record, None)
+            .await
+    }
+
+    pub(super) async fn create_timeline_with_indexes_fenced(
+        &self,
+        timeline_key: &str,
+        record: &TimelineRecord,
+        lock: &EtcdLeaseLock,
+    ) -> Result<u64, TsoError> {
+        self.create_timeline_with_indexes_internal(timeline_key, record, Some(lock))
+            .await
+    }
+
+    async fn create_timeline_with_indexes_internal(
+        &self,
+        timeline_key: &str,
+        record: &TimelineRecord,
+        lock: Option<&EtcdLeaseLock>,
+    ) -> Result<u64, TsoError> {
         let key = self.timeline_key(timeline_key);
         let value = Self::serialize_record(record, "create", "Record serialization")?;
         let mut ops = vec![TxnOp::put(key.as_bytes(), value, None)];
         ops.extend(self.timeline_status_index_put_ops(record, "create")?);
+        let mut comparisons = vec![Compare::mod_revision(key.as_bytes(), CompareOp::Equal, 0)];
+        if let Some(lock) = lock {
+            comparisons.push(lock.fence_compare());
+        }
 
         let response = self
-            .etcd_txn(
-                "create",
-                Txn::new()
-                    .when(vec![Compare::mod_revision(
-                        key.as_bytes(),
-                        CompareOp::Equal,
-                        0,
-                    )])
-                    .and_then(ops),
-            )
+            .etcd_txn("create", Txn::new().when(comparisons).and_then(ops))
             .await
             .map_err(|error| {
                 metrics::TSO_METADATA_ERRORS_TOTAL
@@ -257,7 +312,11 @@ impl EtcdMetadataStore {
 
         if !response.succeeded() {
             record_metadata_conflict("create", "already_exists");
-            return Err(TsoError::MetadataAlreadyExists);
+            return Err(if lock.is_some() {
+                TsoError::CasFailed
+            } else {
+                TsoError::MetadataAlreadyExists
+            });
         }
 
         Self::extract_put_revision(response, "create", "invalid txn response")

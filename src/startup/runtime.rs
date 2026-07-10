@@ -31,7 +31,8 @@ use super::readiness_reason::{
 use super::serving_gate::{CriticalStartupListener, StartupServingGate};
 use super::transport::{
     bind_grpc_listener, bind_health_listener, bind_metrics_listener, build_grpc_server,
-    grpc_listener_stream, serve_health_listener, serve_metrics_listener, wait_for_shutdown_signal,
+    grpc_listener_stream_with_limit, serve_health_listener, serve_metrics_listener,
+    wait_for_shutdown_signal,
 };
 
 fn init_tracing(logging: &StartupLoggingConfig) {
@@ -813,7 +814,7 @@ pub(crate) async fn run() -> AppResult<()> {
                 .add_service(control_service)
                 .add_service(timeline_status_service)
                 .serve_with_incoming_shutdown(
-                    grpc_listener_stream(grpc_listener),
+                    grpc_listener_stream_with_limit(grpc_listener, config.grpc_max_connections),
                     wait_for_shutdown_signal(shutdown_rx),
                 )
                 .await

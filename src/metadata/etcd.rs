@@ -1,8 +1,10 @@
+mod cluster_format;
 mod connect;
 mod control;
 mod generator;
 mod identity_lifecycle;
 mod json;
+mod lease_lock;
 mod request_index;
 mod request_records;
 mod retry;
@@ -31,23 +33,28 @@ use crate::{metrics, TimelineLifecycleState, TimelineRoute, TsoConfig, TsoError}
 
 const REQUEST_RECORD_PRUNE_MIN_FETCH_LIMIT: usize = 128;
 const REQUEST_RECORD_PRUNE_MAX_FETCH_LIMIT: usize = 4096;
+const LEGACY_REQUEST_REVISION_FLAG: u64 = 1 << 63;
 const STATUS_INDEX_REBUILD_BATCH_RECORDS: usize = 32;
+const CURRENT_STATUS_INDEX_VERSION: &str = "2";
 const GENERATOR_BATCH_GET_CHUNK_SIZE: usize = 64;
 const GENERATOR_SCAN_BATCH_RECORDS: usize = 128;
 const STATUS_INDEX_REBUILD_LOCK_TTL_SECS: i64 = 120;
 const STATUS_INDEX_REBUILD_WAIT_TIMEOUT_MS: u64 = 120_000;
+const TIMELINE_CREATION_LOCK_TTL_SECS: i64 = 30;
+const TIMELINE_CREATION_LOCK_RETRY_ATTEMPTS: usize = 200;
 
 use self::connect::build_etcd_connect_options;
 use self::retry::{
     etcd_request_retry_budget, identity_keepalive_reconnect_backoff, retry_etcd_request,
-    route_watch_reconnect_backoff, DEFAULT_ETCD_REQUEST_RETRY_BUDGET_MS,
+    route_watch_reconnect_backoff,
 };
 
 use super::{
     identity::InstanceIdentityLeaseRecord,
     keys,
     types::{
-        timeline_route_update_from_routes, RouteUpdateSignal, CURRENT_METADATA_SCHEMA_VERSION,
+        timeline_route_update_from_routes, RouteUpdateSignal, CURRENT_CLUSTER_FORMAT_VERSION,
+        CURRENT_METADATA_SCHEMA_VERSION,
     },
     GeneratorBatchOp, GeneratorLeaseAuthority, GeneratorRecord, IdentityLeaseAuthority,
     InstanceIdentityLease, OwnershipPlanMember, OwnershipPlanRecord, RequestRecord,
@@ -136,14 +143,12 @@ fn verify_instance_identity_lease_record(
     expected_lease_id: i64,
     actual_lease_id: i64,
     value: &[u8],
-    instance_id: &str,
-    worker_id: &str,
-    advertise_endpoint: &str,
+    expected_record: &InstanceIdentityLeaseRecord,
 ) -> Result<(), TsoError> {
     if actual_lease_id != expected_lease_id {
         return Err(TsoError::Internal(format!(
             "Etcd identity lease startup probe observed lease {} but expected {} for instance {}",
-            actual_lease_id, expected_lease_id, instance_id
+            actual_lease_id, expected_lease_id, expected_record.instance_id
         )));
     }
 
@@ -154,17 +159,27 @@ fn verify_instance_identity_lease_record(
         ))
     })?;
 
-    if record.instance_id != instance_id
-        || record.worker_id != worker_id
-        || record.advertise_endpoint != advertise_endpoint
-    {
+    if &record != expected_record {
         return Err(TsoError::Internal(format!(
             "Etcd identity lease startup probe observed mismatched identity record for instance {}",
-            instance_id
+            expected_record.instance_id
         )));
     }
 
     Ok(())
+}
+
+fn identity_record_belongs_to_ownership_plan(
+    identity: &InstanceIdentityLeaseRecord,
+    plan_id: &str,
+    modulo: u32,
+) -> bool {
+    if identity.ownership_plan_id.is_empty() {
+        // Legacy identities do not declare their plan. Treat them as active for the existing
+        // plan so a mixed-version rollout cannot silently replace ownership underneath them.
+        return true;
+    }
+    identity.ownership_plan_id == plan_id && identity.ownership_modulo == modulo
 }
 
 fn identity_claim_matches_record(
@@ -304,27 +319,15 @@ impl EtcdMetadataStore {
         let request_retry_budget = etcd_request_retry_budget(config);
         let store =
             Self::connect_with_options(endpoints, prefix, options, request_retry_budget).await?;
+        if let Err(error) = store.initialize_cluster_format_and_indexes().await {
+            store.shutdown_route_watch().await;
+            return Err(error);
+        }
         if let Err(error) = store.probe_metadata_runtime().await {
             store.shutdown_route_watch().await;
             return Err(error);
         }
         Ok(store)
-    }
-
-    /// Raw etcd entrypoint for tests or explicitly unchecked callers.
-    ///
-    /// This bypasses config-derived endpoint validation, timeout wiring, and mTLS file loading.
-    pub async fn from_raw_endpoints_unchecked(
-        endpoints: Vec<String>,
-        prefix: String,
-    ) -> Result<Self, TsoError> {
-        Self::connect_with_options(
-            endpoints,
-            prefix,
-            None,
-            Duration::from_millis(DEFAULT_ETCD_REQUEST_RETRY_BUDGET_MS),
-        )
-        .await
     }
 
     async fn connect_with_options(
@@ -346,7 +349,6 @@ impl EtcdMetadataStore {
             route_watch_shutdown_tx,
             route_watch_task: StdMutex::new(None),
         };
-        store.rebuild_timeline_status_indexes().await?;
         store.spawn_route_watch_loop();
         Ok(store)
     }
@@ -363,22 +365,6 @@ impl EtcdMetadataStore {
             let key = key.clone();
             let options = options.clone();
             async move { client.get(key, options).await }
-        })
-        .await
-    }
-
-    async fn etcd_delete(
-        &self,
-        op_label: &'static str,
-        key: impl Into<Vec<u8>>,
-        options: Option<DeleteOptions>,
-    ) -> Result<etcd_client::DeleteResponse, etcd_client::Error> {
-        let key = key.into();
-        retry_etcd_request(op_label, self.request_retry_budget, || {
-            let mut client = self.client.clone();
-            let key = key.clone();
-            let options = options.clone();
-            async move { client.delete(key, options).await }
         })
         .await
     }
@@ -400,7 +386,15 @@ impl EtcdMetadataStore {
         &self,
         ttl: i64,
     ) -> Result<etcd_client::LeaseGrantResponse, etcd_client::Error> {
-        retry_etcd_request("identity_lease_grant", self.request_retry_budget, || {
+        self.etcd_lease_grant_for("identity_lease_grant", ttl).await
+    }
+
+    async fn etcd_lease_grant_for(
+        &self,
+        op_label: &'static str,
+        ttl: i64,
+    ) -> Result<etcd_client::LeaseGrantResponse, etcd_client::Error> {
+        retry_etcd_request(op_label, self.request_retry_budget, || {
             let mut client = self.client.clone();
             async move { client.lease_grant(ttl, None).await }
         })
@@ -412,14 +406,20 @@ impl EtcdMetadataStore {
         lease_id: i64,
     ) -> Result<(etcd_client::LeaseKeeper, etcd_client::LeaseKeepAliveStream), etcd_client::Error>
     {
-        retry_etcd_request(
-            "identity_lease_keepalive_open",
-            self.request_retry_budget,
-            || {
-                let mut client = self.client.clone();
-                async move { client.lease_keep_alive(lease_id).await }
-            },
-        )
+        self.etcd_lease_keep_alive_for("identity_lease_keepalive_open", lease_id)
+            .await
+    }
+
+    async fn etcd_lease_keep_alive_for(
+        &self,
+        op_label: &'static str,
+        lease_id: i64,
+    ) -> Result<(etcd_client::LeaseKeeper, etcd_client::LeaseKeepAliveStream), etcd_client::Error>
+    {
+        retry_etcd_request(op_label, self.request_retry_budget, || {
+            let mut client = self.client.clone();
+            async move { client.lease_keep_alive(lease_id).await }
+        })
         .await
     }
 
@@ -479,8 +479,16 @@ impl EtcdMetadataStore {
         keys::request_key(&self.prefix, timeline_key, client_request_id)
     }
 
+    fn legacy_request_key(&self, timeline_key: &str, client_request_id: &str) -> String {
+        keys::legacy_request_key(&self.prefix, timeline_key, client_request_id)
+    }
+
     fn request_prefix(&self) -> String {
         keys::request_prefix(&self.prefix)
+    }
+
+    fn legacy_request_prefix(&self) -> String {
+        keys::legacy_request_prefix(&self.prefix)
     }
 
     fn request_cleanup_index_key(
@@ -501,6 +509,28 @@ impl EtcdMetadataStore {
         keys::request_cleanup_index_prefix(&self.prefix)
     }
 
+    fn legacy_request_cleanup_index_key(
+        &self,
+        record: &RequestRecord,
+        timeline_key: &str,
+        client_request_id: &str,
+    ) -> String {
+        keys::legacy_request_cleanup_index_key(
+            &self.prefix,
+            record.updated_at_ms,
+            timeline_key,
+            client_request_id,
+        )
+    }
+
+    fn legacy_request_cleanup_index_prefix(&self) -> String {
+        keys::legacy_request_cleanup_index_prefix(&self.prefix)
+    }
+
+    fn legacy_request_cleanup_index_cutoff(&self, older_than_ms: u64) -> String {
+        keys::legacy_request_cleanup_index_cutoff(&self.prefix, older_than_ms)
+    }
+
     fn request_cleanup_index_cutoff(&self, older_than_ms: u64) -> String {
         keys::request_cleanup_index_cutoff(&self.prefix, older_than_ms)
     }
@@ -515,6 +545,14 @@ impl EtcdMetadataStore {
 
     fn ownership_plan_key(&self) -> String {
         keys::ownership_plan_key(&self.prefix)
+    }
+
+    fn cluster_format_key(&self) -> String {
+        keys::cluster_format_key(&self.prefix)
+    }
+
+    fn timeline_creation_lock_key(&self) -> String {
+        keys::timeline_creation_lock_key(&self.prefix)
     }
 
     fn ownership_plan_timestamp_ms() -> u64 {

@@ -1,5 +1,32 @@
 use super::*;
 
+#[derive(Clone)]
+struct GlobalConcurrencyProbeService {
+    entered: Arc<std::sync::atomic::AtomicUsize>,
+    first_entered: Arc<tokio::sync::Notify>,
+    release_first: Arc<tokio::sync::Notify>,
+}
+
+#[tonic::async_trait]
+impl chronos::proto::v1::timestamp_service_server::TimestampService
+    for GlobalConcurrencyProbeService
+{
+    async fn allocate_timestamps(
+        &self,
+        _request: tonic::Request<ProtoAllocateTimestampsRequest>,
+    ) -> Result<tonic::Response<chronos::proto::v1::AllocateTimestampsResponse>, tonic::Status>
+    {
+        let ordinal = self.entered.fetch_add(1, Ordering::SeqCst) + 1;
+        if ordinal == 1 {
+            self.first_entered.notify_one();
+            self.release_first.notified().await;
+        }
+        Ok(tonic::Response::new(
+            chronos::proto::v1::AllocateTimestampsResponse::default(),
+        ))
+    }
+}
+
 #[tokio::test]
 async fn etcd_metadata_from_config_rejects_unreadable_tls_files() {
     let error = match EtcdMetadataStore::from_config(
@@ -295,6 +322,91 @@ async fn grpc_runtime_rejects_requests_above_max_request_bytes() {
     shutdown_tx.send(true).unwrap();
     server_handle.await.unwrap().unwrap();
     service.shutdown().await;
+}
+
+#[tokio::test]
+async fn grpc_concurrency_limit_is_global_across_connections() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+
+    let config = TsoConfig {
+        grpc_max_concurrent_requests: Some(1),
+        grpc_request_timeout_ms: None,
+        ..explicit_dev_insecure_local_config(addr)
+    };
+    let entered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let first_entered = Arc::new(tokio::sync::Notify::new());
+    let release_first = Arc::new(tokio::sync::Notify::new());
+    let probe = GlobalConcurrencyProbeService {
+        entered: entered.clone(),
+        first_entered: first_entered.clone(),
+        release_first: release_first.clone(),
+    };
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let server = build_grpc_server(&config)
+        .unwrap()
+        .add_service(TimestampServiceServer::new(probe))
+        .serve_with_shutdown(addr, wait_for_shutdown_signal(shutdown_rx));
+    let server_handle = tokio::spawn(server);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let endpoint = format!("http://{addr}");
+    let mut first_client = TimestampServiceClient::connect(endpoint.clone())
+        .await
+        .unwrap();
+    let mut second_client = TimestampServiceClient::connect(endpoint).await.unwrap();
+    let first = tokio::spawn(async move {
+        first_client
+            .allocate_timestamps(ProtoAllocateTimestampsRequest::default())
+            .await
+    });
+    first_entered.notified().await;
+    let overload = tokio::time::timeout(
+        Duration::from_secs(1),
+        second_client.allocate_timestamps(ProtoAllocateTimestampsRequest::default()),
+    )
+    .await
+    .expect("overloaded request should be rejected without queueing")
+    .expect_err("overloaded request should fail");
+    assert_eq!(overload.code(), tonic::Code::ResourceExhausted);
+    assert_eq!(entered.load(Ordering::SeqCst), 1);
+    release_first.notify_one();
+    first.await.unwrap().unwrap();
+
+    second_client
+        .allocate_timestamps(ProtoAllocateTimestampsRequest::default())
+        .await
+        .unwrap();
+    assert_eq!(entered.load(Ordering::SeqCst), 2);
+
+    shutdown_tx.send(true).unwrap();
+    server_handle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn grpc_listener_stream_caps_active_connections() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut incoming = Box::pin(grpc_listener_stream_with_limit(listener, 1));
+
+    let first_client = TcpStream::connect(addr).await.unwrap();
+    let first_server = incoming.next().await.unwrap().unwrap();
+    let second_client = TcpStream::connect(addr).await.unwrap();
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), incoming.next())
+            .await
+            .is_err()
+    );
+    drop(first_server);
+    let second_server = tokio::time::timeout(Duration::from_secs(1), incoming.next())
+        .await
+        .expect("second connection should be accepted after the permit is released")
+        .unwrap()
+        .unwrap();
+
+    drop((first_client, second_client, second_server));
 }
 
 #[tokio::test]

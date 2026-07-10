@@ -72,6 +72,8 @@ require_contains clients/go/client.go "WithTLSServerName"
 require_contains clients/go/client.go "validateRoute"
 require_contains clients/go/client.go "isStaleRouteError"
 require_contains clients/go/client.go "ERROR_CODE_ROUTE_VERSION_MISMATCH"
+require_contains clients/go/client.go "type routeSnapshot struct"
+require_contains clients/go/client.go "refreshMu"
 
 require_contains clients/java/src/main/java/chronos/client/Client.java "Config defaults()"
 require_contains clients/java/src/main/java/chronos/client/Client.java "withDesiredResourceTier"
@@ -84,6 +86,8 @@ require_contains clients/java/src/main/java/chronos/client/Client.java "withAuth
 require_contains clients/java/src/main/java/chronos/client/Client.java "requireRoute"
 require_contains clients/java/src/main/java/chronos/client/Client.java "isStaleRouteError"
 require_contains clients/java/src/main/java/chronos/client/Client.java "ERROR_CODE_ROUTE_VERSION_MISMATCH"
+require_contains clients/java/src/main/java/chronos/client/Client.java "class RouteSnapshot"
+require_contains clients/java/src/main/java/chronos/client/Client.java "routeRefreshLock"
 
 if grep -Fq "Status.fromThrowable(err).getCode() == Status.Code.FAILED_PRECONDITION" \
   clients/java/src/main/java/chronos/client/Client.java; then
@@ -102,6 +106,8 @@ require_contains clients/cpp/client.h "ssl_target_name_override"
 require_contains clients/cpp/client.cc "InstallRouteLocked"
 require_contains clients/cpp/client.cc "IsStaleRouteError"
 require_contains clients/cpp/client.cc "ERROR_CODE_ROUTE_VERSION_MISMATCH"
+require_contains clients/cpp/client.h "struct RouteSnapshot"
+require_contains clients/cpp/client.h "route_snapshot_"
 
 for example in examples/rust/client_example.rs examples/go/main.go examples/java/ClientExample.java examples/cpp/client_example.cc; do
   require_contains "${example}" "127.0.0.1:50051"

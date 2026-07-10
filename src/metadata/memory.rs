@@ -22,6 +22,8 @@ use super::{
     TimelineRouteRecord,
 };
 
+const LEGACY_REQUEST_REVISION_FLAG: u64 = 1 << 63;
+
 pub struct MemoryMetadataStore {
     records: DashMap<String, (TimelineRecord, u64)>,
     generators: DashMap<u32, (GeneratorRecord, u64)>,
@@ -125,6 +127,10 @@ impl MemoryMetadataStore {
         keys::request_key("", timeline_key, client_request_id)
     }
 
+    fn legacy_request_key(timeline_key: &str, client_request_id: &str) -> String {
+        keys::legacy_request_key("", timeline_key, client_request_id)
+    }
+
     fn request_cleanup_index_key(
         record: &RequestRecord,
         timeline_key: &str,
@@ -160,6 +166,24 @@ impl MemoryMetadataStore {
         self.request_cleanup_index
             .remove(&Self::request_cleanup_index_key(
                 record,
+                timeline_key,
+                client_request_id,
+            ));
+    }
+
+    fn remove_legacy_request_cleanup_index(
+        &self,
+        timeline_key: &str,
+        client_request_id: &str,
+        record: &RequestRecord,
+    ) {
+        if record.state != super::RequestRecordState::Completed {
+            return;
+        }
+        self.request_cleanup_index
+            .remove(&keys::legacy_request_cleanup_index_key(
+                "",
+                record.updated_at_ms,
                 timeline_key,
                 client_request_id,
             ));
@@ -441,6 +465,28 @@ impl TimelineAuthority for MemoryMetadataStore {
         Ok(revision)
     }
 
+    async fn create_timeline_with_limit(
+        &self,
+        timeline_key: &str,
+        record: &TimelineRecord,
+        max_timelines: usize,
+    ) -> Result<u64, TsoError> {
+        let _cas_guard = self.timeline_cas_lock.lock().await;
+        if self.records.contains_key(timeline_key) {
+            return Err(TsoError::MetadataAlreadyExists);
+        }
+        if self.records.len() >= max_timelines {
+            return Err(TsoError::TimelineLimitReached { max: max_timelines });
+        }
+        record.validate_schema_version()?;
+        let stamped = record.stamped_for_persistence();
+        let revision =
+            Self::create_entry(&self.records, timeline_key.to_string(), &stamped, "create")?;
+        self.invalidate_sorted_timeline_keys();
+        self.publish_route_update(&stamped.route);
+        Ok(revision)
+    }
+
     async fn compare_exchange_timeline(
         &self,
         timeline_key: &str,
@@ -718,12 +764,26 @@ impl RequestRecordAuthority for MemoryMetadataStore {
         let _timer = metrics::TSO_METADATA_LATENCY
             .with_label_values(&["get_request"])
             .start_timer();
-        self.request_records
+        let current = self
+            .request_records
             .get(&Self::request_key(timeline_key, client_request_id))
             .map(|entry| {
                 let (record, revision) = entry.value().clone();
                 record.validate_schema_version()?;
                 Ok((record, revision))
+            })
+            .transpose()?;
+        if current.is_some()
+            || !keys::legacy_request_key_is_unambiguous(timeline_key, client_request_id)
+        {
+            return Ok(current);
+        }
+        self.request_records
+            .get(&Self::legacy_request_key(timeline_key, client_request_id))
+            .map(|entry| {
+                let (record, revision) = entry.value().clone();
+                record.validate_schema_version()?;
+                Ok((record, revision | LEGACY_REQUEST_REVISION_FLAG))
             })
             .transpose()
     }
@@ -740,6 +800,13 @@ impl RequestRecordAuthority for MemoryMetadataStore {
         record.validate_schema_version()?;
         let stamped = record.stamped_for_persistence();
         let _cas_guard = self.request_cas_lock.lock().await;
+        if keys::legacy_request_key_is_unambiguous(timeline_key, client_request_id)
+            && self
+                .request_records
+                .contains_key(&Self::legacy_request_key(timeline_key, client_request_id))
+        {
+            return Err(TsoError::MetadataAlreadyExists);
+        }
         let revision = Self::create_entry(
             &self.request_records,
             Self::request_key(timeline_key, client_request_id),
@@ -763,7 +830,14 @@ impl RequestRecordAuthority for MemoryMetadataStore {
         record.validate_schema_version()?;
         let stamped = record.stamped_for_persistence();
         let _cas_guard = self.request_cas_lock.lock().await;
-        let key = Self::request_key(timeline_key, client_request_id);
+        let legacy = expected_revision & LEGACY_REQUEST_REVISION_FLAG != 0;
+        let expected_revision = expected_revision & !LEGACY_REQUEST_REVISION_FLAG;
+        let key = if legacy {
+            Self::legacy_request_key(timeline_key, client_request_id)
+        } else {
+            Self::request_key(timeline_key, client_request_id)
+        };
+        let target_key = Self::request_key(timeline_key, client_request_id);
         let old_record;
         let new_revision;
         {
@@ -786,9 +860,21 @@ impl RequestRecordAuthority for MemoryMetadataStore {
 
             old_record = current_record.clone();
             new_revision = *current_revision + 1;
-            *entry.value_mut() = (stamped.clone(), new_revision);
+            if !legacy {
+                *entry.value_mut() = (stamped.clone(), new_revision);
+            }
         }
-        self.remove_request_cleanup_index(timeline_key, client_request_id, &old_record);
+        if legacy {
+            if self.request_records.contains_key(&target_key) {
+                return Err(TsoError::CasFailed);
+            }
+            self.request_records.remove(&key);
+            self.request_records
+                .insert(target_key, (stamped.clone(), new_revision));
+            self.remove_legacy_request_cleanup_index(timeline_key, client_request_id, &old_record);
+        } else {
+            self.remove_request_cleanup_index(timeline_key, client_request_id, &old_record);
+        }
         self.insert_request_cleanup_index(timeline_key, client_request_id, &stamped);
         Ok(new_revision)
     }
@@ -802,7 +888,13 @@ impl RequestRecordAuthority for MemoryMetadataStore {
         let _timer = metrics::TSO_METADATA_LATENCY
             .with_label_values(&["delete_request"])
             .start_timer();
-        let key = Self::request_key(timeline_key, client_request_id);
+        let legacy = expected_revision & LEGACY_REQUEST_REVISION_FLAG != 0;
+        let expected_revision = expected_revision & !LEGACY_REQUEST_REVISION_FLAG;
+        let key = if legacy {
+            Self::legacy_request_key(timeline_key, client_request_id)
+        } else {
+            Self::request_key(timeline_key, client_request_id)
+        };
         let _cas_guard = self.request_cas_lock.lock().await;
         let Some(entry) = self.request_records.get(&key) else {
             metrics::TSO_METADATA_ERRORS_TOTAL
@@ -821,7 +913,11 @@ impl RequestRecordAuthority for MemoryMetadataStore {
         let record = entry.value().0.clone();
         drop(entry);
         self.request_records.remove(&key);
-        self.remove_request_cleanup_index(timeline_key, client_request_id, &record);
+        if legacy {
+            self.remove_legacy_request_cleanup_index(timeline_key, client_request_id, &record);
+        } else {
+            self.remove_request_cleanup_index(timeline_key, client_request_id, &record);
+        }
         Ok(())
     }
 

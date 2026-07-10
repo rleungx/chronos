@@ -89,6 +89,10 @@ fn spawn_chronos_process(config: SpawnedChronosConfig<'_>) -> SpawnedChronos {
         .env("CHRONOS_ETCD_PREFIX", config.prefix)
         .env("CHRONOS_SECURITY_MODE", "dev-insecure")
         .env("CHRONOS_SAFETY_GAP_MS", config.safety_gap_ms.to_string())
+        .env(
+            "CHRONOS_MAX_CLOCK_SKEW_MS",
+            config.safety_gap_ms.to_string(),
+        )
         .env("CHRONOS_WORKER_ID", config.worker_id)
         .env("CHRONOS_INSTANCE_ID", config.instance_id)
         .env("CHRONOS_BIND_ADDR", config.bind_addr.to_string())
@@ -329,7 +333,7 @@ async fn etcd_spawned_process_rejects_duplicate_instance_identity() {
         worker_id: "worker-a",
         bind_addr: free_loopback_addr(),
         metrics_bind_addr: free_loopback_addr(),
-        safety_gap_ms: 1,
+        safety_gap_ms: 500,
     });
 
     wait_for_identity_key(&prefix, instance_id, &mut first).await;
@@ -340,7 +344,7 @@ async fn etcd_spawned_process_rejects_duplicate_instance_identity() {
         worker_id: "worker-b",
         bind_addr: free_loopback_addr(),
         metrics_bind_addr: free_loopback_addr(),
-        safety_gap_ms: 1,
+        safety_gap_ms: 500,
     });
 
     let status = wait_for_exit(&mut second).await;

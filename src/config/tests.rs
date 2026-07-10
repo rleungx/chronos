@@ -1,6 +1,7 @@
 use super::{
-    TsoConfig, TsoConfigValidationError, TsoSecurityMode, PRODUCTION_MAX_BATCH_PER_REQUEST,
-    PRODUCTION_MAX_TIMELINE_PROXY_LANES, PRODUCTION_MAX_TIMELINE_RUNTIME_ENTRIES,
+    TsoConfig, TsoConfigValidationError, TsoSecurityMode, DEFAULT_GRPC_MAX_CONNECTIONS,
+    PRODUCTION_MAX_BATCH_PER_REQUEST, PRODUCTION_MAX_TIMELINE_PROXY_LANES,
+    PRODUCTION_MAX_TIMELINE_RUNTIME_ENTRIES,
 };
 use crate::ResourceTier;
 use std::path::PathBuf;
@@ -169,6 +170,16 @@ fn validate_for_startup_rejects_zero_concurrent_timeline_load_limit() {
     assert_eq!(
         config.validate_for_startup(),
         Err(TsoConfigValidationError::ZeroMaxConcurrentTimelineLoads)
+    );
+}
+
+#[test]
+fn validate_for_startup_rejects_zero_grpc_connection_limit() {
+    let mut config = valid_config();
+    config.grpc_max_connections = 0;
+    assert_eq!(
+        config.validate_for_startup(),
+        Err(TsoConfigValidationError::ZeroGrpcMaxConnections)
     );
 }
 
@@ -364,7 +375,7 @@ fn validate_for_startup_rejects_unreadable_etcd_tls_files() {
         etcd_key_file: Some("/definitely/missing/client-key.pem".into()),
         etcd_timeout_ms: Some(100),
         worker_id: "worker-a".into(),
-        safety_gap_ms: 1,
+        safety_gap_ms: 500,
         ..valid_config()
     };
     assert!(matches!(
@@ -541,7 +552,7 @@ fn authoritative_metadata_runtime_contract_rejects_default_worker_id() {
         metadata_kind: "etcd".into(),
         etcd_endpoints: vec!["127.0.0.1:2379".into()],
         advertise_endpoint: "10.0.0.10:50051".into(),
-        safety_gap_ms: 1,
+        safety_gap_ms: 500,
         ..valid_config()
     };
     assert!(matches!(
@@ -558,7 +569,7 @@ fn authoritative_metadata_runtime_contract_rejects_unroutable_advertise_endpoint
         worker_id: "worker-a".into(),
         advertise_endpoint: "localhost:50051".into(),
         security_mode: Some(TsoSecurityMode::Required),
-        safety_gap_ms: 1,
+        safety_gap_ms: 500,
         ..valid_config()
     };
     assert!(matches!(
@@ -576,7 +587,7 @@ fn authoritative_metadata_runtime_contract_rejects_loopback_advertise_endpoint()
             worker_id: "worker-a".into(),
             advertise_endpoint: advertise_endpoint.into(),
             security_mode: Some(TsoSecurityMode::Required),
-            safety_gap_ms: 1,
+            safety_gap_ms: 500,
             ..valid_config()
         };
         assert!(matches!(
@@ -594,7 +605,7 @@ fn authoritative_metadata_runtime_contract_rejects_localhost_subdomain() {
         worker_id: "worker-a".into(),
         advertise_endpoint: "chronos-a.localhost:50051".into(),
         security_mode: Some(TsoSecurityMode::Required),
-        safety_gap_ms: 1,
+        safety_gap_ms: 500,
         ..valid_config()
     };
     assert!(matches!(
@@ -610,7 +621,7 @@ fn authoritative_metadata_runtime_contract_accepts_dev_insecure_loopback_for_loc
         metadata_kind: "etcd".into(),
         worker_id: "worker-a".into(),
         advertise_endpoint: "127.0.0.1:50051".into(),
-        safety_gap_ms: 1,
+        safety_gap_ms: 500,
         ..valid_config()
     };
     assert!(config
@@ -640,7 +651,7 @@ fn authoritative_metadata_runtime_contract_rejects_default_partitioned_ownership
         metadata_kind: "etcd".into(),
         worker_id: "worker-a".into(),
         advertise_endpoint: "10.0.0.10:50051".into(),
-        safety_gap_ms: 1,
+        safety_gap_ms: 500,
         generator_ownership_modulo: 2,
         generator_ownership_remainder: 0,
         ownership_plan_id: " Default ".into(),
@@ -659,7 +670,7 @@ fn authoritative_metadata_runtime_contract_accepts_explicit_partitioned_ownershi
         metadata_kind: "etcd".into(),
         worker_id: "worker-a".into(),
         advertise_endpoint: "10.0.0.10:50051".into(),
-        safety_gap_ms: 1,
+        safety_gap_ms: 500,
         generator_ownership_modulo: 2,
         generator_ownership_remainder: 0,
         ownership_plan_id: "prod-2026-05-10".into(),
@@ -760,6 +771,7 @@ fn default_config_uses_production_safe_capacity_defaults() {
         config.max_timeline_runtime_entries,
         PRODUCTION_MAX_TIMELINE_RUNTIME_ENTRIES
     );
+    assert_eq!(config.grpc_max_connections, DEFAULT_GRPC_MAX_CONNECTIONS);
 }
 
 #[test]
@@ -778,4 +790,36 @@ fn production_profile_applies_safer_capacity_defaults() {
         config.max_timeline_runtime_entries,
         PRODUCTION_MAX_TIMELINE_RUNTIME_ENTRIES
     );
+    assert_eq!(config.max_clock_skew_ms, 500);
+    assert_eq!(config.safety_gap_ms, 500);
+}
+
+#[test]
+fn production_profile_covers_a_larger_configured_clock_skew_bound() {
+    let mut config = TsoConfig {
+        max_clock_skew_ms: 750,
+        ..TsoConfig::default()
+    };
+
+    config.apply_profile("production").unwrap();
+
+    assert_eq!(config.safety_gap_ms, 750);
+}
+
+#[test]
+fn authoritative_metadata_rejects_safety_gap_below_certified_clock_skew() {
+    let config = TsoConfig {
+        metadata_kind: "etcd".into(),
+        worker_id: "worker-a".into(),
+        advertise_endpoint: "10.0.0.10:50051".into(),
+        security_mode: Some(TsoSecurityMode::Required),
+        safety_gap_ms: 499,
+        max_clock_skew_ms: 500,
+        ..valid_config()
+    };
+    assert!(matches!(
+        config.validate_authoritative_metadata_runtime_contract(),
+        Err(TsoConfigValidationError::Security(message))
+            if message.contains("CHRONOS_MAX_CLOCK_SKEW_MS")
+    ));
 }

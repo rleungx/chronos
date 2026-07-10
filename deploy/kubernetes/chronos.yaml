@@ -33,17 +33,21 @@ data:
   CHRONOS_METRICS_BIND_ADDR: 0.0.0.0:9898
   CHRONOS_LOG_FORMAT: json
   CHRONOS_LOG_FILTER: info
-  CHRONOS_OWNERSHIP_PLAN_ID: kubernetes-rendezvous-shards-256
+  CHRONOS_CLUSTER_FORMAT_VERSION: "2"
+  CHRONOS_OWNERSHIP_PLAN_ID: kubernetes-rendezvous-shards-256-workers-3-seed-20260516
   CHRONOS_GENERATOR_OWNERSHIP_MODULO: "256"
   CHRONOS_OWNERSHIP_WORKER_COUNT: "3"
   CHRONOS_OWNERSHIP_ASSIGNMENT_SEED: "20260516"
-  CHRONOS_SAFETY_GAP_MS: "1"
+  CHRONOS_SAFETY_GAP_MS: "500"
+  CHRONOS_MAX_CLOCK_SKEW_MS: "500"
+  CHRONOS_MAX_TIMELINE_RECORDS: "100000"
   CHRONOS_AUTO_FAILOVER_ENABLED: "true"
   CHRONOS_AUTO_FAILOVER_INTERVAL_MS: "1000"
   CHRONOS_AUTO_FAILOVER_BATCH_SIZE: "16"
   CHRONOS_GRPC_REQUEST_TIMEOUT_MS: "250"
   CHRONOS_GRPC_MAX_REQUEST_BYTES: "1048576"
   CHRONOS_GRPC_MAX_CONCURRENT_REQUESTS: "1024"
+  CHRONOS_GRPC_MAX_CONNECTIONS: "1024"
   CHRONOS_ETCD_TIMEOUT_MS: "1000"
 ---
 apiVersion: v1
@@ -129,9 +133,14 @@ spec:
       labels:
         app.kubernetes.io/name: chronos
         app.kubernetes.io/component: tso
+      annotations:
+        # Bump these revisions whenever the referenced ConfigMap or same-name Secrets change.
+        chronos.io/config-revision: "1"
+        chronos.io/tls-revision: "1"
+        chronos.io/allowlist-revision: "1"
     spec:
       serviceAccountName: chronos
-      terminationGracePeriodSeconds: 30
+      terminationGracePeriodSeconds: 120
       securityContext:
         runAsNonRoot: true
         runAsUser: 10001

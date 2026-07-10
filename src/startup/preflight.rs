@@ -128,6 +128,8 @@ pub(crate) fn log_startup_preflight(plan: &ValidatedStartupPlan<'_>) {
         advertise_endpoint = %config.advertise_endpoint,
         build_version = chronos::build_version(),
         build_commit = chronos::build_commit(),
-        safety_gap_ms = config.safety_gap_ms
+        tso_max_supported_unix_ms = chronos::MAX_UNIX_MS,
+        safety_gap_ms = config.safety_gap_ms,
+        max_clock_skew_ms = config.max_clock_skew_ms
     );
 }

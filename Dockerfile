@@ -55,6 +55,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         libc6 \
         libc-bin \
         libcap2 \
+        libgnutls30 \
         libsystemd0 \
         libudev1 \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates \

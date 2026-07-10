@@ -28,6 +28,7 @@ import io.grpc.inprocess.InProcessChannelBuilder;
 import io.grpc.inprocess.InProcessServerBuilder;
 import io.grpc.protobuf.StatusProto;
 import io.grpc.stub.StreamObserver;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -508,6 +509,113 @@ final class ClientTest {
       release.countDown();
       assertEquals(1, first.get(2, TimeUnit.SECONDS).size());
       assertEquals(1, second.get(2, TimeUnit.SECONDS).size());
+    } finally {
+      executor.shutdownNow();
+      routeChannel.shutdownNow();
+      ownerServer.shutdownNow();
+      routeServer.shutdownNow();
+    }
+  }
+
+  @Test
+  void concurrentStaleAllocationsSingleflightRouteRefresh() throws Exception {
+    var routeVersion = new AtomicInteger(11);
+    var getRouteCalls = new AtomicInteger();
+    var ownerServerName = InProcessServerBuilder.generateName();
+    var routeServerName = InProcessServerBuilder.generateName();
+
+    Server ownerServer =
+        InProcessServerBuilder.forName(ownerServerName)
+            .directExecutor()
+            .addService(
+                new TimestampServiceGrpc.TimestampServiceImplBase() {
+                  @Override
+                  public void allocateTimestamps(
+                      AllocateTimestampsRequest request,
+                      StreamObserver<AllocateTimestampsResponse> responseObserver) {
+                    if (request.getExpectedRouteVersion() != routeVersion.get()) {
+                      var status =
+                          com.google.rpc.Status.newBuilder()
+                              .setCode(Status.Code.FAILED_PRECONDITION.value())
+                              .setMessage("stale route")
+                              .addDetails(
+                                  Any.pack(
+                                      ErrorDetail.newBuilder()
+                                          .setCode(ErrorCode.ERROR_CODE_ROUTE_VERSION_MISMATCH)
+                                          .setCurrentRouteVersion(routeVersion.get())
+                                          .build()))
+                              .build();
+                      responseObserver.onError(StatusProto.toStatusRuntimeException(status));
+                      return;
+                    }
+                    responseObserver.onNext(
+                        AllocateTimestampsResponse.newBuilder()
+                            .setTimelineKey(request.getTimelineKey())
+                            .setGeneratorId(7)
+                            .setEpoch(3)
+                            .setRouteVersion(routeVersion.get())
+                            .addRanges(
+                                TimestampRange.newBuilder().setStartTso(100).setEndTso(100).build())
+                            .build());
+                    responseObserver.onCompleted();
+                  }
+                })
+            .build()
+            .start();
+    Server routeServer =
+        InProcessServerBuilder.forName(routeServerName)
+            .directExecutor()
+            .addService(
+                new TimelineRouteServiceGrpc.TimelineRouteServiceImplBase() {
+                  @Override
+                  public void ensureTimeline(
+                      EnsureTimelineRequest request,
+                      StreamObserver<EnsureTimelineResponse> responseObserver) {
+                    responseObserver.onNext(
+                        EnsureTimelineResponse.newBuilder()
+                            .setRoute(
+                                route(request.getTimelineKey(), ownerServerName, routeVersion.get()))
+                            .build());
+                    responseObserver.onCompleted();
+                  }
+
+                  @Override
+                  public void getTimelineRoute(
+                      GetTimelineRouteRequest request,
+                      StreamObserver<GetTimelineRouteResponse> responseObserver) {
+                    getRouteCalls.incrementAndGet();
+                    responseObserver.onNext(
+                        GetTimelineRouteResponse.newBuilder()
+                            .setRoute(
+                                route(request.getTimelineKey(), ownerServerName, routeVersion.get()))
+                            .build());
+                    responseObserver.onCompleted();
+                  }
+                })
+            .build()
+            .start();
+    ManagedChannel routeChannel =
+        InProcessChannelBuilder.forName(routeServerName).directExecutor().build();
+    var executor = Executors.newFixedThreadPool(16);
+
+    try (Client client =
+        new Client(routeChannel, "orders.primary", inProcessOwnerChannelFactory())) {
+      routeVersion.incrementAndGet();
+      var start = new CountDownLatch(1);
+      var futures = new ArrayList<java.util.concurrent.Future<List<TimestampRange>>>();
+      for (int i = 0; i < 32; i++) {
+        futures.add(
+            executor.submit(
+                () -> {
+                  assertTrue(start.await(2, TimeUnit.SECONDS));
+                  return client.allocateTimestamps(1);
+                }));
+      }
+      start.countDown();
+      for (var future : futures) {
+        assertEquals(1, future.get(3, TimeUnit.SECONDS).size());
+      }
+      assertEquals(1, getRouteCalls.get());
     } finally {
       executor.shutdownNow();
       routeChannel.shutdownNow();

@@ -26,6 +26,7 @@ impl TsoService {
         request: &AllocateTimestampsRequest,
     ) -> AllocationRequestFingerprint {
         AllocationRequestFingerprint {
+            timeline_key: request.timeline_key.clone(),
             count: request.count,
         }
     }
@@ -53,6 +54,7 @@ impl TsoService {
             fingerprint,
             state: RequestRecordState::Completed,
             response: Some(AllocationResponseRecord {
+                timeline_key: response.timeline_key.clone(),
                 generator_id: response.generator_id,
                 epoch: response.epoch,
                 route_version: response.route_version,
@@ -78,7 +80,11 @@ impl TsoService {
         request: &AllocateTimestampsRequest,
         record: &RequestRecord,
     ) -> Result<(), TsoError> {
-        if record.fingerprint == Self::allocation_request_fingerprint(request) {
+        let fingerprint = &record.fingerprint;
+        let legacy_timeline_matches = fingerprint.timeline_key.is_empty();
+        if fingerprint.count == request.count
+            && (legacy_timeline_matches || fingerprint.timeline_key == request.timeline_key)
+        {
             return Ok(());
         }
 

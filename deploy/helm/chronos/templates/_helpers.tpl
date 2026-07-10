@@ -41,9 +41,19 @@ app.kubernetes.io/component: tso
 {{- if .Values.ownership.planId -}}
 {{- .Values.ownership.planId -}}
 {{- else -}}
-{{- printf "%s-rendezvous-shards-%d" (include "chronos.fullname" .) (int .Values.ownership.shardCount) -}}
+{{- printf "%s-rendezvous-shards-%d-workers-%d-seed-%d" (include "chronos.fullname" .) (int .Values.ownership.shardCount) (int (include "chronos.ownershipWorkerCount" .)) (int64 .Values.ownership.assignmentSeed) -}}
 {{- end -}}
 {{- end -}}
+
+{{- define "chronos.ownershipWorkerCount" -}}
+{{- if gt (int .Values.ownership.workerCount) 0 -}}
+{{- .Values.ownership.workerCount -}}
+{{- else -}}
+{{- .Values.replicaCount -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "chronos.clusterFormatVersion" -}}2{{- end -}}
 
 {{- define "chronos.image" -}}
 {{- if .Values.image.digest -}}

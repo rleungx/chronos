@@ -55,16 +55,32 @@ fail!("etcd.endpoints must use https") unless values.dig("etcd", "endpoints").to
 fail!("etcd.prefix must be absolute") unless values.dig("etcd", "prefix").to_s.start_with?("/")
 fail!("serviceMonitor must be enabled by default") unless values.dig("serviceMonitor", "enabled") == true
 fail!("networkPolicy must be enabled by default") unless values.dig("networkPolicy", "enabled") == true
-fail!("values.schema.json must constrain replicaCount") unless schema.dig("properties", "replicaCount", "minimum") == 3
+fail!("runtime.safetyGapMs must cover runtime.maxClockSkewMs") unless values.dig("runtime", "safetyGapMs").to_i >= values.dig("runtime", "maxClockSkewMs").to_i
+fail!("runtime.maxTimelineRecords must be positive") unless values.dig("runtime", "maxTimelineRecords").to_i > 0
+fail!("runtime.grpcMaxConnections must be positive") unless values.dig("runtime", "grpcMaxConnections").to_i > 0
+fail!("runtime.terminationGracePeriodSeconds must leave time for bounded shutdown") unless values.dig("runtime", "terminationGracePeriodSeconds").to_i >= 120
+replica_schema = schema.dig("properties", "replicaCount", "anyOf")
+fail!("values.schema.json must allow only drain-zero or at least three replicas") unless replica_schema == [{"const" => 0}, {"minimum" => 3}]
 fail!("values.schema.json must reject latest image tag") unless schema.dig("properties", "image", "properties", "tag", "not", "const") == "latest"
 fail!("values.schema.json must require mTLS security mode") unless schema.dig("properties", "security", "properties", "mode", "const") == "required"
 fail!("values.schema.json must constrain ownership shard count") unless schema.dig("properties", "ownership", "properties", "shardCount", "minimum") == 3
+fail!("values.schema.json must reject removed ownership escape hatches") unless schema.dig("properties", "ownership", "additionalProperties") == false
+fail!("values.schema.json must preserve the bounded shutdown window") unless schema.dig("properties", "runtime", "properties", "terminationGracePeriodSeconds", "minimum") == 120
 ' "${chart}"
 
 require_contains "${chart}/templates/configmap.yaml" "CHRONOS_GENERATOR_OWNERSHIP_MODULO"
 require_contains "${chart}/templates/configmap.yaml" "CHRONOS_OWNERSHIP_WORKER_COUNT"
-require_contains "${chart}/templates/configmap.yaml" "{{ .Values.replicaCount | quote }}"
+require_contains "${chart}/templates/configmap.yaml" 'refusing ownership topology change'
+require_contains "${chart}/templates/configmap.yaml" 'refusing cluster-format change'
+require_contains "${chart}/templates/configmap.yaml" '$existingStatefulSet.status.replicas'
+require_contains "${chart}/templates/configmap.yaml" 'CHRONOS_CLUSTER_FORMAT_VERSION'
+require_contains "${chart}/templates/configmap.yaml" 'CHRONOS_GRPC_MAX_CONNECTIONS'
+require_contains "${chart}/templates/_helpers.tpl" 'chronos.ownershipWorkerCount'
+require_contains "${chart}/templates/_helpers.tpl" 'chronos.clusterFormatVersion'
 require_contains "${chart}/templates/statefulset.yaml" "--print-ownership-env"
+require_contains "${chart}/templates/statefulset.yaml" "checksum/config"
+require_contains "${chart}/templates/statefulset.yaml" "chronos.io/tls-revision"
+require_contains "${chart}/templates/statefulset.yaml" "chronos.io/allowlist-revision"
 require_contains "${chart}/templates/statefulset.yaml" 'exec /usr/local/bin/chronos'
 require_contains "${chart}/templates/statefulset.yaml" 'image: {{ include "chronos.image" . | quote }}'
 require_contains "${chart}/templates/statefulset.yaml" '{{- $affinity := default dict .Values.affinity }}'
@@ -81,6 +97,10 @@ if grep -R "kind: HorizontalPodAutoscaler" "${chart}/templates" >/dev/null; then
   echo "Helm chart must not define HPA for static partitioned ownership" >&2
   exit 1
 fi
+if grep -R "allowUnsafeInPlaceMigration" "${chart}" >/dev/null; then
+  echo "Helm chart must not expose an unsafe in-place ownership migration bypass" >&2
+  exit 1
+fi
 if grep -R "1103515245\|2147483647\|worker \* 97" "${chart}/templates" >/dev/null; then
   echo "Helm chart must not inline ownership hash constants" >&2
   exit 1
@@ -88,11 +108,22 @@ fi
 
 if command -v helm >/dev/null 2>&1; then
   helm lint "${chart}"
+  if helm template chronos "${chart}" --set ownership.allowUnsafeInPlaceMigration=true >/dev/null 2>&1; then
+    echo "Helm chart accepted the removed unsafe in-place migration option" >&2
+    exit 1
+  fi
   rendered="$(mktemp)"
   trap 'rm -f "${rendered}"' EXIT
   helm template chronos "${chart}" --namespace chronos >"${rendered}"
   grep -Fq "CHRONOS_GENERATOR_OWNERSHIP_MODULO: \"256\"" "${rendered}"
   grep -Fq "CHRONOS_OWNERSHIP_WORKER_COUNT: \"3\"" "${rendered}"
+  grep -Fq "CHRONOS_OWNERSHIP_ASSIGNMENT_SEED: \"20260516\"" "${rendered}"
+  grep -Fq "CHRONOS_OWNERSHIP_PLAN_ID: \"chronos-rendezvous-shards-256-workers-3-seed-20260516\"" "${rendered}"
+  grep -Fq "CHRONOS_GRPC_MAX_REQUEST_BYTES: \"1048576\"" "${rendered}"
+  if grep -Eq 'CHRONOS_[A-Z0-9_]+: \"[0-9]+(\\.[0-9]+)?e[+-][0-9]+\"' "${rendered}"; then
+    echo "Helm chart must render numeric Chronos environment values as decimal integers" >&2
+    exit 1
+  fi
   grep -Fq "minAvailable: 2" "${rendered}"
 elif [[ "${CI:-false}" == "true" || "${CHRONOS_REQUIRE_HELM_RENDER:-0}" == "1" ]]; then
   echo "helm is required for Helm render validation in CI" >&2

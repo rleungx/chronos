@@ -49,7 +49,7 @@ type transportConfig struct {
 func defaultConfig() config {
 	return config{
 		desiredResourceTier:      tsov1.ResourceTier_RESOURCE_TIER_SHARED,
-			requestTimeoutMs:         defaultRequestTimeoutMs,
+		requestTimeoutMs:         defaultRequestTimeoutMs,
 		staleRouteRetryAttempts:  defaultStaleRouteRetryAttempts,
 		staleRouteRetryBackoffMs: defaultStaleRouteRetryBackoffMs,
 		idempotencyEnabled:       false,
@@ -114,17 +114,21 @@ func WithTLSServerName(serverName string) Option {
 
 type Client struct {
 	routeConn    *grpc.ClientConn
-	tsoConn      *grpc.ClientConn
 	staleConns   []*grpc.ClientConn
 	routeClient  tsov1.TimelineRouteServiceClient
-	tsoClient    tsov1.TimestampServiceClient
-	route        *tsov1.TimelineRoute
+	snapshot     *routeSnapshot
 	timelineKey  string
-	ownerAddr    string
 	mu           sync.RWMutex
+	refreshMu    sync.Mutex
 	requestID    atomic.Uint64
 	requestScope string
 	config       config
+}
+
+type routeSnapshot struct {
+	route     *tsov1.TimelineRoute
+	ownerConn *grpc.ClientConn
+	tsoClient tsov1.TimestampServiceClient
 }
 
 func New(ctx context.Context, addr string, timelineKey string) (*Client, error) {
@@ -159,37 +163,40 @@ func NewWithOptions(ctx context.Context, addr string, timelineKey string, opts .
 		config:       cfg,
 	}
 	if _, err := client.ensureRoute(ctx); err != nil {
-		if client.tsoConn != nil {
-			_ = client.tsoConn.Close()
-		}
-		_ = conn.Close()
+		_ = client.Close()
 		return nil, err
 	}
 	return client, nil
 }
 
 func (c *Client) Close() error {
+	c.refreshMu.Lock()
+	defer c.refreshMu.Unlock()
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	for _, conn := range c.staleConns {
+	staleConns := c.staleConns
+	c.staleConns = nil
+	snapshot := c.snapshot
+	c.snapshot = nil
+	c.mu.Unlock()
+	for _, conn := range staleConns {
 		_ = conn.Close()
 	}
-	if c.tsoConn != nil {
-		_ = c.tsoConn.Close()
+	if snapshot != nil && snapshot.ownerConn != nil {
+		_ = snapshot.ownerConn.Close()
 	}
 	return c.routeConn.Close()
 }
 
 func (c *Client) AllocateTimestamps(ctx context.Context, count uint32) ([]*tsov1.TimestampRange, error) {
-	route, err := c.ensureRoute(ctx)
+	snapshot, err := c.ensureRoute(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	clientRequestID := c.nextClientRequestID(route.TimelineKey)
+	clientRequestID := c.nextClientRequestID()
 	var staleRetries uint32
 	for {
-		ranges, err := c.allocateOnce(ctx, route, count, clientRequestID)
+		ranges, err := c.allocateOnce(ctx, snapshot, count, clientRequestID)
 		if err == nil {
 			return ranges, nil
 		}
@@ -198,7 +205,7 @@ func (c *Client) AllocateTimestamps(ctx context.Context, count uint32) ([]*tsov1
 		}
 
 		staleRetries++
-		route, err = c.refreshRouteIfUnchanged(ctx, route)
+		snapshot, err = c.refreshRouteIfUnchanged(ctx, snapshot)
 		if err != nil {
 			return nil, err
 		}
@@ -212,12 +219,21 @@ func (c *Client) AllocateTimestamps(ctx context.Context, count uint32) ([]*tsov1
 	}
 }
 
-func (c *Client) ensureRoute(ctx context.Context) (*tsov1.TimelineRoute, error) {
+func (c *Client) ensureRoute(ctx context.Context) (*routeSnapshot, error) {
 	c.mu.RLock()
-	route := c.route
+	snapshot := c.snapshot
 	c.mu.RUnlock()
-	if route != nil {
-		return route, nil
+	if snapshot != nil {
+		return snapshot, nil
+	}
+
+	c.refreshMu.Lock()
+	defer c.refreshMu.Unlock()
+	c.mu.RLock()
+	snapshot = c.snapshot
+	c.mu.RUnlock()
+	if snapshot != nil {
+		return snapshot, nil
 	}
 
 	rpcCtx, cancel := c.rpcContext(ctx)
@@ -233,23 +249,28 @@ func (c *Client) ensureRoute(ctx context.Context) (*tsov1.TimelineRoute, error) 
 		return nil, err
 	}
 
-	return c.installRoute(ctx, resp.GetRoute())
+	return c.installRouteLocked(ctx, resp.GetRoute())
 }
 
-func (c *Client) refreshRouteIfUnchanged(ctx context.Context, observedRoute *tsov1.TimelineRoute) (*tsov1.TimelineRoute, error) {
+func (c *Client) refreshRouteIfUnchanged(ctx context.Context, observed *routeSnapshot) (*routeSnapshot, error) {
+	c.refreshMu.Lock()
+	defer c.refreshMu.Unlock()
 	c.mu.RLock()
-	currentRoute := c.route
+	current := c.snapshot
 	c.mu.RUnlock()
-	if currentRoute != nil && !sameRouteIdentity(currentRoute, observedRoute) {
-		if err := c.ensureOwnerClient(ctx, currentRoute.OwnerWorkerEndpoint); err != nil {
-			return nil, err
-		}
-		return currentRoute, nil
+	if current != nil && !sameRouteIdentity(current.route, observed.route) {
+		return current, nil
 	}
-	return c.refreshRoute(ctx)
+	return c.refreshRouteLocked(ctx)
 }
 
-func (c *Client) refreshRoute(ctx context.Context) (*tsov1.TimelineRoute, error) {
+func (c *Client) refreshRoute(ctx context.Context) (*routeSnapshot, error) {
+	c.refreshMu.Lock()
+	defer c.refreshMu.Unlock()
+	return c.refreshRouteLocked(ctx)
+}
+
+func (c *Client) refreshRouteLocked(ctx context.Context) (*routeSnapshot, error) {
 	rpcCtx, cancel := c.rpcContext(ctx)
 	defer cancel()
 	resp, err := c.routeClient.GetTimelineRoute(rpcCtx, &tsov1.GetTimelineRouteRequest{
@@ -262,18 +283,7 @@ func (c *Client) refreshRoute(ctx context.Context) (*tsov1.TimelineRoute, error)
 	if err := validateRoute("get_timeline_route", route); err != nil {
 		return nil, err
 	}
-	return c.installRoute(ctx, route)
-}
-
-func (c *Client) installRoute(ctx context.Context, route *tsov1.TimelineRoute) (*tsov1.TimelineRoute, error) {
-	if err := c.ensureOwnerClient(ctx, route.OwnerWorkerEndpoint); err != nil {
-		return nil, err
-	}
-
-	c.mu.Lock()
-	c.route = route
-	c.mu.Unlock()
-	return route, nil
+	return c.installRouteLocked(ctx, route)
 }
 
 func sameRouteIdentity(left *tsov1.TimelineRoute, right *tsov1.TimelineRoute) bool {
@@ -285,42 +295,44 @@ func sameRouteIdentity(left *tsov1.TimelineRoute, right *tsov1.TimelineRoute) bo
 		left.GetResourceTier() == right.GetResourceTier()
 }
 
-func (c *Client) ensureOwnerClient(ctx context.Context, ownerAddr string) error {
-	c.mu.Lock()
-	if c.ownerAddr == ownerAddr && c.tsoConn != nil {
+func (c *Client) installRouteLocked(ctx context.Context, route *tsov1.TimelineRoute) (*routeSnapshot, error) {
+	c.mu.RLock()
+	current := c.snapshot
+	c.mu.RUnlock()
+	if current != nil && current.route.OwnerWorkerEndpoint == route.OwnerWorkerEndpoint {
+		next := &routeSnapshot{route: route, ownerConn: current.ownerConn, tsoClient: current.tsoClient}
+		c.mu.Lock()
+		c.snapshot = next
 		c.mu.Unlock()
-		return nil
+		return next, nil
 	}
-	c.mu.Unlock()
 
 	transportCreds, err := transportCredentials(c.config.transport)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	conn, err := grpc.DialContext(
 		ctx,
-		ownerAddr,
+		route.OwnerWorkerEndpoint,
 		grpc.WithTransportCredentials(transportCreds),
 		grpc.WithBlock(),
 	)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	c.mu.Lock()
-	if c.ownerAddr == ownerAddr && c.tsoConn != nil {
-		c.mu.Unlock()
-		_ = conn.Close()
-		return nil
+	next := &routeSnapshot{
+		route:     route,
+		ownerConn: conn,
+		tsoClient: tsov1.NewTimestampServiceClient(conn),
 	}
-	previous := c.tsoConn
+	c.mu.Lock()
+	previous := c.snapshot
 	var evicted *grpc.ClientConn
-	c.tsoConn = conn
-	c.tsoClient = tsov1.NewTimestampServiceClient(conn)
-	c.ownerAddr = ownerAddr
-	if previous != nil {
-		c.staleConns = append(c.staleConns, previous)
+	c.snapshot = next
+	if previous != nil && previous.ownerConn != nil && previous.ownerConn != conn {
+		c.staleConns = append(c.staleConns, previous.ownerConn)
 		if len(c.staleConns) > maxRetainedStaleOwnerConns {
 			evicted = c.staleConns[0]
 			c.staleConns[0] = nil
@@ -331,17 +343,14 @@ func (c *Client) ensureOwnerClient(ctx context.Context, ownerAddr string) error 
 	if evicted != nil {
 		_ = evicted.Close()
 	}
-	return nil
+	return next, nil
 }
 
-func (c *Client) allocateOnce(ctx context.Context, route *tsov1.TimelineRoute, count uint32, clientRequestID string) ([]*tsov1.TimestampRange, error) {
-	c.mu.RLock()
-	tsoClient := c.tsoClient
-	c.mu.RUnlock()
-
+func (c *Client) allocateOnce(ctx context.Context, snapshot *routeSnapshot, count uint32, clientRequestID string) ([]*tsov1.TimestampRange, error) {
+	route := snapshot.route
 	rpcCtx, cancel := c.rpcContext(ctx)
 	defer cancel()
-	resp, err := tsoClient.AllocateTimestamps(rpcCtx, &tsov1.AllocateTimestampsRequest{
+	resp, err := snapshot.tsoClient.AllocateTimestamps(rpcCtx, &tsov1.AllocateTimestampsRequest{
 		TimelineKey:          route.TimelineKey,
 		Count:                count,
 		ExpectedEpoch:        route.Epoch,
@@ -367,11 +376,11 @@ func (c *Client) rpcContext(ctx context.Context) (context.Context, context.Cance
 	return context.WithTimeout(ctx, timeout)
 }
 
-func (c *Client) nextClientRequestID(timelineKey string) string {
+func (c *Client) nextClientRequestID() string {
 	if !c.config.idempotencyEnabled {
 		return ""
 	}
-	return fmt.Sprintf("%s-%s-%d", timelineKey, c.requestScope, c.requestID.Add(1))
+	return fmt.Sprintf("%s-%d", c.requestScope, c.requestID.Add(1))
 }
 
 func newClientRequestScope() string {

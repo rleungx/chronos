@@ -32,7 +32,10 @@ fn sample_record(timeline_key: &str, generator_id: u32) -> TimelineRecord {
 fn sample_request_record(state: RequestRecordState, updated_at_ms: u64) -> RequestRecord {
     RequestRecord {
         schema_version: 1,
-        fingerprint: AllocationRequestFingerprint { count: 1 },
+        fingerprint: AllocationRequestFingerprint {
+            timeline_key: "timeline".into(),
+            count: 1,
+        },
         state,
         response: None,
         updated_at_ms,
@@ -44,6 +47,7 @@ async fn prune_completed_request_records_removes_only_old_completed_records() {
     let store = MemoryMetadataStore::new();
     let old_completed = RequestRecord {
         response: Some(AllocationResponseRecord {
+            timeline_key: "timeline".into(),
             generator_id: 1,
             epoch: 1,
             route_version: 1,
@@ -56,6 +60,7 @@ async fn prune_completed_request_records_removes_only_old_completed_records() {
     };
     let fresh_completed = RequestRecord {
         response: Some(AllocationResponseRecord {
+            timeline_key: "timeline".into(),
             generator_id: 1,
             epoch: 1,
             route_version: 1,
@@ -114,6 +119,7 @@ async fn request_cleanup_index_tracks_completed_record_updates() {
     let pending = sample_request_record(RequestRecordState::Pending, 100);
     let completed = RequestRecord {
         response: Some(AllocationResponseRecord {
+            timeline_key: "timeline".into(),
             generator_id: 1,
             epoch: 1,
             route_version: 1,
@@ -178,6 +184,7 @@ async fn prune_completed_request_records_handles_legacy_records_without_cleanup_
     let store = MemoryMetadataStore::new();
     let legacy_completed = RequestRecord {
         response: Some(AllocationResponseRecord {
+            timeline_key: "timeline".into(),
             generator_id: 1,
             epoch: 1,
             route_version: 1,
@@ -207,6 +214,136 @@ async fn prune_completed_request_records_handles_legacy_records_without_cleanup_
         .await
         .unwrap()
         .is_none());
+}
+
+#[tokio::test]
+async fn request_records_with_legacy_path_collision_inputs_are_isolated() {
+    let store = MemoryMetadataStore::new();
+    let record_a = RequestRecord {
+        fingerprint: AllocationRequestFingerprint {
+            timeline_key: "a/b".into(),
+            count: 1,
+        },
+        ..sample_request_record(RequestRecordState::Pending, 100)
+    };
+    let record_b = RequestRecord {
+        fingerprint: AllocationRequestFingerprint {
+            timeline_key: "a".into(),
+            count: 2,
+        },
+        ..sample_request_record(RequestRecordState::Pending, 101)
+    };
+
+    store
+        .create_request_record("a/b", "c", &record_a)
+        .await
+        .unwrap();
+    store
+        .create_request_record("a", "b/c", &record_b)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        store
+            .load_request_record("a/b", "c")
+            .await
+            .unwrap()
+            .unwrap()
+            .0
+            .fingerprint,
+        record_a.fingerprint
+    );
+    assert_eq!(
+        store
+            .load_request_record("a", "b/c")
+            .await
+            .unwrap()
+            .unwrap()
+            .0
+            .fingerprint,
+        record_b.fingerprint
+    );
+}
+
+#[tokio::test]
+async fn unambiguous_legacy_request_record_migrates_on_compare_exchange() {
+    let store = MemoryMetadataStore::new();
+    let legacy = sample_request_record(RequestRecordState::Pending, 100);
+    store.request_records.insert(
+        MemoryMetadataStore::legacy_request_key("timeline", "legacy-id"),
+        (legacy, 7),
+    );
+    let (_, legacy_revision) = store
+        .load_request_record("timeline", "legacy-id")
+        .await
+        .unwrap()
+        .unwrap();
+    let completed = RequestRecord {
+        fingerprint: AllocationRequestFingerprint {
+            timeline_key: "timeline".into(),
+            count: 1,
+        },
+        state: RequestRecordState::Completed,
+        response: Some(AllocationResponseRecord {
+            timeline_key: "timeline".into(),
+            generator_id: 1,
+            epoch: 1,
+            route_version: 1,
+            ranges: vec![],
+        }),
+        updated_at_ms: 200,
+        schema_version: 1,
+    };
+
+    store
+        .compare_exchange_request_record("timeline", "legacy-id", legacy_revision, &completed)
+        .await
+        .unwrap();
+
+    assert!(!store
+        .request_records
+        .contains_key(&MemoryMetadataStore::legacy_request_key(
+            "timeline",
+            "legacy-id"
+        )));
+    assert!(store
+        .request_records
+        .contains_key(&MemoryMetadataStore::request_key("timeline", "legacy-id")));
+}
+
+#[tokio::test]
+async fn ambiguous_legacy_request_records_are_never_replayed() {
+    let store = MemoryMetadataStore::new();
+    store.request_records.insert(
+        keys::legacy_request_key("", "a/b", "c"),
+        (sample_request_record(RequestRecordState::Pending, 100), 1),
+    );
+
+    assert!(store
+        .load_request_record("a/b", "c")
+        .await
+        .unwrap()
+        .is_none());
+    assert!(store
+        .load_request_record("a", "b/c")
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn timeline_creation_limit_is_enforced_under_the_memory_store_lock() {
+    let store = MemoryMetadataStore::new();
+    store
+        .create_timeline_with_limit("timeline-a", &sample_record("timeline-a", 1), 1)
+        .await
+        .unwrap();
+    assert!(matches!(
+        store
+            .create_timeline_with_limit("timeline-b", &sample_record("timeline-b", 2), 1)
+            .await,
+        Err(TsoError::TimelineLimitReached { max: 1 })
+    ));
 }
 
 #[tokio::test]
