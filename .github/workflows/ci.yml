@@ -81,6 +81,8 @@ jobs:
           go-version-file: clients/go/go.mod
       - name: Verify Go client
         run: make client-check-go
+      - name: Validate Go API compatibility tooling
+        run: bash hack/verify-client-api-compat.sh go --self
       - name: Verify Go example
         run: make client-example-check-go
 
@@ -98,22 +100,26 @@ jobs:
           gradle-version: '9.4.0'
       - name: Verify Java client
         run: make client-check-java
+      - name: Validate Java API compatibility tooling
+        run: bash hack/verify-client-api-compat.sh java --self
       - name: Verify Java example
         run: make client-example-check-java
       - name: Verify Java package metadata
         run: make client-package-check-java
 
   client-cpp:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     if: github.event_name != 'schedule'
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
       - name: Install C++ client dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake libgrpc++-dev libprotobuf-dev protobuf-compiler protobuf-compiler-grpc
+          sudo apt-get install -y abi-compliance-checker abi-dumper cmake libgrpc++-dev libprotobuf-dev protobuf-compiler protobuf-compiler-grpc
       - name: Verify C++ client
         run: make client-check-cpp
+      - name: Validate C++ API compatibility tooling
+        run: bash hack/verify-client-api-compat.sh cpp --self
       - name: Verify C++ example
         run: make client-example-check-cpp
       - name: Verify C++ install metadata

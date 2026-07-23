@@ -17,6 +17,9 @@ if [[ $# -eq 0 ]]; then
 fi
 
 BUILD_INFO="${ARTIFACT_ROOT%/}/BUILD_INFO"
+if [[ ! -f "${BUILD_INFO}" && -f "${ARTIFACT_ROOT%/}/release/BUILD_INFO" ]]; then
+  BUILD_INFO="${ARTIFACT_ROOT%/}/release/BUILD_INFO"
+fi
 [[ -f "${BUILD_INFO}" ]] || {
   echo "missing release BUILD_INFO: ${BUILD_INFO}" >&2
   exit 1

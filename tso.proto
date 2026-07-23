@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package chronos.tso.v1;
 
-option go_package = "github.com/rleungx/chronos/gen/proto/tso/v1;tsov1";
+option go_package = "github.com/rleungx/chronos/clients/go/gen/proto/tso/v1;tsov1";
 option java_multiple_files = true;
 option java_package = "com.chronos.tso.v1";
 option java_outer_classname = "TsoProto";

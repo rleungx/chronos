@@ -91,6 +91,9 @@ generator jump-ahead and allows the owner to fall back to a dedicated generator 
 otherwise be too large. Allocation clients should set a rebalance-window request timeout, currently
 `CHRONOS_REBALANCE_ALLOCATE_REQUEST_TIMEOUT_MS=10000` in the local gate, so transient catch-up waits
 are absorbed without exposing allocation failures.
+The default `CHRONOS_PRE_BORROW_MS=100` keeps the normal graceful-transfer catch-up window below the
+one-second tail-latency budget. Raising it reduces generator metadata renewal frequency but directly
+increases the worst-case pause when ownership moves to another worker.
 
 ## Before a production run
 

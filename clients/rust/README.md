@@ -10,7 +10,7 @@ Support level: Primary.
 - `client.allocate_timestamps(count).await?`
 
 Advanced configuration should use `ClientConfig` builder methods for desired resource tier,
-request timeout, stale-route retry attempts/backoff, idempotency, and transport.
+request timeout, route-recovery retry attempts/backoff, idempotency, and transport.
 
 ## Build and test
 
@@ -31,6 +31,8 @@ cargo run --example client_example
 - The client fetches and caches the current route internally
 - Stale-route errors are handled with a configurable refresh-and-retry budget
 - Route refresh reconnects allocation traffic to the current owner endpoint
+- Owner transport failures refresh through the stable construction endpoint; use a Service or load
+  balancer rather than an owner-pod address in production
 - Allocation request-record idempotency is disabled by default; use
   `ClientConfig::with_idempotency_enabled(true)` when callers need replay protection
 - Other RPC failures are returned to the caller

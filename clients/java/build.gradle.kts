@@ -1,5 +1,7 @@
+import org.gradle.external.javadoc.StandardJavadocDocletOptions
+
 plugins {
-    id("java")
+    id("java-library")
     id("com.google.protobuf") version "0.10.0"
     id("maven-publish")
 }
@@ -9,16 +11,21 @@ repositories {
 }
 
 group = "io.github.rleungx"
-version = "0.1.0"
+version = providers.environmentVariable("CHRONOS_CLIENT_VERSION").orElse("0.1.0-SNAPSHOT").get()
+
+java {
+    withSourcesJar()
+    withJavadocJar()
+}
 
 val grpcVersion = "1.76.0"
 val protobufVersion = "4.34.1"
 
 dependencies {
     implementation("io.grpc:grpc-netty-shaded:$grpcVersion")
-    implementation("com.google.protobuf:protobuf-java:$protobufVersion")
-    implementation("io.grpc:grpc-protobuf:$grpcVersion")
-    implementation("io.grpc:grpc-stub:$grpcVersion")
+    api("com.google.protobuf:protobuf-java:$protobufVersion")
+    api("io.grpc:grpc-protobuf:$grpcVersion")
+    api("io.grpc:grpc-stub:$grpcVersion")
     compileOnly("org.apache.tomcat:annotations-api:6.0.53")
     testImplementation("io.grpc:grpc-inprocess:$grpcVersion")
     testImplementation("org.junit.jupiter:junit-jupiter:5.11.3")
@@ -27,9 +34,6 @@ dependencies {
 
 sourceSets {
     main {
-        java {
-            srcDir("src/main/java")
-        }
         resources {
             setSrcDirs(emptyList<String>())
         }
@@ -93,9 +97,14 @@ publishing {
                 name.set("Chronos Java Client")
                 description.set("Application-facing Chronos timestamp client")
                 url.set("https://github.com/rleungx/chronos")
+                scm {
+                    connection.set("scm:git:https://github.com/rleungx/chronos.git")
+                    developerConnection.set("scm:git:ssh://git@github.com/rleungx/chronos.git")
+                    url.set("https://github.com/rleungx/chronos")
+                }
                 licenses {
                     license {
-                        name.set("MIT OR Apache-2.0")
+                        name.set("Apache-2.0")
                     }
                 }
             }
@@ -106,6 +115,14 @@ publishing {
             name = "localStaging"
             url = layout.buildDirectory.dir("staging-repo").get().asFile.toURI()
         }
+        maven {
+            name = "GitHubPackages"
+            url = uri("https://maven.pkg.github.com/rleungx/chronos")
+            credentials {
+                username = System.getenv("GITHUB_ACTOR") ?: ""
+                password = System.getenv("GITHUB_TOKEN") ?: ""
+            }
+        }
     }
 }
 
@@ -115,6 +132,11 @@ tasks.test {
 
 tasks.withType<JavaCompile>().configureEach {
     options.release.set(21)
+}
+
+tasks.withType<Javadoc>().configureEach {
+    exclude("com/chronos/tso/v1/**")
+    (options as StandardJavadocDocletOptions).addBooleanOption("Werror", true)
 }
 
 tasks.named("generateProto") {

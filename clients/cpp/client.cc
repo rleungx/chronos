@@ -25,6 +25,17 @@ std::atomic<uint64_t> g_client_scope_counter{1};
 constexpr const char* kErrorDetailTypeUrl =
     "type.googleapis.com/chronos.tso.v1.ErrorDetail";
 
+class RpcStatusError final : public std::runtime_error {
+ public:
+  explicit RpcStatusError(grpc::Status status)
+      : std::runtime_error(status.error_message()), status_(std::move(status)) {}
+
+  const grpc::Status& status() const { return status_; }
+
+ private:
+  grpc::Status status_;
+};
+
 std::string MakeIdempotencyScope() {
   auto now = std::chrono::steady_clock::now().time_since_epoch().count();
   auto counter = g_client_scope_counter.fetch_add(1);
@@ -217,14 +228,20 @@ std::vector<chronos::tso::v1::TimestampRange> Client::AllocateTimestamps(uint32_
     if (status.ok()) {
       return {response.ranges().begin(), response.ranges().end()};
     }
-    if (!IsStaleRouteError(status) || stale_retries >= config_.stale_route_retry_attempts) {
+    const bool recoverable = IsStaleRouteError(status) ||
+        status.error_code() == grpc::StatusCode::UNAVAILABLE;
+    if (!recoverable || stale_retries >= config_.stale_route_retry_attempts) {
       throw std::runtime_error(status.error_message());
     }
 
     ++stale_retries;
-    {
+    try {
       std::lock_guard<std::mutex> lock(mu_);
       snapshot = RefreshRouteIfUnchangedLocked(snapshot);
+    } catch (const RpcStatusError& refresh_error) {
+      if (refresh_error.status().error_code() != grpc::StatusCode::UNAVAILABLE) {
+        throw;
+      }
     }
     SleepBeforeStaleRouteRetry();
     response.Clear();
@@ -277,7 +294,7 @@ std::shared_ptr<const Client::RouteSnapshot> Client::RefreshRouteLocked() {
   chronos::tso::v1::GetTimelineRouteResponse response;
   auto status = route_stub_->GetTimelineRoute(&ctx, request, &response);
   if (!status.ok()) {
-    throw std::runtime_error(status.error_message());
+    throw RpcStatusError(std::move(status));
   }
   if (!response.has_route()) {
     throw std::runtime_error("chronos returned no route from GetTimelineRoute");

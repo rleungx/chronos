@@ -4,7 +4,7 @@ import (
 	"context"
 	"log"
 
-	chronos "github.com/rleungx/chronos"
+	chronos "github.com/rleungx/chronos/clients/go"
 )
 
 func main() {

@@ -20,6 +20,15 @@ func TestStaleRouteErrorRequiresChronosRouteDetail(t *testing.T) {
 	}
 }
 
+func TestRouteRecoveryIncludesUnavailableOnly(t *testing.T) {
+	if !isRouteRecoveryError(grpcstatus.Error(codes.Unavailable, "owner unavailable")) {
+		t.Fatal("UNAVAILABLE should trigger route recovery")
+	}
+	if isRouteRecoveryError(grpcstatus.Error(codes.DeadlineExceeded, "allocation timed out")) {
+		t.Fatal("DEADLINE_EXCEEDED should not retry a possibly committed allocation")
+	}
+}
+
 func TestTransportCredentialsDefaultToTLS(t *testing.T) {
 	creds, err := transportCredentials(transportConfig{})
 	if err != nil {

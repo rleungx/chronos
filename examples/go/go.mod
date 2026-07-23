@@ -1,8 +1,8 @@
 module chronos-go-example
 
-go 1.26.0
+go 1.24.0
 
-require github.com/rleungx/chronos v0.0.0
+require github.com/rleungx/chronos/clients/go v0.0.0
 
 require (
 	golang.org/x/net v0.42.0 // indirect
@@ -13,4 +13,4 @@ require (
 	google.golang.org/protobuf v1.36.10 // indirect
 )
 
-replace github.com/rleungx/chronos => ../../clients/go
+replace github.com/rleungx/chronos/clients/go => ../../clients/go

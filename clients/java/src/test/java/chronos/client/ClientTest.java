@@ -169,6 +169,65 @@ final class ClientTest {
   }
 
   @Test
+  void allocateTimestampsRefreshesRouteWhenOwnerIsUnavailable() throws Exception {
+    var unavailableOnFirstAllocate = new AtomicBoolean(true);
+    var allocateCalls = new AtomicInteger();
+    var ownerServerName = InProcessServerBuilder.generateName();
+    var routeServerName = InProcessServerBuilder.generateName();
+
+    Server ownerServer =
+        InProcessServerBuilder.forName(ownerServerName)
+            .directExecutor()
+            .addService(
+                new TimestampServiceGrpc.TimestampServiceImplBase() {
+                  @Override
+                  public void allocateTimestamps(
+                      AllocateTimestampsRequest request,
+                      StreamObserver<AllocateTimestampsResponse> responseObserver) {
+                    allocateCalls.incrementAndGet();
+                    if (unavailableOnFirstAllocate.getAndSet(false)) {
+                      responseObserver.onError(
+                          Status.UNAVAILABLE
+                              .withDescription("owner unavailable")
+                              .asRuntimeException());
+                      return;
+                    }
+                    responseObserver.onNext(
+                        AllocateTimestampsResponse.newBuilder()
+                            .setTimelineKey(request.getTimelineKey())
+                            .setGeneratorId(7)
+                            .setEpoch(3)
+                            .setRouteVersion(11)
+                            .addRanges(
+                                TimestampRange.newBuilder()
+                                    .setStartTso(100)
+                                    .setEndTso(100)
+                                    .build())
+                            .build());
+                    responseObserver.onCompleted();
+                  }
+                })
+            .build()
+            .start();
+    Server routeServer = routeServer(routeServerName, ownerServerName, 11);
+    ManagedChannel routeChannel =
+        InProcessChannelBuilder.forName(routeServerName).directExecutor().build();
+
+    try (Client client =
+        new Client(routeChannel, "orders.primary", inProcessOwnerChannelFactory())) {
+      List<TimestampRange> ranges = client.allocateTimestamps(1);
+      assertEquals(1, ranges.size());
+      assertEquals(100, ranges.get(0).getStartTso());
+      assertEquals(2, allocateCalls.get());
+      assertFalse(unavailableOnFirstAllocate.get());
+    } finally {
+      routeChannel.shutdownNow();
+      ownerServer.shutdownNow();
+      routeServer.shutdownNow();
+    }
+  }
+
+  @Test
   void defaultAllocationOmitsClientRequestId() throws Exception {
     var observedRequestId = new AtomicReference<String>("not-called");
     var ownerServerName = InProcessServerBuilder.generateName();

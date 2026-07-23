@@ -103,8 +103,13 @@ struct RouteServiceImpl final : TimelineRouteService::Service {
 };
 
 struct TimestampServiceImpl final : TimestampService::Service {
-  explicit TimestampServiceImpl(std::shared_ptr<TimelineRoute> route, bool stale_once)
-      : route(std::move(route)), stale_once(stale_once) {}
+  explicit TimestampServiceImpl(
+      std::shared_ptr<TimelineRoute> route,
+      bool stale_once,
+      bool unavailable_once = false)
+      : route(std::move(route)),
+        stale_once(stale_once),
+        unavailable_once(unavailable_once) {}
 
   grpc::Status AllocateTimestamps(
       grpc::ServerContext*,
@@ -115,6 +120,10 @@ struct TimestampServiceImpl final : TimestampService::Service {
     {
       std::lock_guard<std::mutex> lock(request_ids_mu);
       request_ids.push_back(request->client_request_id());
+    }
+
+    if (unavailable_once.exchange(false)) {
+      return grpc::Status(grpc::StatusCode::UNAVAILABLE, "owner unavailable");
     }
 
     if (stale_once.exchange(false)) {
@@ -153,6 +162,7 @@ struct TimestampServiceImpl final : TimestampService::Service {
 
   std::shared_ptr<TimelineRoute> route;
   std::atomic<bool> stale_once;
+  std::atomic<bool> unavailable_once;
   std::atomic<int> allocate_calls{0};
   std::atomic<uint32_t> last_request_timeout_ms{0};
   std::mutex request_ids_mu;
@@ -289,6 +299,34 @@ void TestRefreshesStaleRouteAndRetries() {
         owner_service.request_ids[0] != owner_service.request_ids[1]) {
       throw std::runtime_error("retry did not reuse logical request id");
     }
+  }
+}
+
+void TestRefreshesRouteWhenOwnerIsUnavailable() {
+  auto route = std::make_shared<TimelineRoute>(MakeRoute(kPendingOwnerEndpoint));
+  auto owner_service = TimestampServiceImpl(route, false, true);
+  auto owner_server = StartServer(&owner_service);
+  route->set_owner_worker_endpoint("127.0.0.1:" + std::to_string(owner_server.port));
+
+  auto route_service = RouteServiceImpl(route);
+  auto route_server = StartServer(&route_service);
+
+  Client::Config config;
+  config.transport = InsecureTransport();
+  config.stale_route_retry_attempts = 2;
+  config.stale_route_retry_backoff_ms = 0;
+  Client client(
+      "127.0.0.1:" + std::to_string(route_server.port),
+      "orders.primary",
+      std::move(config));
+
+  auto ranges = client.AllocateTimestamps(1);
+  if (ranges.size() != 1 || ranges.front().start_tso() != 100) {
+    throw std::runtime_error("unavailable owner retry failed");
+  }
+  if (owner_service.allocate_calls.load() != 2 ||
+      route_service.get_route_calls.load() != 1) {
+    throw std::runtime_error("unavailable owner did not trigger one route refresh and retry");
   }
 }
 
@@ -486,6 +524,7 @@ int main() {
   try {
     TestAllocateAgainstOwnerEndpoint();
     TestRefreshesStaleRouteAndRetries();
+    TestRefreshesRouteWhenOwnerIsUnavailable();
     TestClientConfigFlowsIntoRequests();
     TestIdempotentClientsUseDistinctRequestIds();
     TestFailedPreconditionWithoutChronosRouteDetailIsNotRetried();

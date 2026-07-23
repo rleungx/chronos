@@ -1,0 +1,195 @@
+name: Client Release
+
+on:
+  push:
+    tags:
+      - 'clients/go/v*'
+      - 'clients/java/v*'
+      - 'clients/cpp/v*'
+
+permissions:
+  contents: read
+
+jobs:
+  verify-compatibility:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      previous-tag: ${{ steps.compatibility.outputs.previous_tag }}
+      source-compat-required: ${{ steps.compatibility.outputs.source_compat_required }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c
+        with:
+          go-version-file: clients/go/go.mod
+      - name: Install protobuf compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+      - name: Verify compatibility with previous client release
+        id: compatibility
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          current_version="${GITHUB_REF_NAME##*/v}"
+          [[ "$current_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          client_prefix="${GITHUB_REF_NAME%/v*}"
+          previous_tag="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100" --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name' | grep -E "^${client_prefix}/v[0-9]+\.[0-9]+\.[0-9]+$" | sort -V | tail -1 || true)"
+          if [[ -n "$previous_tag" ]]; then
+            previous_version="${previous_tag##*/v}"
+            newest_version="$(printf '%s\n%s\n' "$previous_version" "$current_version" | sort -V | tail -1)"
+            [[ "$newest_version" == "$current_version" && "$current_version" != "$previous_version" ]]
+            CHRONOS_PROTO_BASE_REF="$previous_tag" make proto-breaking-check
+            previous_major="${previous_version%%.*}"
+            previous_minor="${previous_version#*.}"
+            previous_minor="${previous_minor%%.*}"
+            current_major="${current_version%%.*}"
+            current_minor="${current_version#*.}"
+            current_minor="${current_minor%%.*}"
+            source_compat_required=false
+            if [[ "$current_major" == "$previous_major" ]] && \
+              { [[ "$current_major" != "0" ]] || [[ "$current_minor" == "$previous_minor" ]]; }; then
+              source_compat_required=true
+            fi
+          else
+            echo "No previous ${client_prefix} release; this tag establishes the compatibility baseline."
+            source_compat_required=false
+          fi
+          echo "previous_tag=${previous_tag}" >> "$GITHUB_OUTPUT"
+          echo "source_compat_required=${source_compat_required}" >> "$GITHUB_OUTPUT"
+          make client-conformance-check
+
+  publish-go:
+    if: startsWith(github.ref, 'refs/tags/clients/go/v')
+    needs: verify-compatibility
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c
+        with:
+          go-version-file: clients/go/go.mod
+      - name: Validate Go client module
+        run: |
+          test "$(sed -n '1s/^module //p' clients/go/go.mod)" = "github.com/rleungx/chronos/clients/go"
+      - name: Test Go client
+        working-directory: clients/go
+        run: |
+          go mod verify
+          go test ./...
+          go list -m
+      - name: Verify Go public API compatibility
+        if: needs.verify-compatibility.outputs.source-compat-required == 'true'
+        run: bash hack/verify-client-api-compat.sh go "${{ needs.verify-compatibility.outputs.previous-tag }}"
+      - name: Publish Go module release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${GITHUB_REF_NAME#clients/go/v}"
+          gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes --title "Chronos Go Client v${version}"
+
+  publish-java:
+    if: startsWith(github.ref, 'refs/tags/clients/java/v')
+    needs: verify-compatibility
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      packages: write
+      attestations: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: gradle/actions/setup-gradle@39fdf500b386709a9a4a769f717dad447ac345b9
+        with:
+          gradle-version: '9.4.0'
+      - name: Test and stage Java client
+        working-directory: clients/java
+        env:
+          CHRONOS_CLIENT_VERSION: ${{ github.ref_name }}
+        run: |
+          export CHRONOS_CLIENT_VERSION="${CHRONOS_CLIENT_VERSION#clients/java/v}"
+          gradle --no-daemon clean test publishMavenJavaPublicationToLocalStagingRepository
+          gradle --no-daemon -p package-consumer --refresh-dependencies compileJava
+      - name: Verify Java public API compatibility
+        if: needs.verify-compatibility.outputs.source-compat-required == 'true'
+        run: bash hack/verify-client-api-compat.sh java "${{ needs.verify-compatibility.outputs.previous-tag }}"
+      - name: Create Java client checksums
+        working-directory: clients/java/build/libs
+        run: sha256sum *.jar > SHA256SUMS
+      - name: Attest Java client release assets
+        uses: actions/attest-build-provenance@b3e506e8c389afc651c5bacf2b8f2a1ea0557215
+        with:
+          subject-path: |
+            clients/java/build/libs/*.jar
+            clients/java/build/libs/SHA256SUMS
+      - name: Publish Java client package
+        working-directory: clients/java
+        env:
+          CHRONOS_CLIENT_VERSION: ${{ github.ref_name }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          export CHRONOS_CLIENT_VERSION="${CHRONOS_CLIENT_VERSION#clients/java/v}"
+          gradle --no-daemon publishMavenJavaPublicationToGitHubPackagesRepository
+      - name: Publish Java client release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${GITHUB_REF_NAME#clients/java/v}"
+          gh release create "$GITHUB_REF_NAME" clients/java/build/libs/*.jar clients/java/build/libs/SHA256SUMS --verify-tag --generate-notes --title "Chronos Java Client v${version}"
+
+  publish-cpp:
+    if: startsWith(github.ref, 'refs/tags/clients/cpp/v')
+    needs: verify-compatibility
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      attestations: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          fetch-depth: 0
+      - name: Install C++ client prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y abi-compliance-checker abi-dumper cmake libgrpc++-dev libprotobuf-dev protobuf-compiler protobuf-compiler-grpc
+      - name: Build and package C++ client
+        run: |
+          version="${GITHUB_REF_NAME#clients/cpp/v}"
+          cmake -S clients/cpp -B clients/cpp/build -DCHRONOS_CLIENT_VERSION="$version" -DCMAKE_BUILD_TYPE=Release
+          cmake --build clients/cpp/build
+          ctest --test-dir clients/cpp/build --output-on-failure
+          cmake --install clients/cpp/build --prefix clients/cpp/build/package-root
+          cmake -S clients/cpp/package-consumer -B clients/cpp/build/package-consumer -DCMAKE_PREFIX_PATH="$PWD/clients/cpp/build/package-root" -DCHRONOS_CLIENT_VERSION="$version"
+          cmake --build clients/cpp/build/package-consumer
+          cmake --build clients/cpp/build --target package
+          (cd clients/cpp/build && sha256sum chronos-cpp-client-*.tar.gz > SHA256SUMS)
+      - name: Verify C++ public API and ABI compatibility
+        if: needs.verify-compatibility.outputs.source-compat-required == 'true'
+        run: bash hack/verify-client-api-compat.sh cpp "${{ needs.verify-compatibility.outputs.previous-tag }}"
+      - name: Attest C++ client release assets
+        uses: actions/attest-build-provenance@b3e506e8c389afc651c5bacf2b8f2a1ea0557215
+        with:
+          subject-path: |
+            clients/cpp/build/chronos-cpp-client-*.tar.gz
+            clients/cpp/build/SHA256SUMS
+      - name: Publish C++ client release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${GITHUB_REF_NAME#clients/cpp/v}"
+          gh release create "$GITHUB_REF_NAME" clients/cpp/build/chronos-cpp-client-*.tar.gz clients/cpp/build/SHA256SUMS --verify-tag --generate-notes --title "Chronos C++ Client v${version}"

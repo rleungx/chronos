@@ -29,12 +29,14 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import javax.net.ssl.SSLException;
 
+/** Thread-safe application client for allocating timestamp ranges from one Chronos timeline. */
 public class Client implements AutoCloseable {
   private static final int MAX_RETAINED_STALE_OWNER_CHANNELS = 16;
   private static final int DEFAULT_REQUEST_TIMEOUT_MS = 250;
-  private static final int DEFAULT_STALE_ROUTE_RETRY_ATTEMPTS = 3;
-  private static final long DEFAULT_STALE_ROUTE_RETRY_BACKOFF_MS = 5;
+  private static final int DEFAULT_STALE_ROUTE_RETRY_ATTEMPTS = 100;
+  private static final long DEFAULT_STALE_ROUTE_RETRY_BACKOFF_MS = 50;
 
+  /** Immutable TLS and plaintext transport configuration. */
   public static final class TransportConfig {
     private final boolean plaintext;
     private final byte[] trustedCaPem;
@@ -55,25 +57,55 @@ public class Client implements AutoCloseable {
       this.authorityOverride = authorityOverride;
     }
 
+    /**
+     * Returns a TLS configuration that uses the platform trust roots.
+     *
+     * @return secure transport configuration
+     */
     public static TransportConfig secure() {
       return new TransportConfig(false, null, null, null, null);
     }
 
+    /**
+     * Returns a copy with plaintext transport enabled or disabled.
+     *
+     * @param plaintext whether to disable TLS
+     * @return updated immutable configuration
+     */
     public TransportConfig withPlaintext(boolean plaintext) {
       return new TransportConfig(
           plaintext, copy(trustedCaPem), copy(clientCertPem), copy(clientKeyPem), authorityOverride);
     }
 
+    /**
+     * Returns a copy using the supplied PEM-encoded CA bundle.
+     *
+     * @param trustedCaPem PEM-encoded trusted certificate authorities
+     * @return updated immutable configuration
+     */
     public TransportConfig withTrustedCaPem(byte[] trustedCaPem) {
       return new TransportConfig(
           plaintext, copy(trustedCaPem), copy(clientCertPem), copy(clientKeyPem), authorityOverride);
     }
 
+    /**
+     * Returns a copy using the supplied PEM-encoded mTLS client identity.
+     *
+     * @param clientCertPem PEM-encoded client certificate chain
+     * @param clientKeyPem PEM-encoded client private key
+     * @return updated immutable configuration
+     */
     public TransportConfig withClientIdentityPem(byte[] clientCertPem, byte[] clientKeyPem) {
       return new TransportConfig(
           plaintext, copy(trustedCaPem), copy(clientCertPem), copy(clientKeyPem), authorityOverride);
     }
 
+    /**
+     * Returns a copy overriding the TLS authority used for certificate verification.
+     *
+     * @param authorityOverride expected TLS server authority
+     * @return updated immutable configuration
+     */
     public TransportConfig withAuthorityOverride(String authorityOverride) {
       return new TransportConfig(
           plaintext,
@@ -88,6 +120,7 @@ public class Client implements AutoCloseable {
     }
   }
 
+  /** Immutable allocation, retry, idempotency, and transport configuration. */
   public static final class Config {
     private final ResourceTier desiredResourceTier;
     private final int requestTimeoutMs;
@@ -111,6 +144,11 @@ public class Client implements AutoCloseable {
       this.transport = transport;
     }
 
+    /**
+     * Returns the production-oriented default client configuration.
+     *
+     * @return default immutable configuration
+     */
     public static Config defaults() {
       return new Config(
           ResourceTier.RESOURCE_TIER_SHARED,
@@ -121,6 +159,12 @@ public class Client implements AutoCloseable {
           TransportConfig.secure());
     }
 
+    /**
+     * Returns a copy requesting the given resource tier when ensuring the timeline.
+     *
+     * @param desiredResourceTier desired Chronos resource tier
+     * @return updated immutable configuration
+     */
     public Config withDesiredResourceTier(ResourceTier desiredResourceTier) {
       return new Config(
           Objects.requireNonNull(desiredResourceTier, "desiredResourceTier"),
@@ -131,6 +175,13 @@ public class Client implements AutoCloseable {
           transport);
     }
 
+    /**
+     * Returns a copy with the per-RPC timeout in milliseconds; zero disables the deadline.
+     *
+     * @param requestTimeoutMs non-negative timeout in milliseconds
+     * @return updated immutable configuration
+     * @throws IllegalArgumentException if the timeout is negative
+     */
     public Config withRequestTimeoutMs(int requestTimeoutMs) {
       if (requestTimeoutMs < 0) {
         throw new IllegalArgumentException("Chronos request timeout must be >= 0");
@@ -144,6 +195,13 @@ public class Client implements AutoCloseable {
           transport);
     }
 
+    /**
+     * Returns a copy with the route-recovery retry budget.
+     *
+     * @param staleRouteRetryAttempts non-negative number of recovery retries
+     * @return updated immutable configuration
+     * @throws IllegalArgumentException if the retry count is negative
+     */
     public Config withStaleRouteRetryAttempts(int staleRouteRetryAttempts) {
       if (staleRouteRetryAttempts < 0) {
         throw new IllegalArgumentException("Chronos stale-route retry attempts must be >= 0");
@@ -157,6 +215,13 @@ public class Client implements AutoCloseable {
           transport);
     }
 
+    /**
+     * Returns a copy with the delay between route-recovery attempts.
+     *
+     * @param staleRouteRetryBackoffMs non-negative delay in milliseconds
+     * @return updated immutable configuration
+     * @throws IllegalArgumentException if the delay is negative
+     */
     public Config withStaleRouteRetryBackoffMs(long staleRouteRetryBackoffMs) {
       if (staleRouteRetryBackoffMs < 0) {
         throw new IllegalArgumentException("Chronos stale-route retry backoff must be >= 0");
@@ -170,6 +235,12 @@ public class Client implements AutoCloseable {
           transport);
     }
 
+    /**
+     * Returns a copy with request-record idempotency enabled or disabled.
+     *
+     * @param idempotencyEnabled whether allocations carry replay identifiers
+     * @return updated immutable configuration
+     */
     public Config withIdempotency(boolean idempotencyEnabled) {
       return new Config(
           desiredResourceTier,
@@ -180,6 +251,12 @@ public class Client implements AutoCloseable {
           transport);
     }
 
+    /**
+     * Returns a copy using the supplied transport configuration.
+     *
+     * @param transport non-null transport configuration
+     * @return updated immutable configuration
+     */
     public Config withTransport(TransportConfig transport) {
       return new Config(
           desiredResourceTier,
@@ -222,14 +299,35 @@ public class Client implements AutoCloseable {
   private final Object routeRefreshLock = new Object();
   private final Deque<ManagedChannel> staleOwnerChannels = new ArrayDeque<>();
 
+  /**
+   * Creates a client using the default secure configuration.
+   *
+   * @param addr stable Chronos control endpoint
+   * @param timelineKey timeline bound to this client
+   */
   public Client(String addr, String timelineKey) {
     this(addr, timelineKey, Config.defaults());
   }
 
+  /**
+   * Creates a client using custom transport settings.
+   *
+   * @param addr stable Chronos control endpoint
+   * @param timelineKey timeline bound to this client
+   * @param transportConfig TLS or plaintext transport settings
+   */
   public Client(String addr, String timelineKey, TransportConfig transportConfig) {
     this(addr, timelineKey, Config.defaults().withTransport(transportConfig));
   }
 
+  /**
+   * Creates a client using custom transport and idempotency settings.
+   *
+   * @param addr stable Chronos control endpoint
+   * @param timelineKey timeline bound to this client
+   * @param transportConfig TLS or plaintext transport settings
+   * @param idempotencyEnabled whether allocations carry replay identifiers
+   */
   public Client(
       String addr,
       String timelineKey,
@@ -241,6 +339,13 @@ public class Client implements AutoCloseable {
         Config.defaults().withTransport(transportConfig).withIdempotency(idempotencyEnabled));
   }
 
+  /**
+   * Creates a client using the complete immutable configuration.
+   *
+   * @param addr stable Chronos control endpoint
+   * @param timelineKey timeline bound to this client
+   * @param config non-null client configuration
+   */
   public Client(String addr, String timelineKey, Config config) {
     this(
         createManagedChannel(addr, requireConfig(config).transport),
@@ -292,6 +397,12 @@ public class Client implements AutoCloseable {
     ensureRoute();
   }
 
+  /**
+   * Allocates timestamp ranges, transparently recovering stale routes and unavailable owners.
+   *
+   * @param count positive number of timestamps requested
+   * @return one or more allocated timestamp ranges
+   */
   public List<TimestampRange> allocateTimestamps(int count) {
     RouteSnapshot snapshot = ensureRoute();
     String clientRequestId = nextClientRequestId();
@@ -301,11 +412,17 @@ public class Client implements AutoCloseable {
       try {
         return allocateOnce(snapshot, count, clientRequestId).getRangesList();
       } catch (RuntimeException err) {
-        if (!isStaleRouteError(err) || staleRetries >= config.staleRouteRetryAttempts) {
+        if (!isRouteRecoveryError(err) || staleRetries >= config.staleRouteRetryAttempts) {
           throw err;
         }
         staleRetries++;
-        snapshot = refreshRouteIfUnchanged(snapshot);
+        try {
+          snapshot = refreshRouteIfUnchanged(snapshot);
+        } catch (RuntimeException refreshErr) {
+          if (Status.fromThrowable(refreshErr).getCode() != Status.Code.UNAVAILABLE) {
+            throw refreshErr;
+          }
+        }
         sleepBeforeStaleRouteRetry();
       }
     }
@@ -475,6 +592,12 @@ public class Client implements AutoCloseable {
     return false;
   }
 
+  private static boolean isRouteRecoveryError(RuntimeException err) {
+    Status.Code code = Status.fromThrowable(err).getCode();
+    return isStaleRouteError(err) || code == Status.Code.UNAVAILABLE;
+  }
+
+  /** Closes the control and owner channels held by this client. */
   @Override
   public void close() {
     synchronized (routeRefreshLock) {

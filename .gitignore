@@ -3,6 +3,8 @@ target/
 artifacts/
 clients/java/.gradle/
 clients/java/build/
+clients/java/package-consumer/.gradle/
+clients/java/package-consumer/build/
 clients/java/.project
 clients/java/.settings/
 clients/cpp/build/

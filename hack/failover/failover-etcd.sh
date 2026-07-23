@@ -85,17 +85,20 @@ CHRONOS_FAILOVER_BENCH_ALLOCATE_REQUEST_TIMEOUT_MS="${CHRONOS_FAILOVER_BENCH_ALL
 CHRONOS_FAILOVER_BENCH_ROUTE_REFRESH_TIMEOUT_MS="${CHRONOS_FAILOVER_BENCH_ROUTE_REFRESH_TIMEOUT_MS:-500}" \
 CHRONOS_FAILOVER_BENCH_DURATION_SECS="${BENCH_DURATION_SECS}" \
 CHRONOS_FAILOVER_BENCH_WARMUP_SECS="${BENCH_WARMUP_SECS}" \
-"${RELEASE_BIN_DIR}/chronos-failover-bench" | tee "${FAILOVER_LOG}"
+"${RELEASE_BIN_DIR}/chronos-failover-bench" 2>&1 | tee "${FAILOVER_LOG}"
 
 assert_positive_metric "failover_attempts_total" "${FAILOVER_LOG}"
 assert_positive_metric "failover_success_total" "${FAILOVER_LOG}"
 assert_positive_metric "first_success_after_kill_ms" "${FAILOVER_LOG}"
+assert_positive_metric "client_failover_success_total" "${FAILOVER_LOG}"
+assert_positive_metric "client_failover_latency_us" "${FAILOVER_LOG}"
 assert_metric_at_most "allocate_latency_p95_us" "${FAILOVER_LOG}" "${ALLOCATE_LATENCY_P95_US_MAX}"
 assert_metric_at_most "allocate_latency_p999_us" "${FAILOVER_LOG}" "${ALLOCATE_LATENCY_P999_US_MAX}"
 assert_metric_at_most "route_refresh_p999_us" "${FAILOVER_LOG}" "${ROUTE_REFRESH_P999_US_MAX}"
 assert_metric_at_most "failover_latency_p95_us" "${FAILOVER_LOG}" "${FAILOVER_LATENCY_P95_US_MAX}"
 assert_metric_at_most "failover_latency_p999_us" "${FAILOVER_LOG}" "${FAILOVER_LATENCY_P999_US_MAX}"
 assert_metric_at_most "first_success_after_kill_ms" "${FAILOVER_LOG}" "${FIRST_SUCCESS_AFTER_KILL_MS_MAX}"
+assert_metric_at_most "client_failover_latency_us" "${FAILOVER_LOG}" "$((FIRST_SUCCESS_AFTER_KILL_MS_MAX * 1000))"
 assert_zero_metric "monotonicity_violations_total" "${FAILOVER_LOG}"
 
 RESULT="success"

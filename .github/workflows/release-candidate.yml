@@ -2,11 +2,12 @@ name: Release Candidate
 
 on:
   workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
 
 permissions:
   contents: read
-  attestations: write
-  id-token: write
 
 env:
   CHRONOS_ARTIFACT_RETENTION_DAYS: 14
@@ -21,6 +22,8 @@ jobs:
       RUST_BACKTRACE: 1
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          fetch-depth: 2
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
         with:
           toolchain: 1.94.0
@@ -487,6 +490,10 @@ jobs:
   package-release-artifacts:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    permissions:
+      contents: write
+      attestations: write
+      id-token: write
     needs:
       - release-check
       - release-artifacts
@@ -523,3 +530,8 @@ jobs:
           path: artifacts/release/
           if-no-files-found: error
           retention-days: 14
+      - name: Publish GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" artifacts/release/* --verify-tag --generate-notes

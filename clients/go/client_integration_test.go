@@ -11,7 +11,7 @@ import (
 	"google.golang.org/grpc/codes"
 	grpcstatus "google.golang.org/grpc/status"
 
-	tsov1 "github.com/rleungx/chronos/gen/proto/tso/v1"
+	tsov1 "github.com/rleungx/chronos/clients/go/gen/proto/tso/v1"
 )
 
 type fakeChronosServer struct {
@@ -24,6 +24,7 @@ type fakeChronosServer struct {
 	getRouteCalls    int
 	allocateCalls    int
 	staleOnAllocate  bool
+	unavailableOnce  bool
 	nextStartTso     uint64
 	lastRequestID    string
 	returnedRequest  []string
@@ -106,6 +107,10 @@ func (s *fakeChronosServer) AllocateTimestamps(ctx context.Context, req *tsov1.A
 	s.returnedRequest = append(s.returnedRequest, req.ClientRequestId)
 	s.lastTimeoutMs = req.RequestTimeoutMs
 	_, s.allocateDeadline = ctx.Deadline()
+	if s.unavailableOnce {
+		s.unavailableOnce = false
+		return nil, grpcstatus.Error(codes.Unavailable, "owner unavailable")
+	}
 
 	if s.staleOnAllocate {
 		s.route.RouteVersion++
@@ -243,6 +248,42 @@ func TestClientRefreshesStaleRouteAndRetries(t *testing.T) {
 	}
 	if len(server.returnedRequest) != 2 || server.returnedRequest[0] == "" || server.returnedRequest[0] != server.returnedRequest[1] {
 		t.Fatalf("expected retry to reuse logical request id, got %v", server.returnedRequest)
+	}
+}
+
+func TestClientRefreshesRouteWhenOwnerIsUnavailable(t *testing.T) {
+	server, addr := startFakeChronosServer(t, false)
+	server.unavailableOnce = true
+
+	client, err := NewWithOptions(
+		context.Background(),
+		addr,
+		"orders.primary",
+		WithInsecureTransport(),
+		WithStaleRouteRetryAttempts(2),
+		WithStaleRouteRetryBackoffMs(0),
+	)
+	if err != nil {
+		t.Fatalf("New returned error: %v", err)
+	}
+	defer client.Close()
+
+	ranges, err := client.AllocateTimestamps(context.Background(), 1)
+	if err != nil {
+		t.Fatalf("AllocateTimestamps returned error: %v", err)
+	}
+	if len(ranges) != 1 || ranges[0].StartTso != 100 {
+		t.Fatalf("unexpected ranges: %+v", ranges)
+	}
+
+	server.mu.Lock()
+	defer server.mu.Unlock()
+	if server.getRouteCalls != 1 || server.allocateCalls != 2 {
+		t.Fatalf(
+			"expected one route refresh and two allocation attempts, got refreshes=%d allocations=%d",
+			server.getRouteCalls,
+			server.allocateCalls,
+		)
 	}
 }
 

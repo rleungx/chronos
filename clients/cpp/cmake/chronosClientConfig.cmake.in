@@ -1,0 +1,9 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+find_dependency(gRPC REQUIRED)
+if(NOT TARGET protobuf::libprotobuf)
+  find_dependency(Protobuf REQUIRED)
+endif()
+
+include("${CMAKE_CURRENT_LIST_DIR}/chronosClientTargets.cmake")

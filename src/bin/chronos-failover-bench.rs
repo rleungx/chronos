@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::error::Error;
-use std::io::Read;
 use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -18,6 +17,7 @@ use chronos::proto::v1::{
     EnsureTimelineRequest, ErrorCode, ErrorDetail, GetTimelineRouteRequest, ResourceTier,
     TimelineRoute, TimelineTransferReason, TransferTimelineRequest, WorkerReadinessState,
 };
+use chronos::{Client, ClientConfig, ClientTransportConfig};
 
 #[path = "support/env.rs"]
 mod support_env;
@@ -74,6 +74,8 @@ struct FailoverBenchStats {
     failover_latencies_us: Vec<u64>,
     monotonicity_violations_total: u64,
     first_success_after_kill_ms: Option<u64>,
+    client_failover_success_total: u64,
+    client_failover_latency_us: Option<u64>,
     error_counts: HashMap<String, u64>,
 }
 
@@ -248,17 +250,10 @@ fn spawn_chronos_process(config: &BenchConfig, spawn: &SpawnConfig) -> AppResult
             spawn.metrics_bind_addr.to_string(),
         )
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
+        // The harness must continuously drain service logs. A piped stderr that is only read on
+        // early startup failure eventually fills and blocks the timestamp server.
+        .stderr(Stdio::inherit())
         .spawn()?)
-}
-
-fn read_child_stderr(child: &mut Child) -> String {
-    let mut stderr = String::new();
-    if let Some(mut pipe) = child.stderr.take() {
-        pipe.read_to_string(&mut stderr)
-            .expect("child stderr should read");
-    }
-    stderr
 }
 
 fn terminate_child(child: &mut Child) {
@@ -286,7 +281,9 @@ async fn wait_for_post_failover_allocation_success(
     first_success_after_kill: Arc<Mutex<Option<u64>>>,
 ) -> AppResult<()> {
     timeout(Duration::from_secs(timeout_secs), async {
+        let mut attempt = 0u64;
         loop {
+            attempt = attempt.saturating_add(1);
             match allocate_timestamps_raw(
                 owner_endpoint_addr(config, &route.owner_worker_endpoint)?,
                 route,
@@ -305,11 +302,34 @@ async fn wait_for_post_failover_allocation_success(
                     }
                     return Ok::<(), Box<dyn Error + Send + Sync>>(());
                 }
-                Ok(_) | Err(_) => sleep(Duration::from_millis(100)).await,
+                Ok(_) => {
+                    if attempt == 1 || attempt.is_multiple_of(10) {
+                        eprintln!(
+                            "phase=post_failover_allocation_pending attempt={attempt} reason=empty_response"
+                        );
+                    }
+                    sleep(Duration::from_millis(100)).await;
+                }
+                Err(error) => {
+                    if attempt == 1 || attempt.is_multiple_of(10) {
+                        eprintln!(
+                            "phase=post_failover_allocation_pending attempt={attempt} grpc_code={} reason={}",
+                            error.code(),
+                            error.message()
+                        );
+                    }
+                    sleep(Duration::from_millis(100)).await;
+                }
             }
         }
     })
-    .await??;
+    .await
+    .map_err(|_| {
+        format!(
+            "post-failover allocation did not succeed within {timeout_secs}s for owner {}",
+            route.owner_worker_endpoint
+        )
+    })??;
     Ok(())
 }
 
@@ -317,11 +337,9 @@ async fn wait_for_ready(endpoint: SocketAddr, child: &mut Child) -> AppResult<()
     timeout(Duration::from_secs(15), async {
         loop {
             if let Some(status) = child.try_wait()? {
-                let stderr = read_child_stderr(child);
-                return Err(format!(
-                    "chronos process exited before readiness: status={status} stderr={stderr}"
-                )
-                .into());
+                return Err(
+                    format!("chronos process exited before readiness: status={status}").into(),
+                );
             }
 
             if let Ok(mut client) =
@@ -543,6 +561,19 @@ async fn main() -> AppResult<()> {
             config.owner_a.bind_addr,
             config.owner_b.bind_addr,
         );
+        let application_client = Arc::new(
+            Client::connect_with_config(
+                standby_endpoint.to_string(),
+                ClientConfig::new(timeline_key.clone())
+                    .with_request_timeout_ms(
+                        u32::try_from(config.allocate_request_timeout_ms).unwrap_or(u32::MAX),
+                    )
+                    .with_stale_route_retry_attempts(200)
+                    .with_stale_route_retry_backoff_ms(50)
+                    .with_transport(ClientTransportConfig::default().with_insecure(true)),
+            )
+            .await?,
+        );
         let leader_child = if leader_endpoint == config.owner_a.bind_addr {
             owner_a.clone()
         } else {
@@ -685,6 +716,7 @@ async fn main() -> AppResult<()> {
         let driver_first_success_after_kill = first_success_after_kill.clone();
         let driver_leader_child = leader_child.clone();
         let driver_config = config.clone();
+        let driver_application_client = application_client.clone();
         let driver_stats_handle = tokio::spawn(async move {
             let mut stats = FailoverBenchStats::default();
             driver_barrier.wait().await;
@@ -692,9 +724,19 @@ async fn main() -> AppResult<()> {
             *kill_instant.lock().await = Some(Instant::now());
             terminate_child(&mut *driver_leader_child.lock().await);
             eprintln!("phase=leader_killed endpoint={}", leader_endpoint);
+            let client_probe_started = Instant::now();
+            let client_probe = tokio::spawn(async move {
+                timeout(
+                    Duration::from_secs(failover_timeout_secs),
+                    driver_application_client.allocate_timestamps(driver_allocate_batch),
+                )
+                .await
+                .map_err(|_| "published Rust client did not recover before failover timeout")??;
+                Ok::<(), Box<dyn Error + Send + Sync>>(())
+            });
 
             if driver_config.auto_failover_enabled {
-                let (refreshed, observed_stats) = wait_for_auto_failover_route(
+                let (refreshed, mut observed_stats) = wait_for_auto_failover_route(
                     standby_endpoint,
                     &timeline_key_for_failover,
                     &owner_endpoint_str,
@@ -706,10 +748,15 @@ async fn main() -> AppResult<()> {
                         .expect("kill instant must be set before auto failover polling"),
                 )
                 .await?;
+                client_probe.await??;
+                observed_stats.client_failover_success_total = 1;
+                observed_stats.client_failover_latency_us =
+                    Some(client_probe_started.elapsed().as_micros() as u64);
                 *route.lock().await = refreshed;
+                let recovered_route = route.lock().await.clone();
                 wait_for_post_failover_allocation_success(
                     &driver_config,
-                    &route.lock().await.clone(),
+                    &recovered_route,
                     driver_allocate_batch,
                     driver_request_timeout_ms,
                     failover_timeout_secs,
@@ -746,9 +793,10 @@ async fn main() -> AppResult<()> {
                                     Box::<dyn Error + Send + Sync>::from(error.to_string())
                                 })?;
                             *route.lock().await = refreshed;
+                            let recovered_route = route.lock().await.clone();
                             wait_for_post_failover_allocation_success(
                                 &driver_config,
-                                &route.lock().await.clone(),
+                                &recovered_route,
                                 driver_allocate_batch,
                                 driver_request_timeout_ms,
                                 failover_timeout_secs,
@@ -756,6 +804,10 @@ async fn main() -> AppResult<()> {
                                 driver_first_success_after_kill.clone(),
                             )
                             .await?;
+                            client_probe.await??;
+                            stats.client_failover_success_total = 1;
+                            stats.client_failover_latency_us =
+                                Some(client_probe_started.elapsed().as_micros() as u64);
                             return Ok::<FailoverBenchStats, Box<dyn Error + Send + Sync>>(stats);
                         }
                         Err(status) if status.code() == Code::FailedPrecondition => {
@@ -780,6 +832,8 @@ async fn main() -> AppResult<()> {
         stats.failover_other_failures_total = driver_stats.failover_other_failures_total;
         stats.failover_latencies_us = driver_stats.failover_latencies_us;
         stats.first_success_after_kill_ms = *first_success_after_kill.lock().await;
+        stats.client_failover_success_total = driver_stats.client_failover_success_total;
+        stats.client_failover_latency_us = driver_stats.client_failover_latency_us;
 
         terminate_child(&mut *leader_child.lock().await);
         terminate_child(&mut *standby_child.lock().await);
@@ -889,6 +943,14 @@ async fn main() -> AppResult<()> {
         println!(
             "first_success_after_kill_ms={}",
             stats.first_success_after_kill_ms.unwrap_or(0)
+        );
+        println!(
+            "client_failover_success_total={}",
+            stats.client_failover_success_total
+        );
+        println!(
+            "client_failover_latency_us={}",
+            stats.client_failover_latency_us.unwrap_or(0)
         );
         println!(
             "monotonicity_violations_total={}",

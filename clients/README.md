@@ -14,6 +14,8 @@ The client handles the operational details that applications should not duplicat
 - The client fetches and caches the current route internally
 - Stale-route errors are handled internally with a configurable refresh-and-retry budget
 - Route refresh reconnects allocation traffic to the current owner endpoint
+- Owner `UNAVAILABLE` failures trigger bounded route recovery through the
+  stable construction endpoint
 - Allocation idempotency is optional; enable it only when callers need replay protection for
   ambiguous retries
 
@@ -27,6 +29,9 @@ Common client options are available in every language:
 - Stale-route retry attempts and retry backoff
 - Optional allocation request idempotency
 - TLS, mTLS, server-name override, and explicit plaintext for local development
+
+The endpoint passed to the constructor is a control-plane endpoint, not an owner-pod address. Use a
+stable Service or load balancer in production so it remains reachable after an owner exits.
 
 ## Languages
 
@@ -53,10 +58,16 @@ Common client options are available in every language:
 
 ## Compatibility
 
-Client examples and library entry points are CI-gated. Rust and Go are the stable application
-surfaces for published integrations. Java and C++ track the same API shape in this repository and
-are suitable for source-based integrations; publish them externally only with an explicit
-versioning and distribution step.
+Client examples and library entry points are CI-gated. This repository has not published its first
+client release yet, so the current checkout remains a source-based integration. Tag-triggered
+release automation is available for Go, Java, and C++; only artifacts produced by that workflow are
+published releases.
+
+The Go module lives at `github.com/rleungx/chronos/clients/go`. Release it with a matching
+subdirectory tag such as `clients/go/v0.1.0`.
+
+The versioning, distribution, and public compatibility policy is defined in
+`clients/compatibility.md`.
 
 The cross-language client contract lives in `clients/client-contract.md` and is checked by
 `make client-conformance-check`. Repository-local package metadata is checked by

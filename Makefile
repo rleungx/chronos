@@ -80,6 +80,7 @@ CONTAINER_CHECK_IMAGE ?= chronos:container-check
 CONTAINER_CHECK_FORCE_BUILD ?= 1
 CHRONOS_ALLOW_DIRTY_RELEASE ?= 0
 CARGO_DENY_VERSION ?= 0.19.4
+CLIENT_CPP_CHECK_VERSION ?= 0.1.0
 CHRONOS_SKIP_RELEASE_BUILD ?= 0
 CHRONOS_RELEASE_BIN_DIR ?= $(CURDIR)/target/release
 RELEASE_GATE_ARTIFACT_DIR ?= $(CURDIR)/artifacts/release-gate
@@ -338,9 +339,14 @@ client-example-check:
 
 client-package-check-java:
 	cd clients/java && gradle --no-daemon publishMavenJavaPublicationToLocalStagingRepository
+	gradle --no-daemon -p clients/java/package-consumer --refresh-dependencies compileJava
 
 client-package-check-cpp:
-	cmake -S clients/cpp -B clients/cpp/build && cmake --build clients/cpp/build && cmake --install clients/cpp/build --prefix clients/cpp/build/install-check
+	cmake -S clients/cpp -B clients/cpp/build -DCHRONOS_CLIENT_VERSION=$(CLIENT_CPP_CHECK_VERSION) && cmake --build clients/cpp/build && cmake --install clients/cpp/build --prefix clients/cpp/build/install-check
+	cmake -S clients/cpp/package-consumer -B clients/cpp/build/package-consumer -DCMAKE_PREFIX_PATH=$$(pwd)/clients/cpp/build/install-check -DCHRONOS_CLIENT_VERSION=$(CLIENT_CPP_CHECK_VERSION)
+	cmake --build clients/cpp/build/package-consumer
+	cmake --build clients/cpp/build --target package
+	test -s clients/cpp/build/chronos-cpp-client-$(CLIENT_CPP_CHECK_VERSION)-*.tar.gz
 
 client-package-check:
 	$(MAKE) client-package-check-java

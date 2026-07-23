@@ -26,8 +26,8 @@ class Client {
     chronos::tso::v1::ResourceTier desired_resource_tier =
         chronos::tso::v1::RESOURCE_TIER_SHARED;
     uint32_t request_timeout_ms = 250;
-    uint32_t stale_route_retry_attempts = 3;
-    uint64_t stale_route_retry_backoff_ms = 5;
+    uint32_t stale_route_retry_attempts = 100;
+    uint64_t stale_route_retry_backoff_ms = 50;
     bool idempotency_enabled = false;
     TransportConfig transport;
   };

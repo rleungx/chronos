@@ -77,6 +77,15 @@ Before publishing or deploying, ensure you have:
 8. release-shape and container delivery checks validated via `make release-check`
 9. `BUILD_INFO`, SBOM/hash artifacts, and container vulnerability scanning validated via `make release-security-check`
 
+After the gate passes on the exact release commit, create an annotated root tag such as `v0.1.0`.
+The tag-triggered Release Candidate workflow reruns the authoritative gates, attests the artifacts,
+and publishes the GitHub release only after every required job succeeds. Publish the Go module with
+the matching subdirectory tag, for example `clients/go/v0.1.0`.
+
+Go, Java, and C++ clients have independent release tags and distributions. Follow
+`clients/compatibility.md`; the `Client Release` workflow validates, packages, and publishes exactly
+one client for each `clients/<language>/vX.Y.Z` tag.
+
 ## Rollback expectation
 
 If any benchmark budget or observability validation fails after a release candidate build, do not

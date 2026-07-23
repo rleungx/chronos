@@ -4,7 +4,15 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-BASE_REF="${CHRONOS_PROTO_BASE_REF:-origin/main}"
+if [[ -n "${CHRONOS_PROTO_BASE_REF:-}" ]]; then
+  BASE_REF="${CHRONOS_PROTO_BASE_REF}"
+elif [[ "${GITHUB_EVENT_NAME:-}" == "push" ]] && git cat-file -e HEAD^:tso.proto 2>/dev/null; then
+  BASE_REF="HEAD^"
+elif [[ -n "${GITHUB_BASE_REF:-}" ]]; then
+  BASE_REF="origin/${GITHUB_BASE_REF}"
+else
+  BASE_REF="origin/main"
+fi
 
 cd "${REPO_ROOT}"
 if ! git cat-file -e "${BASE_REF}:tso.proto" 2>/dev/null; then

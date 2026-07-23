@@ -13,17 +13,18 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 
-	tsov1 "github.com/rleungx/chronos/gen/proto/tso/v1"
+	tsov1 "github.com/rleungx/chronos/clients/go/gen/proto/tso/v1"
 )
 
 const maxRetainedStaleOwnerConns = 16
 const defaultRequestTimeoutMs uint32 = 250
-const defaultStaleRouteRetryAttempts uint32 = 3
-const defaultStaleRouteRetryBackoffMs uint64 = 5
+const defaultStaleRouteRetryAttempts uint32 = 100
+const defaultStaleRouteRetryBackoffMs uint64 = 50
 
 var clientScopeCounter atomic.Uint64
 
@@ -200,14 +201,16 @@ func (c *Client) AllocateTimestamps(ctx context.Context, count uint32) ([]*tsov1
 		if err == nil {
 			return ranges, nil
 		}
-		if !isStaleRouteError(err) || staleRetries >= c.config.staleRouteRetryAttempts {
+		if !isRouteRecoveryError(err) || staleRetries >= c.config.staleRouteRetryAttempts {
 			return nil, err
 		}
 
 		staleRetries++
-		snapshot, err = c.refreshRouteIfUnchanged(ctx, snapshot)
-		if err != nil {
-			return nil, err
+		refreshed, refreshErr := c.refreshRouteIfUnchanged(ctx, snapshot)
+		if refreshErr == nil {
+			snapshot = refreshed
+		} else if !isTransientRPCError(refreshErr) {
+			return nil, refreshErr
 		}
 		if c.config.staleRouteRetryBackoffMs > 0 {
 			select {
@@ -427,6 +430,15 @@ func isStaleRouteError(err error) bool {
 	}
 
 	return false
+}
+
+func isRouteRecoveryError(err error) bool {
+	return isStaleRouteError(err) || isTransientRPCError(err)
+}
+
+func isTransientRPCError(err error) bool {
+	code := status.Code(err)
+	return code == codes.Unavailable
 }
 
 func transportCredentials(cfg transportConfig) (credentials.TransportCredentials, error) {

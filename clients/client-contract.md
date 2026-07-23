@@ -17,8 +17,11 @@ Every client must support the same behavior:
   can never combine a route from one refresh generation with another owner's channel
 - singleflight concurrent route refreshes for the same observed stale snapshot
 - allocate against the `owner_worker_endpoint` returned by the route service
-- refresh the route and retry only for Chronos stale-route error details:
-  `NOT_TIMELINE_OWNER`, `ROUTE_VERSION_MISMATCH`, and `EPOCH_MISMATCH`
+- refresh the route and retry for Chronos stale-route error details
+  (`NOT_TIMELINE_OWNER`, `ROUTE_VERSION_MISMATCH`, and `EPOCH_MISMATCH`) and owner transport
+  failures (`UNAVAILABLE`)
+- treat the construction endpoint as a stable control-plane address that remains reachable when an
+  advertised owner endpoint fails
 - reuse the same logical client request id across stale-route retries when idempotency is enabled
 - keep generated request IDs independent of user-controlled timeline length and within the server's
   128-byte request-ID limit
@@ -29,8 +32,8 @@ Every client must expose these configuration capabilities:
 
 - desired resource tier for timeline ensure
 - per-allocation Chronos request timeout
-- stale-route retry attempts
-- stale-route retry backoff
+- route-recovery retry attempts
+- route-recovery retry backoff
 - optional allocation request-record idempotency
 - TLS roots
 - mTLS client identity

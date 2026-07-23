@@ -1,7 +1,9 @@
 cmake_minimum_required(VERSION 3.20)
-project(chronos_cpp_client LANGUAGES CXX)
+set(CHRONOS_CLIENT_VERSION "0.1.0" CACHE STRING "Chronos C++ client package version")
+project(chronos_cpp_client VERSION "${CHRONOS_CLIENT_VERSION}" LANGUAGES CXX)
 
 include(GNUInstallDirs)
+include(CMakePackageConfigHelpers)
 
 enable_testing()
 
@@ -40,7 +42,7 @@ target_include_directories(
   PUBLIC
     "$<BUILD_INTERFACE:${GENERATED_DIR}>"
     "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>"
-    "$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/chronos>"
+    "$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>"
 )
 target_link_libraries(chronos_proto PUBLIC protobuf::libprotobuf gRPC::grpc++)
 
@@ -51,7 +53,7 @@ target_include_directories(
   chronos_client_lib
   PUBLIC
     "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>"
-    "$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/chronos>"
+    "$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>"
 )
 target_link_libraries(chronos_client_lib PUBLIC chronos_proto)
 
@@ -78,6 +80,36 @@ install(
 )
 install(
   EXPORT chronosClientTargets
+  FILE chronosClientTargets.cmake
   NAMESPACE chronos::
   DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/chronos"
 )
+
+configure_package_config_file(
+  "${CMAKE_CURRENT_SOURCE_DIR}/cmake/chronosClientConfig.cmake.in"
+  "${CMAKE_CURRENT_BINARY_DIR}/chronosConfig.cmake"
+  INSTALL_DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/chronos"
+)
+if(PROJECT_VERSION_MAJOR EQUAL 0)
+  set(CHRONOS_VERSION_COMPATIBILITY SameMinorVersion)
+else()
+  set(CHRONOS_VERSION_COMPATIBILITY SameMajorVersion)
+endif()
+write_basic_package_version_file(
+  "${CMAKE_CURRENT_BINARY_DIR}/chronosConfigVersion.cmake"
+  VERSION "${PROJECT_VERSION}"
+  COMPATIBILITY "${CHRONOS_VERSION_COMPATIBILITY}"
+)
+install(
+  FILES
+    "${CMAKE_CURRENT_BINARY_DIR}/chronosConfig.cmake"
+    "${CMAKE_CURRENT_BINARY_DIR}/chronosConfigVersion.cmake"
+  DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/chronos"
+)
+
+set(CPACK_PACKAGE_NAME "chronos-cpp-client")
+set(CPACK_PACKAGE_VENDOR "Chronos")
+set(CPACK_PACKAGE_VERSION "${PROJECT_VERSION}")
+set(CPACK_PACKAGE_FILE_NAME "chronos-cpp-client-${PROJECT_VERSION}-${CMAKE_SYSTEM_NAME}-${CMAKE_SYSTEM_PROCESSOR}")
+set(CPACK_GENERATOR "TGZ")
+include(CPack)

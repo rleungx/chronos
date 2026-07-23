@@ -37,9 +37,9 @@ trap cleanup EXIT
 protoc \
   --proto_path="${REPO_ROOT}" \
   --go_out="${generated_dir}" \
-  --go_opt=module=github.com/rleungx/chronos \
+  --go_opt=module=github.com/rleungx/chronos/clients/go \
   --go-grpc_out="${generated_dir}" \
-  --go-grpc_opt=module=github.com/rleungx/chronos \
+  --go-grpc_opt=module=github.com/rleungx/chronos/clients/go \
   "${REPO_ROOT}/tso.proto"
 
 for generated_file in tso.pb.go tso_grpc.pb.go; do

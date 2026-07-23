@@ -3,6 +3,10 @@
 Chronos is a gRPC timestamp service for applications that need monotonic, timeline-scoped timestamp
 allocation without carrying route, ownership, or failover logic in application code.
 
+> Project status: pre-release. The correctness and operations gates are actively exercised, but no
+> stable version has been published. Production adoption should pin a reviewed commit and run the
+> full release gate in the target environment.
+
 The application path is intentionally small:
 
 1. Pick a `timeline_key` for the workload shard
@@ -11,6 +15,10 @@ The application path is intentionally small:
 
 The client handles timeline creation, route lookup, owner reconnects, stale-route refresh, and
 failover recovery.
+
+In production, construct clients with a stable control-plane address (for example, a Kubernetes
+Service). Advertised owner endpoints may change or disappear during failover; the control-plane
+address must remain reachable so clients can refresh their cached route.
 
 ## When to use Chronos
 
@@ -68,6 +76,8 @@ traffic across timeline keys and configure multi-node generator ownership.
 The Kubernetes manifest is intentionally a static partitioned StatefulSet; scale it through a
 planned ownership-plan change rather than a generic HPA. Use `make kubernetes-scale-plan` before
 changing replicas, ownership modulo, or PDB settings.
+Ownership-plan and worker-count changes currently require a quiesced, scale-to-zero migration; they
+are not online elastic scaling operations.
 
 Operator docs:
 

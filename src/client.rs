@@ -7,8 +7,9 @@
 //!
 //! Internal route management stays inside the client. The client ensures the timeline,
 //! fetches the current route, caches it, and refreshes it on stale-route errors.
-//! Stale-route conditions such as owner, epoch, or route-version mismatch are retried
-//! internally after route refresh. Other RPC failures are returned to the caller.
+//! Stale-route conditions such as owner, epoch, or route-version mismatch, plus owner
+//! `UNAVAILABLE` failures, are retried internally after route refresh. Other RPC failures are
+//! returned to the caller.
 //!
 //! ```no_run
 //! use chronos::{Client, ClientConfig, ClientTransportConfig};
@@ -45,8 +46,9 @@ use crate::proto::v1::{
 };
 use crate::rpc::decode_error_detail_from_status_details;
 
-const DEFAULT_STALE_ROUTE_RETRY_ATTEMPTS: u32 = 3;
-const DEFAULT_STALE_ROUTE_RETRY_BACKOFF_MS: u64 = 5;
+// The recovery window must cover lease expiry, not only an immediately visible stale route.
+const DEFAULT_STALE_ROUTE_RETRY_ATTEMPTS: u32 = 100;
+const DEFAULT_STALE_ROUTE_RETRY_BACKOFF_MS: u64 = 50;
 const DEFAULT_REQUEST_TIMEOUT_MS: u32 = 250;
 static CLIENT_SCOPE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -166,8 +168,9 @@ pub enum ClientError {
     },
     /// A gRPC error returned by Chronos after client-side refresh/retry handling.
     ///
-    /// Route staleness is handled internally. Errors returned here are terminal for the
-    /// current call unless the application chooses to apply its own higher-level retry policy.
+    /// Route staleness and owner `UNAVAILABLE` failures are handled internally. Errors returned
+    /// here are terminal for the current call unless the application chooses to apply its own
+    /// higher-level retry policy.
     #[error(transparent)]
     Rpc(Box<Status>),
     #[error("chronos returned no route from {operation}")]
@@ -263,8 +266,9 @@ impl Client {
 
     /// Allocates one or more timestamp ranges from the bound timeline.
     ///
-    /// This method refreshes the cached route and retries when Chronos reports that the
-    /// current route is stale. Other failures are returned as `ClientError`.
+    /// This method refreshes the cached route and retries when Chronos reports that the current
+    /// route is stale or the cached owner is unavailable. Other failures are returned as
+    /// `ClientError`.
     pub async fn allocate_timestamps(
         &self,
         count: u32,
@@ -285,11 +289,15 @@ impl Client {
             {
                 Ok(ranges) => return Ok(ranges),
                 Err(status)
-                    if is_stale_route_error(&status)
+                    if is_route_recovery_error(&status)
                         && stale_retries < self.config.stale_route_retry_attempts =>
                 {
                     stale_retries += 1;
-                    self.refresh_route_if_unchanged(&snapshot.route).await?;
+                    if let Err(error) = self.refresh_route_if_unchanged(&snapshot.route).await {
+                        if !is_transient_client_error(&error) {
+                            return Err(error);
+                        }
+                    }
                     if self.config.stale_route_retry_backoff_ms > 0 {
                         tokio::time::sleep(Duration::from_millis(
                             self.config.stale_route_retry_backoff_ms,
@@ -550,6 +558,18 @@ fn is_stale_route_error(status: &Status) -> bool {
     )
 }
 
+fn is_route_recovery_error(status: &Status) -> bool {
+    is_stale_route_error(status) || status.code() == Code::Unavailable
+}
+
+fn is_transient_client_error(error: &ClientError) -> bool {
+    matches!(
+        error,
+        ClientError::Rpc(status)
+            if status.code() == Code::Unavailable
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
@@ -643,6 +663,37 @@ mod tests {
     #[derive(Clone)]
     struct FakeTimestampService {
         route: Arc<StdMutex<TimelineRoute>>,
+    }
+
+    #[derive(Clone)]
+    struct FailoverRouteService {
+        initial_route: TimelineRoute,
+        recovered_route: TimelineRoute,
+    }
+
+    #[tonic::async_trait]
+    impl crate::proto::v1::timeline_route_service_server::TimelineRouteService
+        for FailoverRouteService
+    {
+        async fn get_timeline_route(
+            &self,
+            request: Request<GetTimelineRouteRequest>,
+        ) -> Result<Response<GetTimelineRouteResponse>, Status> {
+            let mut route = self.recovered_route.clone();
+            route.timeline_key = request.into_inner().timeline_key;
+            Ok(Response::new(GetTimelineRouteResponse {
+                route: Some(route),
+            }))
+        }
+
+        async fn ensure_timeline(
+            &self,
+            request: Request<EnsureTimelineRequest>,
+        ) -> Result<Response<EnsureTimelineResponse>, Status> {
+            let mut route = self.initial_route.clone();
+            route.timeline_key = request.into_inner().timeline_key;
+            Ok(Response::new(EnsureTimelineResponse { route: Some(route) }))
+        }
     }
 
     #[tonic::async_trait]
@@ -751,6 +802,32 @@ mod tests {
         tokio::spawn(async move {
             Server::builder()
                 .add_service(TimestampServiceServer::new(timestamp_service))
+                .serve_with_incoming(incoming)
+                .await
+                .expect("server should serve");
+        });
+
+        addr.to_string()
+    }
+
+    async fn spawn_failover_route_server(
+        initial_route: TimelineRoute,
+        recovered_route: TimelineRoute,
+    ) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener
+            .local_addr()
+            .expect("listener should have local addr");
+        let incoming = TcpListenerStream::new(listener);
+
+        tokio::spawn(async move {
+            Server::builder()
+                .add_service(TimelineRouteServiceServer::new(FailoverRouteService {
+                    initial_route,
+                    recovered_route,
+                }))
                 .serve_with_incoming(incoming)
                 .await
                 .expect("server should serve");
@@ -908,6 +985,38 @@ mod tests {
             .expect("allocation should succeed against owner endpoint");
 
         assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0].start_tso, 100);
+    }
+
+    #[tokio::test]
+    async fn allocate_recovers_when_cached_owner_is_unavailable() {
+        let recovered_owner = spawn_timestamp_only_server(test_route("127.0.0.1:0")).await;
+        let dead_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("dead endpoint should bind");
+        let dead_owner = dead_listener
+            .local_addr()
+            .expect("dead endpoint should have local addr")
+            .to_string();
+        drop(dead_listener);
+
+        let route_endpoint =
+            spawn_failover_route_server(test_route(dead_owner), test_route(recovered_owner)).await;
+        let client = Client::connect_with_config(
+            route_endpoint,
+            ClientConfig::new("orders.primary")
+                .with_stale_route_retry_attempts(3)
+                .with_stale_route_retry_backoff_ms(0)
+                .with_transport(ClientTransportConfig::default().with_insecure(true)),
+        )
+        .await
+        .expect("client should connect through the stable control endpoint");
+
+        let ranges = client
+            .allocate_timestamps(1)
+            .await
+            .expect("allocation should refresh after owner transport failure");
+
         assert_eq!(ranges[0].start_tso, 100);
     }
 

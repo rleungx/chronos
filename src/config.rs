@@ -249,7 +249,10 @@ impl Default for TsoConfig {
             etcd_cert_file: None,
             etcd_key_file: None,
             etcd_timeout_ms: None,
-            pre_borrow_ms: 1000,
+            // Keep planned cross-owner transfer catch-up comfortably below the 1s allocation
+            // tail-latency budget. Operators can raise this to trade fewer metadata renewals for
+            // a larger graceful-transfer pause.
+            pre_borrow_ms: 100,
             max_clock_rewind_ms: 30_000,
             max_clock_skew_ms: DEFAULT_MAX_CLOCK_SKEW_MS,
             recovery_catchup_budget_ms: 5_000,
