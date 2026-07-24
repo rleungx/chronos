@@ -1,12 +1,12 @@
 # Changelog
 
-All notable changes will be documented here. Chronos has not published its first release yet.
+All notable changes will be documented here.
 
 The project follows Semantic Versioning. Protocol compatibility, generated clients, release
 artifacts, and retained failure-recovery evidence must pass the release gate before a version is
 tagged.
 
-## Unreleased
+## [Unreleased]
 
 - Recover client routes after owner transport failures.
 - Validate failover and rebalance evidence without masking benchmark failures.

@@ -52,6 +52,9 @@ jobs:
       - name: Validate GitHub Actions workflows
         run: |
           "$(go env GOPATH)/bin/actionlint" -color
+      - name: Validate root release tag and version surfaces
+        if: startsWith(github.ref, 'refs/tags/')
+        run: make CHRONOS_RELEASE_TAG="$GITHUB_REF_NAME" release-version-check
       - name: Run release checks
         run: make release-check-core
 

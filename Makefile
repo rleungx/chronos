@@ -12,6 +12,8 @@ ETCD_ENDPOINTS ?= 127.0.0.1:2379
 	etcd-cluster-reset \
 	etcd-cluster-health \
 	test-layer-0 \
+	test-release-version-verifier \
+	release-version-check \
 	test-layer-1 \
 	test-layer-2 \
 	test-layer-3 \
@@ -185,6 +187,14 @@ etcd-cluster-health:
 test-layer-0:
 	cargo fmt --all -- --check
 	cargo clippy --locked --all-targets -- -D warnings
+	$(MAKE) test-release-version-verifier
+	$(MAKE) release-version-check
+
+test-release-version-verifier:
+	bash hack/verify-release-version.sh --self-test
+
+release-version-check:
+	CHRONOS_RELEASE_TAG="$(CHRONOS_RELEASE_TAG)" bash hack/verify-release-version.sh
 
 test-layer-1:
 	cargo test --locked --lib --test crate_root_api_smoke --test tso_planes_public_api --test lifecycle_semantics

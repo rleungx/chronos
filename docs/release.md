@@ -83,8 +83,14 @@ Before publishing or deploying, ensure you have:
 
 After the gate passes on the exact release commit, create an annotated root tag such as `v0.1.0`.
 The tag-triggered Release Candidate workflow reruns the authoritative gates, attests the artifacts,
-and publishes the GitHub release only after every required job succeeds. Publish the Go module with
-the matching subdirectory tag, for example `clients/go/v0.1.0`.
+and publishes the GitHub release only after every required job succeeds. The release checks reject
+a root tag that is not `v` plus stable SemVer (prerelease and build metadata are not
+supported) or does not exactly match the root Cargo package, lockfile, Helm chart/app/image versions,
+and Docker OCI version label. Normal source checks require an `[Unreleased]` changelog section; a
+tagged release additionally requires a heading for that exact version. Run `make
+release-version-check` locally while preparing the version surfaces, and add the versioned changelog
+heading before creating the tag. Publish the Go module with the matching subdirectory tag, for
+example `clients/go/v0.1.0`.
 
 Go, Java, and C++ clients have independent release tags and distributions. Follow
 `clients/compatibility.md`; the `Client Release` workflow validates, packages, and publishes exactly
