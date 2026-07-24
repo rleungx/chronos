@@ -3,11 +3,12 @@ use crate::{ResourceTier, TimelineLifecycleState, TsoConfig};
 
 use super::EtcdMetadataStore;
 use super::{
-    cluster_format::active_identity_formats_are_compatible, identity_claim_matches_record,
-    identity_lifecycle::await_identity_keepalive_step, identity_record_belongs_to_ownership_plan,
-    parse_prev_route, parse_timeline_filter_record, route_update_for_watch_event,
-    verify_instance_identity_lease_record, InstanceIdentityLeaseRecord, RouteOnlyTimelineRecord,
-    TimelineRoute, TimelineRouteRecord,
+    cluster_format::active_identity_formats_are_compatible,
+    identity_claim_matches_record,
+    identity_lifecycle::{await_identity_keepalive_reconnect, await_identity_keepalive_step},
+    identity_record_belongs_to_ownership_plan, parse_prev_route, parse_timeline_filter_record,
+    route_update_for_watch_event, verify_instance_identity_lease_record,
+    InstanceIdentityLeaseRecord, RouteOnlyTimelineRecord, TimelineRoute, TimelineRouteRecord,
 };
 use crate::metadata::types::{CURRENT_CLUSTER_FORMAT_VERSION, CURRENT_METADATA_SCHEMA_VERSION};
 use crate::metadata::{
@@ -25,6 +26,31 @@ async fn identity_keepalive_step_stops_waiting_at_the_confirmed_lease_deadline()
 
     assert!(result.is_err());
     assert!(Instant::now() >= deadline);
+}
+
+#[tokio::test]
+async fn identity_reconnect_after_stream_error_cannot_outlive_confirmed_deadline() {
+    let pending_open_deadline = Instant::now() + Duration::from_millis(20);
+    let result = await_identity_keepalive_reconnect(
+        pending_open_deadline,
+        Duration::from_millis(1),
+        std::future::pending::<()>(),
+    )
+    .await;
+
+    assert!(result.is_err());
+    assert!(Instant::now() >= pending_open_deadline);
+
+    let backoff_deadline = Instant::now() + Duration::from_millis(20);
+    let result = await_identity_keepalive_reconnect(
+        backoff_deadline,
+        Duration::from_secs(1),
+        std::future::ready(()),
+    )
+    .await;
+
+    assert!(result.is_err());
+    assert!(Instant::now() >= backoff_deadline);
 }
 
 fn sample_route(generator_id: u32, route_version: u64) -> TimelineRoute {

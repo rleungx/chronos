@@ -12,6 +12,18 @@ pub(super) async fn await_identity_keepalive_step<T>(
     timeout_at(lease_alive_until, future).await
 }
 
+pub(super) async fn await_identity_keepalive_reconnect<T>(
+    lease_alive_until: Instant,
+    backoff: Duration,
+    reconnect: impl Future<Output = T>,
+) -> Result<T, Elapsed> {
+    timeout_at(lease_alive_until, async {
+        sleep(backoff).await;
+        reconnect.await
+    })
+    .await
+}
+
 impl EtcdMetadataStore {
     async fn claimed_instance_identity_matches(
         &self,
@@ -424,27 +436,32 @@ impl EtcdMetadataStore {
                         worker_id = lease_worker_id,
                         advertise_endpoint = lease_advertise_endpoint
                     );
-                    sleep(backoff).await;
-
-                    match retry_etcd_request(
-                        "identity_lease_keepalive_open",
-                        request_retry_budget,
-                        || {
-                            let mut client = keepalive_client_source.clone();
-                            async move { client.lease_keep_alive(lease_id).await }
-                        },
+                    match await_identity_keepalive_reconnect(
+                        lease_alive_until,
+                        backoff,
+                        retry_etcd_request(
+                            "identity_lease_keepalive_open",
+                            request_retry_budget,
+                            || {
+                                let mut client = keepalive_client_source.clone();
+                                async move { client.lease_keep_alive(lease_id).await }
+                            },
+                        ),
                     )
                     .await
                     {
-                        Ok((new_keeper, new_stream)) => {
+                        Ok(Ok((new_keeper, new_stream))) => {
                             keeper = new_keeper;
                             stream = new_stream;
                             continue 'keepalive;
                         }
-                        Err(error) => {
+                        Ok(Err(error)) => {
                             consecutive_reconnect_failures =
                                 consecutive_reconnect_failures.saturating_add(1);
                             reconnect_reason = format!("keepalive_reconnect_failed: {error}");
+                        }
+                        Err(_) => {
+                            reconnect_reason = "keepalive_reconnect_deadline_elapsed".to_owned();
                         }
                     }
                 }
