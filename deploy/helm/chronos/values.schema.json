@@ -52,6 +52,7 @@
     },
     "etcd": {
       "type": "object",
+      "additionalProperties": false,
       "required": ["endpoints", "prefix", "tlsSecretName"],
       "properties": {
         "endpoints": {

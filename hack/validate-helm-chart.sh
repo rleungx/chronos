@@ -63,6 +63,7 @@ replica_schema = schema.dig("properties", "replicaCount", "anyOf")
 fail!("values.schema.json must allow only drain-zero or at least three replicas") unless replica_schema == [{"const" => 0}, {"minimum" => 3}]
 fail!("values.schema.json must reject latest image tag") unless schema.dig("properties", "image", "properties", "tag", "not", "const") == "latest"
 fail!("values.schema.json must reject unknown image properties") unless schema.dig("properties", "image", "additionalProperties") == false
+fail!("values.schema.json must reject unknown etcd properties") unless schema.dig("properties", "etcd", "additionalProperties") == false
 fail!("values.schema.json must require mTLS security mode") unless schema.dig("properties", "security", "properties", "mode", "const") == "required"
 fail!("values.schema.json must constrain ownership shard count") unless schema.dig("properties", "ownership", "properties", "shardCount", "minimum") == 3
 fail!("values.schema.json must reject removed ownership escape hatches") unless schema.dig("properties", "ownership", "additionalProperties") == false
@@ -132,6 +133,25 @@ if command -v helm >/dev/null 2>&1; then
     echo "Helm chart rejected image.digset for an unexpected reason: ${typo_error}" >&2
     exit 1
   fi
+  custom_etcd_rendered="$(
+    helm template chronos "${chart}" \
+      --set-string etcd.endpoints=https://custom-etcd.example:2379
+  )"
+  if ! grep -Fq 'CHRONOS_ETCD_ENDPOINTS: "https://custom-etcd.example:2379"' \
+    <<<"${custom_etcd_rendered}"; then
+    echo "Helm chart did not render the custom etcd endpoint" >&2
+    exit 1
+  fi
+  if typo_error="$(helm template chronos "${chart}" \
+    --set-string etcd.endponts=https://wrong.example:2379 \
+    2>&1 >/dev/null)"; then
+    echo "Helm chart accepted unknown etcd.endponts typo" >&2
+    exit 1
+  fi
+  if ! grep -Fq 'Additional property endponts is not allowed' <<<"${typo_error}"; then
+    echo "Helm chart rejected etcd.endponts for an unexpected reason: ${typo_error}" >&2
+    exit 1
+  fi
   if helm template chronos "${chart}" --set ownership.allowUnsafeInPlaceMigration=true >/dev/null 2>&1; then
     echo "Helm chart accepted the removed unsafe in-place migration option" >&2
     exit 1
@@ -143,6 +163,8 @@ if command -v helm >/dev/null 2>&1; then
     echo "Helm chart must render the default image for both Chronos containers" >&2
     exit 1
   fi
+  grep -Fq 'CHRONOS_ETCD_ENDPOINTS: "https://etcd-client.etcd.svc.cluster.local:2379"' \
+    "${rendered}"
   grep -Fq "CHRONOS_GENERATOR_OWNERSHIP_MODULO: \"256\"" "${rendered}"
   grep -Fq "CHRONOS_OWNERSHIP_WORKER_COUNT: \"3\"" "${rendered}"
   grep -Fq "CHRONOS_OWNERSHIP_ASSIGNMENT_SEED: \"20260516\"" "${rendered}"
