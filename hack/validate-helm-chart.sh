@@ -66,6 +66,7 @@ fail!("values.schema.json must reject unknown image properties") unless schema.d
 fail!("values.schema.json must reject unknown etcd properties") unless schema.dig("properties", "etcd", "additionalProperties") == false
 fail!("values.schema.json must require mTLS security mode") unless schema.dig("properties", "security", "properties", "mode", "const") == "required"
 fail!("values.schema.json must reject unknown security properties") unless schema.dig("properties", "security", "additionalProperties") == false
+fail!("values.schema.json must reject unknown topology spread properties") unless schema.dig("properties", "topologySpreadConstraints", "additionalProperties") == false
 fail!("values.schema.json must constrain ownership shard count") unless schema.dig("properties", "ownership", "properties", "shardCount", "minimum") == 3
 fail!("values.schema.json must reject removed ownership escape hatches") unless schema.dig("properties", "ownership", "additionalProperties") == false
 fail!("values.schema.json must preserve the bounded shutdown window") unless schema.dig("properties", "runtime", "properties", "terminationGracePeriodSeconds", "minimum") == 120
@@ -172,6 +173,36 @@ if command -v helm >/dev/null 2>&1; then
     echo "Helm chart rejected security.tlsRevison for an unexpected reason: ${typo_error}" >&2
     exit 1
   fi
+  custom_topology_rendered="$(
+    helm template chronos "${chart}" \
+      --set-string topologySpreadConstraints.topologyKey=kubernetes.io/hostname
+  )"
+  ruby --disable=gems -ryaml -e '
+    documents = YAML.load_stream(STDIN.read)
+    stateful_set = documents.find { |document| document.is_a?(Hash) && document["kind"] == "StatefulSet" }
+    constraints = stateful_set&.dig("spec", "template", "spec", "topologySpreadConstraints") || []
+    abort("Helm chart did not render exactly one custom topology spread constraint") unless constraints.length == 1
+    abort("Helm chart did not render the custom topology key") unless constraints[0]["topologyKey"] == "kubernetes.io/hostname"
+  ' <<<"${custom_topology_rendered}"
+  disabled_topology_rendered="$(
+    helm template chronos "${chart}" --set topologySpreadConstraints.enabled=false
+  )"
+  ruby --disable=gems -ryaml -e '
+    documents = YAML.load_stream(STDIN.read)
+    stateful_set = documents.find { |document| document.is_a?(Hash) && document["kind"] == "StatefulSet" }
+    constraints = stateful_set&.dig("spec", "template", "spec", "topologySpreadConstraints")
+    abort("Helm chart rendered disabled topology spread constraints") unless constraints.nil?
+  ' <<<"${disabled_topology_rendered}"
+  if typo_error="$(helm template chronos "${chart}" \
+    --set-string topologySpreadConstraints.toplogyKey=failure-domain.example/zone \
+    2>&1 >/dev/null)"; then
+    echo "Helm chart accepted unknown topologySpreadConstraints.toplogyKey typo" >&2
+    exit 1
+  fi
+  if ! grep -Fq 'Additional property toplogyKey is not allowed' <<<"${typo_error}"; then
+    echo "Helm chart rejected topologySpreadConstraints.toplogyKey for an unexpected reason: ${typo_error}" >&2
+    exit 1
+  fi
   if helm template chronos "${chart}" --set ownership.allowUnsafeInPlaceMigration=true >/dev/null 2>&1; then
     echo "Helm chart accepted the removed unsafe in-place migration option" >&2
     exit 1
@@ -195,6 +226,10 @@ if command -v helm >/dev/null 2>&1; then
     abort("default TLS revision was not rendered") unless annotations["chronos.io/tls-revision"] == "1"
     abort("default allowlist revision was not rendered") unless annotations["chronos.io/allowlist-revision"] == "1"
     pod_spec = stateful_set.dig("spec", "template", "spec") || {}
+    topology_constraints = pod_spec["topologySpreadConstraints"] || []
+    abort("default topology spread constraint was not rendered") unless topology_constraints.length == 1
+    abort("default topology key was not rendered") unless topology_constraints[0]["topologyKey"] == "topology.kubernetes.io/zone"
+    abort("default topology scheduling policy was not rendered") unless topology_constraints[0]["whenUnsatisfiable"] == "DoNotSchedule"
     chronos_container = (pod_spec["containers"] || []).find { |container| container["name"] == "chronos" }
     allowlist_refs = (chronos_container&.fetch("env", []) || []).map do |entry|
       entry.dig("valueFrom", "secretKeyRef", "name")

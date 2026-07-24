@@ -108,7 +108,8 @@
           "type": "string",
           "enum": ["DoNotSchedule", "ScheduleAnyway"]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "serviceMonitor": {
       "type": "object",
