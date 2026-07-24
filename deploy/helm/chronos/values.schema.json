@@ -72,6 +72,7 @@
     },
     "security": {
       "type": "object",
+      "additionalProperties": false,
       "required": ["mode", "clientCertAllowlistSecretName", "grpcTlsSecretName", "metricsTlsSecretName"],
       "properties": {
         "mode": { "const": "required" },

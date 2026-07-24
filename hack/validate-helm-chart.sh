@@ -65,6 +65,7 @@ fail!("values.schema.json must reject latest image tag") unless schema.dig("prop
 fail!("values.schema.json must reject unknown image properties") unless schema.dig("properties", "image", "additionalProperties") == false
 fail!("values.schema.json must reject unknown etcd properties") unless schema.dig("properties", "etcd", "additionalProperties") == false
 fail!("values.schema.json must require mTLS security mode") unless schema.dig("properties", "security", "properties", "mode", "const") == "required"
+fail!("values.schema.json must reject unknown security properties") unless schema.dig("properties", "security", "additionalProperties") == false
 fail!("values.schema.json must constrain ownership shard count") unless schema.dig("properties", "ownership", "properties", "shardCount", "minimum") == 3
 fail!("values.schema.json must reject removed ownership escape hatches") unless schema.dig("properties", "ownership", "additionalProperties") == false
 fail!("values.schema.json must preserve the bounded shutdown window") unless schema.dig("properties", "runtime", "properties", "terminationGracePeriodSeconds", "minimum") == 120
@@ -152,6 +153,25 @@ if command -v helm >/dev/null 2>&1; then
     echo "Helm chart rejected etcd.endponts for an unexpected reason: ${typo_error}" >&2
     exit 1
   fi
+  custom_tls_revision_rendered="$(
+    helm template chronos "${chart}" --set-string security.tlsRevision=2
+  )"
+  ruby --disable=gems -ryaml -e '
+    documents = YAML.load_stream(STDIN.read)
+    stateful_set = documents.find { |document| document.is_a?(Hash) && document["kind"] == "StatefulSet" }
+    annotation = stateful_set&.dig("spec", "template", "metadata", "annotations", "chronos.io/tls-revision")
+    abort("Helm chart did not render the custom TLS revision rollout annotation") unless annotation == "2"
+  ' <<<"${custom_tls_revision_rendered}"
+  if typo_error="$(helm template chronos "${chart}" \
+    --set-string security.tlsRevison=2 \
+    2>&1 >/dev/null)"; then
+    echo "Helm chart accepted unknown security.tlsRevison typo" >&2
+    exit 1
+  fi
+  if ! grep -Fq 'Additional property tlsRevison is not allowed' <<<"${typo_error}"; then
+    echo "Helm chart rejected security.tlsRevison for an unexpected reason: ${typo_error}" >&2
+    exit 1
+  fi
   if helm template chronos "${chart}" --set ownership.allowUnsafeInPlaceMigration=true >/dev/null 2>&1; then
     echo "Helm chart accepted the removed unsafe in-place migration option" >&2
     exit 1
@@ -165,6 +185,29 @@ if command -v helm >/dev/null 2>&1; then
   fi
   grep -Fq 'CHRONOS_ETCD_ENDPOINTS: "https://etcd-client.etcd.svc.cluster.local:2379"' \
     "${rendered}"
+  ruby --disable=gems -ryaml -e '
+    documents = YAML.load_stream(File.read(ARGV.fetch(0)))
+    config_map = documents.find { |document| document.is_a?(Hash) && document["kind"] == "ConfigMap" }
+    stateful_set = documents.find { |document| document.is_a?(Hash) && document["kind"] == "StatefulSet" }
+    abort("missing rendered ConfigMap or StatefulSet") unless config_map && stateful_set
+    abort("default security mode was not rendered") unless config_map.dig("data", "CHRONOS_SECURITY_MODE") == "required"
+    annotations = stateful_set.dig("spec", "template", "metadata", "annotations") || {}
+    abort("default TLS revision was not rendered") unless annotations["chronos.io/tls-revision"] == "1"
+    abort("default allowlist revision was not rendered") unless annotations["chronos.io/allowlist-revision"] == "1"
+    pod_spec = stateful_set.dig("spec", "template", "spec") || {}
+    chronos_container = (pod_spec["containers"] || []).find { |container| container["name"] == "chronos" }
+    allowlist_refs = (chronos_container&.fetch("env", []) || []).map do |entry|
+      entry.dig("valueFrom", "secretKeyRef", "name")
+    end.compact
+    unless allowlist_refs.count("chronos-client-cert-allowlist") == 4
+      abort("default client certificate allowlist Secret refs were not rendered")
+    end
+    secret_volumes = (pod_spec["volumes"] || []).each_with_object({}) do |volume, result|
+      result[volume["name"]] = volume.dig("secret", "secretName")
+    end
+    abort("default gRPC TLS Secret ref was not rendered") unless secret_volumes["grpc-tls-input"] == "chronos-grpc-tls"
+    abort("default metrics TLS Secret ref was not rendered") unless secret_volumes["metrics-tls-input"] == "chronos-metrics-tls"
+  ' "${rendered}"
   grep -Fq "CHRONOS_GENERATOR_OWNERSHIP_MODULO: \"256\"" "${rendered}"
   grep -Fq "CHRONOS_OWNERSHIP_WORKER_COUNT: \"3\"" "${rendered}"
   grep -Fq "CHRONOS_OWNERSHIP_ASSIGNMENT_SEED: \"20260516\"" "${rendered}"
