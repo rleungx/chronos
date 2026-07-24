@@ -14,9 +14,24 @@ env:
   DOCKER_BUILDKIT: 1
 
 jobs:
+  release-version:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+      - name: Validate root release version surfaces and tag
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            make CHRONOS_RELEASE_TAG="$GITHUB_REF_NAME" release-version-check
+          else
+            make release-version-check
+          fi
+
   release-check:
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    needs:
+      - release-version
     env:
       CHRONOS_BUILD_COMMIT: ${{ github.sha }}
       RUST_BACKTRACE: 1
@@ -52,9 +67,6 @@ jobs:
       - name: Validate GitHub Actions workflows
         run: |
           "$(go env GOPATH)/bin/actionlint" -color
-      - name: Validate root release tag and version surfaces
-        if: startsWith(github.ref, 'refs/tags/')
-        run: make CHRONOS_RELEASE_TAG="$GITHUB_REF_NAME" release-version-check
       - name: Run release checks
         run: make release-check-core
 
@@ -88,6 +100,8 @@ jobs:
   layer-4-clustered-etcd:
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    needs:
+      - release-version
     env:
       CHRONOS_BUILD_COMMIT: ${{ github.sha }}
       RUST_BACKTRACE: 1
@@ -482,6 +496,8 @@ jobs:
   container-image:
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    needs:
+      - release-version
     env:
       CHRONOS_BUILD_COMMIT: ${{ github.sha }}
       RUST_BACKTRACE: 1
