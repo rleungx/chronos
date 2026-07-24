@@ -1,5 +1,17 @@
 use super::*;
 
+use std::future::Future;
+
+use tokio::time::error::Elapsed;
+use tokio::time::timeout_at;
+
+pub(super) async fn await_identity_keepalive_step<T>(
+    lease_alive_until: Instant,
+    future: impl Future<Output = T>,
+) -> Result<T, Elapsed> {
+    timeout_at(lease_alive_until, future).await
+}
+
 impl EtcdMetadataStore {
     async fn claimed_instance_identity_matches(
         &self,
@@ -353,22 +365,29 @@ impl EtcdMetadataStore {
             let mut lease_alive_until =
                 Instant::now() + Duration::from_secs(ttl_seconds.max(1) as u64);
             'keepalive: loop {
-                let keepalive_result = keeper.keep_alive().await;
+                let keepalive_result =
+                    await_identity_keepalive_step(lease_alive_until, keeper.keep_alive()).await;
                 let failure_reason = match keepalive_result {
-                    Ok(()) => match stream.message().await {
-                        Ok(Some(response)) if response.ttl() > 0 => {
-                            lease_alive_until =
-                                Instant::now() + Duration::from_secs(response.ttl().max(1) as u64);
-                            sleep(heartbeat_interval).await;
-                            continue;
+                    Ok(Ok(())) => {
+                        match await_identity_keepalive_step(lease_alive_until, stream.message())
+                            .await
+                        {
+                            Ok(Ok(Some(response))) if response.ttl() > 0 => {
+                                lease_alive_until = Instant::now()
+                                    + Duration::from_secs(response.ttl().max(1) as u64);
+                                sleep(heartbeat_interval).await;
+                                continue;
+                            }
+                            Ok(Ok(Some(response))) => {
+                                format!("keepalive_response_non_positive_ttl: {}", response.ttl())
+                            }
+                            Ok(Ok(None)) => "keepalive_stream_closed".to_owned(),
+                            Ok(Err(error)) => format!("keepalive_stream_error: {error}"),
+                            Err(_) => "keepalive_response_deadline_elapsed".to_owned(),
                         }
-                        Ok(Some(response)) => {
-                            format!("keepalive_response_non_positive_ttl: {}", response.ttl())
-                        }
-                        Ok(None) => "keepalive_stream_closed".to_owned(),
-                        Err(error) => format!("keepalive_stream_error: {error}"),
-                    },
-                    Err(error) => format!("keepalive_send_failed: {error}"),
+                    }
+                    Ok(Err(error)) => format!("keepalive_send_failed: {error}"),
+                    Err(_) => "keepalive_send_deadline_elapsed".to_owned(),
                 };
 
                 let mut consecutive_reconnect_failures = 0u32;

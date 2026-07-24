@@ -357,6 +357,14 @@ replicas/worker-count/PDB values, and Helm blocks an in-place worker-count chang
 `make test-cluster-leader-loss` runs a continuous single-timeline allocation stream against a
 three-member etcd cluster, stops the actual etcd leader, observes a different leader and higher
 Raft term while the stream is still running, and verifies non-overlapping TSO ranges before,
-during, and after the election. It covers quorum-preserving leader loss; separate environment
-evidence is still required for owner-to-etcd network partitions, quorum loss, larger worker counts,
+during, and after the election. It covers quorum-preserving leader loss.
+
+`make test-owner-etcd-partition` keeps all three etcd members healthy while pausing three
+owner-specific TCP forwarding paths. A continuous single-timeline stream must span the identity
+lease-loss shutdown, observe client-visible failures after Chronos fails closed, and recover only
+after the forwarding paths are resumed, the old identity expires, and Chronos is restarted. The
+replacement uses a fresh process identity at the same advertised owner endpoint; the first
+post-recovery TSO must be strictly above the last acknowledged pre-shutdown TSO. This is a
+single-owner control-plane partition gate; separate environment evidence is still required for
+quorum loss, multi-owner network isolation, stable-identity restart behavior, larger worker counts,
 staged rollout safety, and production alert threshold tuning.

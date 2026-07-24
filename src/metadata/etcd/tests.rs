@@ -4,9 +4,10 @@ use crate::{ResourceTier, TimelineLifecycleState, TsoConfig};
 use super::EtcdMetadataStore;
 use super::{
     cluster_format::active_identity_formats_are_compatible, identity_claim_matches_record,
-    identity_record_belongs_to_ownership_plan, parse_prev_route, parse_timeline_filter_record,
-    route_update_for_watch_event, verify_instance_identity_lease_record,
-    InstanceIdentityLeaseRecord, RouteOnlyTimelineRecord, TimelineRoute, TimelineRouteRecord,
+    identity_lifecycle::await_identity_keepalive_step, identity_record_belongs_to_ownership_plan,
+    parse_prev_route, parse_timeline_filter_record, route_update_for_watch_event,
+    verify_instance_identity_lease_record, InstanceIdentityLeaseRecord, RouteOnlyTimelineRecord,
+    TimelineRoute, TimelineRouteRecord,
 };
 use crate::metadata::types::{CURRENT_CLUSTER_FORMAT_VERSION, CURRENT_METADATA_SCHEMA_VERSION};
 use crate::metadata::{
@@ -15,7 +16,16 @@ use crate::metadata::{
 };
 use etcd_client::{PutOptions, Txn, TxnOp};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use tokio::time::Duration;
+use tokio::time::{Duration, Instant};
+
+#[tokio::test]
+async fn identity_keepalive_step_stops_waiting_at_the_confirmed_lease_deadline() {
+    let deadline = Instant::now() + Duration::from_millis(20);
+    let result = await_identity_keepalive_step(deadline, std::future::pending::<()>()).await;
+
+    assert!(result.is_err());
+    assert!(Instant::now() >= deadline);
+}
 
 fn sample_route(generator_id: u32, route_version: u64) -> TimelineRoute {
     TimelineRoute {

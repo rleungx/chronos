@@ -13,7 +13,7 @@ ARTIFACT_ROOT="${1:-${CHRONOS_ARTIFACT_DIR:-artifacts}}"
 shift || true
 
 if [[ $# -eq 0 ]]; then
-  set -- soak chaos failover auto-failover scale-matrix rebalance restore cluster-leader-loss
+  set -- soak chaos failover auto-failover scale-matrix rebalance restore cluster-leader-loss owner-etcd-partition
 fi
 
 BUILD_INFO="${ARTIFACT_ROOT%/}/BUILD_INFO"
@@ -278,6 +278,14 @@ for target in "$@"; do
         etcd-before.json etcd-after.json
       bash "${REPO_ROOT}/hack/verify-cluster-leader-loss.sh" \
         "${ARTIFACT_ROOT%/}/cluster-leader-loss/summary.txt"
+      ;;
+    owner-etcd-partition)
+      verify_dir owner-etcd-partition summary.txt artifact-index.txt \
+        fault-chronos.log recovery-chronos.log \
+        fault-span-bench.log post-recovery-bench.log \
+        etcd-during-partition.txt proxy-1.log proxy-2.log proxy-3.log
+      bash "${REPO_ROOT}/hack/verify-owner-etcd-partition.sh" \
+        "${ARTIFACT_ROOT%/}/owner-etcd-partition/summary.txt"
       ;;
     *)
       echo "unsupported evidence target: ${target}" >&2

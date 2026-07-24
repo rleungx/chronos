@@ -254,6 +254,19 @@ jobs:
       - name: Verify clustered leader-loss evidence
         if: always()
         run: bash hack/verify-cluster-leader-loss.sh artifacts/cluster-leader-loss/summary.txt
+      - name: Run owner-to-etcd partition validation
+        run: make test-owner-etcd-partition
+      - name: Upload owner-to-etcd partition artifacts
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: chronos-owner-etcd-partition-artifacts
+          path: artifacts/owner-etcd-partition/
+          if-no-files-found: error
+          retention-days: ${{ env.CHRONOS_ARTIFACT_RETENTION_DAYS }}
+      - name: Verify owner-to-etcd partition evidence
+        if: always()
+        run: bash hack/verify-owner-etcd-partition.sh artifacts/owner-etcd-partition/summary.txt
       - name: Stop clustered etcd
         if: always()
         run: make etcd-cluster-reset

@@ -35,6 +35,8 @@ ETCD_ENDPOINTS ?= 127.0.0.1:2379
 	test-dr-monotonicity-verifier \
 	test-cluster-leader-loss-verifier \
 	test-cluster-leader-loss \
+	test-owner-etcd-partition-verifier \
+	test-owner-etcd-partition \
 	test-restore-dr \
 	promtool-check \
 	observability-check \
@@ -282,6 +284,14 @@ test-cluster-leader-loss:
 	CHRONOS_RELEASE_BIN_DIR=$(CHRONOS_RELEASE_BIN_DIR) \
 	bash hack/chaos/cluster-leader-loss.sh
 
+test-owner-etcd-partition-verifier:
+	bash hack/verify-owner-etcd-partition.sh --self-test
+
+test-owner-etcd-partition:
+	CHRONOS_SKIP_RELEASE_BUILD=$(CHRONOS_SKIP_RELEASE_BUILD) \
+	CHRONOS_RELEASE_BIN_DIR=$(CHRONOS_RELEASE_BIN_DIR) \
+	bash hack/chaos/owner-etcd-partition.sh
+
 test-restore-dr:
 	CHRONOS_SKIP_RELEASE_BUILD=$(CHRONOS_SKIP_RELEASE_BUILD) \
 	CHRONOS_RELEASE_BIN_DIR=$(CHRONOS_RELEASE_BIN_DIR) \
@@ -481,6 +491,7 @@ release-check-core:
 	$(MAKE) test-release-core
 	$(MAKE) test-dr-monotonicity-verifier
 	$(MAKE) test-cluster-leader-loss-verifier
+	$(MAKE) test-owner-etcd-partition-verifier
 	$(MAKE) proto-generated-check
 	$(MAKE) proto-breaking-check
 	$(MAKE) observability-check
@@ -520,6 +531,7 @@ release-gate:
 	cp artifacts/release/BUILD_INFO $(RELEASE_GATE_ARTIFACT_DIR)/BUILD_INFO
 	$(MAKE) release-gate-layer-4-clustered
 	$(MAKE) CHRONOS_SKIP_RELEASE_BUILD=1 CHRONOS_ARTIFACT_DIR=$(RELEASE_GATE_ARTIFACT_DIR) CHRONOS_KEEP_ARTIFACTS_ON_SUCCESS=1 test-cluster-leader-loss
+	$(MAKE) CHRONOS_SKIP_RELEASE_BUILD=1 CHRONOS_ARTIFACT_DIR=$(RELEASE_GATE_ARTIFACT_DIR) CHRONOS_KEEP_ARTIFACTS_ON_SUCCESS=1 test-owner-etcd-partition
 	$(MAKE) CHRONOS_SKIP_RELEASE_BUILD=1 CHRONOS_ARTIFACT_DIR=$(RELEASE_GATE_ARTIFACT_DIR) CHRONOS_KEEP_ARTIFACTS_ON_SUCCESS=1 test-soak
 	$(MAKE) CHRONOS_SKIP_RELEASE_BUILD=1 CHRONOS_ARTIFACT_DIR=$(RELEASE_GATE_ARTIFACT_DIR) CHRONOS_KEEP_ARTIFACTS_ON_SUCCESS=1 test-chaos
 	$(MAKE) CHRONOS_SKIP_RELEASE_BUILD=1 CHRONOS_ARTIFACT_DIR=$(RELEASE_GATE_ARTIFACT_DIR) CHRONOS_KEEP_ARTIFACTS_ON_SUCCESS=1 test-failover-bench
