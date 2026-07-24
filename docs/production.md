@@ -367,4 +367,15 @@ replacement uses a fresh process identity at the same advertised owner endpoint;
 post-recovery TSO must be strictly above the last acknowledged pre-shutdown TSO. This is a
 single-owner control-plane partition gate; separate environment evidence is still required for
 quorum loss, multi-owner network isolation, stable-identity restart behavior, larger worker counts,
-staged rollout safety, and production alert threshold tuning.
+and production alert threshold tuning.
+
+`make test-rolling-upgrade` builds the exact historical commit pinned in
+`hack/upgrade/baseline.env` plus the current exact worktree and first rejects any package-version,
+metadata-schema, or cluster-format difference. It then starts three historical workers and keeps one
+single-timeline allocation client alive while each worker is replaced in order. The client moves
+the same timeline onto every old and replacement instance, records health-reported instance/build
+identity, and requires non-empty strictly increasing ranges in old-only, every replacement window,
+both mixed-binary windows, and new-only. A bounded maximum success gap prevents readiness-only
+evidence from hiding a prolonged allocation outage. This proves only that pinned historical
+commit-to-current-head forward rollout; it is not a SemVer compatibility promise and does not cover
+N+1-to-N rollback or any rollout that changes `CURRENT_CLUSTER_FORMAT_VERSION`.

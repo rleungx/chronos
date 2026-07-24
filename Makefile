@@ -37,6 +37,8 @@ ETCD_ENDPOINTS ?= 127.0.0.1:2379
 	test-cluster-leader-loss \
 	test-owner-etcd-partition-verifier \
 	test-owner-etcd-partition \
+	test-rolling-upgrade-verifier \
+	test-rolling-upgrade \
 	test-restore-dr \
 	promtool-check \
 	observability-check \
@@ -292,6 +294,14 @@ test-owner-etcd-partition:
 	CHRONOS_RELEASE_BIN_DIR=$(CHRONOS_RELEASE_BIN_DIR) \
 	bash hack/chaos/owner-etcd-partition.sh
 
+test-rolling-upgrade-verifier:
+	bash hack/verify-rolling-upgrade.sh --self-test
+
+test-rolling-upgrade:
+	CHRONOS_SKIP_RELEASE_BUILD=$(CHRONOS_SKIP_RELEASE_BUILD) \
+	CHRONOS_RELEASE_BIN_DIR=$(CHRONOS_RELEASE_BIN_DIR) \
+	bash hack/upgrade/rolling-same-format.sh
+
 test-restore-dr:
 	CHRONOS_SKIP_RELEASE_BUILD=$(CHRONOS_SKIP_RELEASE_BUILD) \
 	CHRONOS_RELEASE_BIN_DIR=$(CHRONOS_RELEASE_BIN_DIR) \
@@ -471,12 +481,13 @@ release-package:
 	@set -e; \
 	build_commit=$$(git rev-parse HEAD); \
 	printf 'git_commit=%s\nchronos_build_commit=%s\nbuilt_at=%s\n' "$$build_commit" "$$build_commit" "$$(date -u +%Y-%m-%dT%H:%M:%SZ)" > artifacts/release/BUILD_INFO; \
-	CHRONOS_BUILD_COMMIT="$$build_commit" cargo build --locked --release --bin chronos --bin chronos-bench --bin chronos-control-bench --bin chronos-failover-bench
+	CHRONOS_BUILD_COMMIT="$$build_commit" cargo build --locked --release --bin chronos --bin chronos-bench --bin chronos-control-bench --bin chronos-failover-bench --bin chronos-upgrade-bench
 	cp target/release/chronos artifacts/release/
 	cp target/release/chronos-bench artifacts/release/
 	cp target/release/chronos-control-bench artifacts/release/
 	cp target/release/chronos-failover-bench artifacts/release/
-	(cd artifacts/release && if command -v shasum >/dev/null 2>&1; then shasum -a 256 BUILD_INFO chronos chronos-bench chronos-control-bench chronos-failover-bench; else sha256sum BUILD_INFO chronos chronos-bench chronos-control-bench chronos-failover-bench; fi > SHA256SUMS)
+	cp target/release/chronos-upgrade-bench artifacts/release/
+	(cd artifacts/release && if command -v shasum >/dev/null 2>&1; then shasum -a 256 BUILD_INFO chronos chronos-bench chronos-control-bench chronos-failover-bench chronos-upgrade-bench; else sha256sum BUILD_INFO chronos chronos-bench chronos-control-bench chronos-failover-bench chronos-upgrade-bench; fi > SHA256SUMS)
 	docker run --rm -v "$(CURDIR)/artifacts/release:/artifacts" $(SYFT_IMAGE) dir:/artifacts -o spdx-json > artifacts/release/chronos-release.spdx.json
 
 release-security-check: release-package
@@ -492,6 +503,7 @@ release-check-core:
 	$(MAKE) test-dr-monotonicity-verifier
 	$(MAKE) test-cluster-leader-loss-verifier
 	$(MAKE) test-owner-etcd-partition-verifier
+	$(MAKE) test-rolling-upgrade-verifier
 	$(MAKE) proto-generated-check
 	$(MAKE) proto-breaking-check
 	$(MAKE) observability-check
@@ -532,6 +544,7 @@ release-gate:
 	$(MAKE) release-gate-layer-4-clustered
 	$(MAKE) CHRONOS_SKIP_RELEASE_BUILD=1 CHRONOS_ARTIFACT_DIR=$(RELEASE_GATE_ARTIFACT_DIR) CHRONOS_KEEP_ARTIFACTS_ON_SUCCESS=1 test-cluster-leader-loss
 	$(MAKE) CHRONOS_SKIP_RELEASE_BUILD=1 CHRONOS_ARTIFACT_DIR=$(RELEASE_GATE_ARTIFACT_DIR) CHRONOS_KEEP_ARTIFACTS_ON_SUCCESS=1 test-owner-etcd-partition
+	$(MAKE) CHRONOS_SKIP_RELEASE_BUILD=1 CHRONOS_ARTIFACT_DIR=$(RELEASE_GATE_ARTIFACT_DIR) CHRONOS_KEEP_ARTIFACTS_ON_SUCCESS=1 test-rolling-upgrade
 	$(MAKE) CHRONOS_SKIP_RELEASE_BUILD=1 CHRONOS_ARTIFACT_DIR=$(RELEASE_GATE_ARTIFACT_DIR) CHRONOS_KEEP_ARTIFACTS_ON_SUCCESS=1 test-soak
 	$(MAKE) CHRONOS_SKIP_RELEASE_BUILD=1 CHRONOS_ARTIFACT_DIR=$(RELEASE_GATE_ARTIFACT_DIR) CHRONOS_KEEP_ARTIFACTS_ON_SUCCESS=1 test-chaos
 	$(MAKE) CHRONOS_SKIP_RELEASE_BUILD=1 CHRONOS_ARTIFACT_DIR=$(RELEASE_GATE_ARTIFACT_DIR) CHRONOS_KEEP_ARTIFACTS_ON_SUCCESS=1 test-failover-bench

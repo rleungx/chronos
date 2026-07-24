@@ -13,7 +13,7 @@ ARTIFACT_ROOT="${1:-${CHRONOS_ARTIFACT_DIR:-artifacts}}"
 shift || true
 
 if [[ $# -eq 0 ]]; then
-  set -- soak chaos failover auto-failover scale-matrix rebalance restore cluster-leader-loss owner-etcd-partition
+  set -- soak chaos failover auto-failover scale-matrix rebalance restore cluster-leader-loss owner-etcd-partition rolling-upgrade
 fi
 
 BUILD_INFO="${ARTIFACT_ROOT%/}/BUILD_INFO"
@@ -286,6 +286,15 @@ for target in "$@"; do
         etcd-during-partition.txt proxy-1.log proxy-2.log proxy-3.log
       bash "${REPO_ROOT}/hack/verify-owner-etcd-partition.sh" \
         "${ARTIFACT_ROOT%/}/owner-etcd-partition/summary.txt"
+      ;;
+    rolling-upgrade)
+      verify_dir rolling-upgrade summary.txt artifact-index.txt \
+        continuous-allocation.txt identity-evidence.txt \
+        worker-0-old.log worker-1-old.log worker-2-old.log \
+        worker-0-new.log worker-1-new.log worker-2-new.log \
+        base-build.log current-build.log
+      bash "${REPO_ROOT}/hack/verify-rolling-upgrade.sh" \
+        "${ARTIFACT_ROOT%/}/rolling-upgrade/summary.txt"
       ;;
     *)
       echo "unsupported evidence target: ${target}" >&2

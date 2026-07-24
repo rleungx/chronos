@@ -28,6 +28,7 @@ make test-auto-failover-bench
 make test-scale-matrix-production
 make test-rebalance-bench
 make test-restore-dr
+make test-rolling-upgrade
 bash hack/verify-evidence.sh artifacts/release-gate
 ```
 
@@ -72,12 +73,13 @@ Before publishing or deploying, ensure you have:
 1. the exact git commit
 2. the exact `CHRONOS_BUILD_COMMIT` used at runtime
 3. retained soak/chaos/failover/scale/rebalance/restore artifacts for the validation run
-4. alert rules validated with `make observability-check`
-5. dependency policy validated with `make dependency-check`
-6. cross-language client behavior validated with `make client-conformance-check`
-7. Kubernetes manifests validated for static partitioned ownership via `make kubernetes-manifest-check`
-8. release-shape and container delivery checks validated via `make release-check`
-9. `BUILD_INFO`, SBOM/hash artifacts, and container vulnerability scanning validated via `make release-security-check`
+4. retained same-format rolling-upgrade evidence from the pinned historical commit to the exact release commit
+5. alert rules validated with `make observability-check`
+6. dependency policy validated with `make dependency-check`
+7. cross-language client behavior validated with `make client-conformance-check`
+8. Kubernetes manifests validated for static partitioned ownership via `make kubernetes-manifest-check`
+9. release-shape and container delivery checks validated via `make release-check`
+10. `BUILD_INFO`, SBOM/hash artifacts, and container vulnerability scanning validated via `make release-security-check`
 
 After the gate passes on the exact release commit, create an annotated root tag such as `v0.1.0`.
 The tag-triggered Release Candidate workflow reruns the authoritative gates, attests the artifacts,
@@ -95,5 +97,10 @@ promote the artifact. Revert to the last candidate whose validation bundle is in
 that advances `CURRENT_CLUSTER_FORMAT_VERSION` requires a quiesced all-worker upgrade; after its
 etcd marker is written, an older binary must not be restarted on that prefix. Restore a pre-upgrade
 snapshot to a separate prefix when a format-level rollback is required.
+
+`make test-rolling-upgrade` is narrower than a version-support promise: it builds the exact
+historical SHA pinned in `hack/upgrade/baseline.env` and the current exact SHA, verifies that package
+version, metadata schema, and cluster format are unchanged, then exercises a forward three-worker
+rolling replacement. It does not prove N+1-to-N rollback or compatibility across a format change.
 
 For the full rollback procedure, see `docs/rollback.md`.

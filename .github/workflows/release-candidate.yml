@@ -92,6 +92,8 @@ jobs:
       CHRONOS_KEEP_ARTIFACTS_ON_SUCCESS: 1
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
         with:
           toolchain: 1.94.0
@@ -141,6 +143,23 @@ jobs:
       - name: Verify owner-to-etcd partition evidence
         if: always()
         run: bash hack/verify-owner-etcd-partition.sh artifacts/owner-etcd-partition/summary.txt
+      - name: Fetch pinned rolling-upgrade baseline
+        run: |
+          source hack/upgrade/baseline.env
+          git fetch --no-tags --depth=1 origin "${CHRONOS_UPGRADE_BASE_SHA}"
+      - name: Run same-format rolling-upgrade validation
+        run: make test-rolling-upgrade
+      - name: Upload rolling-upgrade artifacts
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: chronos-rc-rolling-upgrade-artifacts
+          path: artifacts/rolling-upgrade/
+          if-no-files-found: error
+          retention-days: ${{ env.CHRONOS_ARTIFACT_RETENTION_DAYS }}
+      - name: Verify rolling-upgrade evidence
+        if: always()
+        run: bash hack/verify-rolling-upgrade.sh artifacts/rolling-upgrade/summary.txt
       - name: Stop clustered etcd
         if: always()
         run: make etcd-cluster-reset
@@ -172,7 +191,7 @@ jobs:
           name: chronos-rc-release-artifacts
           path: artifacts/release
       - name: Restore release executable bits
-        run: chmod +x artifacts/release/chronos artifacts/release/chronos-bench artifacts/release/chronos-control-bench artifacts/release/chronos-failover-bench
+        run: chmod +x artifacts/release/chronos artifacts/release/chronos-bench artifacts/release/chronos-control-bench artifacts/release/chronos-failover-bench artifacts/release/chronos-upgrade-bench
       - name: Run etcd-backed soak validation
         run: make test-soak
       - name: Upload soak artifacts
@@ -217,7 +236,7 @@ jobs:
           name: chronos-rc-release-artifacts
           path: artifacts/release
       - name: Restore release executable bits
-        run: chmod +x artifacts/release/chronos artifacts/release/chronos-bench artifacts/release/chronos-control-bench artifacts/release/chronos-failover-bench
+        run: chmod +x artifacts/release/chronos artifacts/release/chronos-bench artifacts/release/chronos-control-bench artifacts/release/chronos-failover-bench artifacts/release/chronos-upgrade-bench
       - name: Run etcd-backed chaos recovery validation
         run: make test-chaos
       - name: Upload chaos artifacts
@@ -262,7 +281,7 @@ jobs:
           name: chronos-rc-release-artifacts
           path: artifacts/release
       - name: Restore release executable bits
-        run: chmod +x artifacts/release/chronos artifacts/release/chronos-bench artifacts/release/chronos-control-bench artifacts/release/chronos-failover-bench
+        run: chmod +x artifacts/release/chronos artifacts/release/chronos-bench artifacts/release/chronos-control-bench artifacts/release/chronos-failover-bench artifacts/release/chronos-upgrade-bench
       - name: Run etcd-backed failover benchmark
         run: make test-failover-bench
       - name: Upload failover artifacts
@@ -307,7 +326,7 @@ jobs:
           name: chronos-rc-release-artifacts
           path: artifacts/release
       - name: Restore release executable bits
-        run: chmod +x artifacts/release/chronos artifacts/release/chronos-bench artifacts/release/chronos-control-bench artifacts/release/chronos-failover-bench
+        run: chmod +x artifacts/release/chronos artifacts/release/chronos-bench artifacts/release/chronos-control-bench artifacts/release/chronos-failover-bench artifacts/release/chronos-upgrade-bench
       - name: Run etcd-backed automatic failover benchmark
         run: make test-auto-failover-bench
       - name: Upload automatic failover artifacts
@@ -352,7 +371,7 @@ jobs:
           name: chronos-rc-release-artifacts
           path: artifacts/release
       - name: Restore release executable bits
-        run: chmod +x artifacts/release/chronos artifacts/release/chronos-bench artifacts/release/chronos-control-bench artifacts/release/chronos-failover-bench
+        run: chmod +x artifacts/release/chronos artifacts/release/chronos-bench artifacts/release/chronos-control-bench artifacts/release/chronos-failover-bench artifacts/release/chronos-upgrade-bench
       - name: Run etcd-backed scale matrix
         run: make test-scale-matrix-production
       - name: Upload scale matrix artifacts
@@ -397,7 +416,7 @@ jobs:
           name: chronos-rc-release-artifacts
           path: artifacts/release
       - name: Restore release executable bits
-        run: chmod +x artifacts/release/chronos artifacts/release/chronos-bench artifacts/release/chronos-control-bench artifacts/release/chronos-failover-bench
+        run: chmod +x artifacts/release/chronos artifacts/release/chronos-bench artifacts/release/chronos-control-bench artifacts/release/chronos-failover-bench artifacts/release/chronos-upgrade-bench
       - name: Run etcd-backed rebalance benchmark
         run: make test-rebalance-bench
       - name: Upload rebalance artifacts
@@ -442,7 +461,7 @@ jobs:
           name: chronos-rc-release-artifacts
           path: artifacts/release
       - name: Restore release executable bits
-        run: chmod +x artifacts/release/chronos artifacts/release/chronos-bench artifacts/release/chronos-control-bench artifacts/release/chronos-failover-bench
+        run: chmod +x artifacts/release/chronos artifacts/release/chronos-bench artifacts/release/chronos-control-bench artifacts/release/chronos-failover-bench artifacts/release/chronos-upgrade-bench
       - name: Run restore DR validation
         run: make test-restore-dr
       - name: Upload restore artifacts
@@ -546,7 +565,7 @@ jobs:
           name: chronos-rc-release-artifacts
           path: artifacts/release
       - name: Restore release executable bits
-        run: chmod +x artifacts/release/chronos artifacts/release/chronos-bench artifacts/release/chronos-control-bench artifacts/release/chronos-failover-bench
+        run: chmod +x artifacts/release/chronos artifacts/release/chronos-bench artifacts/release/chronos-control-bench artifacts/release/chronos-failover-bench artifacts/release/chronos-upgrade-bench
       - name: Attest release artifacts
         uses: actions/attest-build-provenance@b3e506e8c389afc651c5bacf2b8f2a1ea0557215
         with:
