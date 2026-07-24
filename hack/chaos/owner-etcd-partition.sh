@@ -85,10 +85,6 @@ PARTITION_ENDED_AT_MS=""
 RECOVERY_READY_AT_MS=""
 POST_FINISHED_AT_MS=""
 
-now_ms() {
-  python3 -c 'import time; print(time.time_ns() // 1_000_000)'
-}
-
 process_is_running() {
   local state
   state="$(ps -o state= -p "$1" 2>/dev/null | tr -d '[:space:]')" || return 1
@@ -98,16 +94,6 @@ process_is_running() {
 metric_value() {
   curl --max-time 2 -fsS "http://${METRICS_ENDPOINT}/metrics" |
     awk '$1 == "tso_allocate_total" { value = $2 } END { print value + 0 }'
-}
-
-metric_or_zero() {
-  local key=$1
-  local file=$2
-  local value=""
-  if [[ -f "${file}" ]]; then
-    value="$(extract_metric "${key}" "${file}")"
-  fi
-  printf '%s\n' "${value:-0}"
 }
 
 run_allocation_bench() {

@@ -54,6 +54,20 @@ require_non_negative_integer() {
   require_nonnegative_integer "$@"
 }
 
+now_ms() {
+  python3 -c 'import time; print(time.time_ns() // 1_000_000)'
+}
+
+metric_or_zero() {
+  local key=$1
+  local file=$2
+  local value=""
+  if [[ -f "${file}" ]]; then
+    value="$(extract_metric "${key}" "${file}")"
+  fi
+  printf '%s\n' "${value:-0}"
+}
+
 write_artifact_index() {
   local artifact_dir=$1
   local index_log=$2
