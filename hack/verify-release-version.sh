@@ -218,7 +218,7 @@ self_test() {
 
   local hostile_tag
   local injection_marker="${test_dir}/injected"
-  hostile_tag='v$(touch>'"${injection_marker}"')'
+  hostile_tag='v$$(touch>'"${injection_marker}"')'
   git check-ref-format "refs/tags/${hostile_tag}"
   expect_failure "a hostile but valid git tag" \
     env CHRONOS_RELEASE_TAG="${hostile_tag}" \
