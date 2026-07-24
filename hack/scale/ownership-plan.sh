@@ -6,6 +6,55 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 source "${REPO_ROOT}/hack/lib/ownership.sh"
 
+identity_ttl_plan_values() {
+  python3 - "$1" "$2" <<'PY'
+import sys
+
+U64_MAX = (1 << 64) - 1
+
+def positive_u64(name: str, raw: str) -> int:
+    if not raw.isdecimal():
+        raise SystemExit(f"{name} must be a positive decimal u64, got: {raw}")
+    value = int(raw)
+    if value == 0 or value > U64_MAX:
+        raise SystemExit(f"{name} must be in 1..={U64_MAX}, got: {raw}")
+    return value
+
+configured_ms = positive_u64("lease ttl ms", sys.argv[1])
+safety_gap_ms = positive_u64("safety gap ms", sys.argv[2])
+request_seconds = (configured_ms // 1000) + (1 if configured_ms % 1000 else 0)
+request_ms = request_seconds * 1000
+minimum_wait_ms = request_ms + safety_gap_ms
+print(request_seconds, request_ms, minimum_wait_ms)
+PY
+}
+
+if [[ "${1:-}" == "--self-test" ]]; then
+  assert_ttl_plan() {
+    local configured_ms=$1
+    local safety_gap_ms=$2
+    local expected=$3
+    local actual
+    actual="$(identity_ttl_plan_values "${configured_ms}" "${safety_gap_ms}")"
+    [[ "${actual}" == "${expected}" ]] || {
+      echo "identity TTL plan mismatch for ${configured_ms}: expected '${expected}', got '${actual}'" >&2
+      return 1
+    }
+  }
+
+  assert_ttl_plan 500 500 "1 1000 1500"
+  assert_ttl_plan 1500 500 "2 2000 2500"
+  assert_ttl_plan 3000 500 "3 3000 3500"
+  assert_ttl_plan 18446744073709551615 500 \
+    "18446744073709552 18446744073709552000 18446744073709552500"
+  if identity_ttl_plan_values 18446744073709551616 500 >/dev/null 2>&1; then
+    echo "identity TTL planner accepted a value above u64" >&2
+    exit 1
+  fi
+  echo "[ownership-plan] self-test passed"
+  exit 0
+fi
+
 OLD_WORKERS="${1:-${CHRONOS_OWNERSHIP_OLD_WORKERS:-1}}"
 NEW_WORKERS="${2:-${CHRONOS_OWNERSHIP_NEW_WORKERS:-${CHRONOS_SCALE_WORKERS:-2}}}"
 SHARD_COUNT="${3:-${CHRONOS_OWNERSHIP_SHARDS:-${CHRONOS_OWNERSHIP_GENERATORS:-256}}}"
@@ -18,15 +67,9 @@ require_positive_integer "old worker count" "${OLD_WORKERS}"
 require_positive_integer "new worker count" "${NEW_WORKERS}"
 require_positive_integer "ownership shard count" "${SHARD_COUNT}"
 require_non_negative_integer "assignment seed" "${ASSIGNMENT_SEED}"
-require_positive_integer "lease ttl ms" "${LEASE_TTL_MS}"
-require_positive_integer "safety gap ms" "${SAFETY_GAP_MS}"
-
-IDENTITY_GRANT_REQUEST_TTL_SECONDS=$((LEASE_TTL_MS / 1000))
-if [[ $((LEASE_TTL_MS % 1000)) -ne 0 ]]; then
-  IDENTITY_GRANT_REQUEST_TTL_SECONDS=$((IDENTITY_GRANT_REQUEST_TTL_SECONDS + 1))
-fi
-IDENTITY_GRANT_REQUEST_TTL_MS=$((IDENTITY_GRANT_REQUEST_TTL_SECONDS * 1000))
-MINIMUM_IDENTITY_LEASE_WAIT_MS=$((IDENTITY_GRANT_REQUEST_TTL_MS + SAFETY_GAP_MS))
+TTL_PLAN_VALUES="$(identity_ttl_plan_values "${LEASE_TTL_MS}" "${SAFETY_GAP_MS}")"
+read -r IDENTITY_GRANT_REQUEST_TTL_SECONDS IDENTITY_GRANT_REQUEST_TTL_MS \
+  MINIMUM_IDENTITY_LEASE_WAIT_MS <<<"${TTL_PLAN_VALUES}"
 
 moved_total=0
 stable_total=0

@@ -7,7 +7,7 @@ use super::{
     identity_claim_matches_record,
     identity_lifecycle::{
         await_identity_keepalive_reconnect, await_identity_keepalive_step,
-        identity_lease_grant_timing, identity_lease_initial_deadline,
+        identity_lease_confirmed_window, validate_identity_lease_grant_or_revoke,
     },
     identity_record_belongs_to_ownership_plan, parse_prev_route, parse_timeline_filter_record,
     route_update_for_watch_event, verify_instance_identity_lease_record,
@@ -57,23 +57,95 @@ async fn identity_reconnect_after_stream_error_cannot_outlive_confirmed_deadline
 }
 
 #[test]
-fn identity_grant_response_drives_initial_deadline_and_heartbeat_cadence() {
-    let timing = identity_lease_grant_timing(6).expect("positive server grant TTL should be valid");
-    let now = Instant::now();
-    let deadline =
-        identity_lease_initial_deadline(now, timing).expect("six seconds should fit the clock");
+fn identity_confirmed_window_anchors_deadline_before_response_delay() {
+    let request_started_at = Instant::now();
+    let response_observed_at = request_started_at + Duration::from_secs(2);
+    let window = identity_lease_confirmed_window(request_started_at, response_observed_at, 5)
+        .expect("three seconds should remain");
 
-    assert_eq!(timing.granted_ttl, Duration::from_secs(6));
-    assert_eq!(timing.heartbeat_interval, Duration::from_secs(2));
-    assert_eq!(deadline.duration_since(now), Duration::from_secs(6));
+    assert_eq!(
+        window.deadline.duration_since(request_started_at),
+        Duration::from_secs(5)
+    );
+    assert_eq!(
+        window.deadline.duration_since(response_observed_at),
+        Duration::from_secs(3)
+    );
+    assert_eq!(window.heartbeat_interval, Duration::from_secs(1));
 }
 
 #[test]
-fn identity_grant_response_rejects_non_positive_ttl_before_claim() {
-    for ttl in [0, -1] {
-        let error = identity_lease_grant_timing(ttl).unwrap_err();
-        assert!(error.to_string().contains("non-positive TTL"));
+fn identity_confirmed_window_cadence_is_strictly_inside_one_two_and_six_seconds() {
+    let now = Instant::now();
+    for (ttl_seconds, expected_interval) in [
+        (1, Duration::from_secs(1) / 3),
+        (2, Duration::from_secs(2) / 3),
+        (6, Duration::from_secs(2)),
+    ] {
+        let window = identity_lease_confirmed_window(now, now, ttl_seconds).unwrap();
+        assert_eq!(window.heartbeat_interval, expected_interval);
+        assert!(window.heartbeat_interval < Duration::from_secs(ttl_seconds as u64));
     }
+}
+
+#[tokio::test]
+async fn one_second_identity_window_schedules_heartbeat_before_deadline() {
+    let now = Instant::now();
+    let window = identity_lease_confirmed_window(now, now, 1).unwrap();
+
+    let result = await_identity_keepalive_step(
+        window.deadline,
+        tokio::time::sleep(window.heartbeat_interval),
+    )
+    .await;
+
+    assert!(result.is_ok());
+    assert!(Instant::now() < window.deadline);
+}
+
+#[tokio::test]
+async fn invalid_identity_grant_is_revoked_before_the_caller_can_claim() {
+    for ttl in [0, -1] {
+        let revoked_lease = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
+        let observed_revoke = revoked_lease.clone();
+        let now = Instant::now();
+        let error = validate_identity_lease_grant_or_revoke(
+            17,
+            now,
+            now,
+            ttl,
+            move |lease_id| async move {
+                observed_revoke.store(lease_id, Ordering::SeqCst);
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("non-positive TTL"));
+        assert_eq!(revoked_lease.load(Ordering::SeqCst), 17);
+    }
+}
+
+#[tokio::test]
+async fn identity_grant_exhausted_during_response_delay_is_revoked() {
+    let revoked_lease = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
+    let observed_revoke = revoked_lease.clone();
+    let request_started_at = Instant::now();
+    let response_observed_at = request_started_at + Duration::from_secs(2);
+    let error = validate_identity_lease_grant_or_revoke(
+        19,
+        request_started_at,
+        response_observed_at,
+        1,
+        move |lease_id| async move {
+            observed_revoke.store(lease_id, Ordering::SeqCst);
+        },
+    )
+    .await
+    .unwrap_err();
+
+    assert!(error.to_string().contains("already exhausted"));
+    assert_eq!(revoked_lease.load(Ordering::SeqCst), 19);
 }
 
 fn sample_route(generator_id: u32, route_version: u64) -> TimelineRoute {

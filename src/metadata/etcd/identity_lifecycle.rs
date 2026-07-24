@@ -6,39 +6,69 @@ use tokio::time::error::Elapsed;
 use tokio::time::timeout_at;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct IdentityLeaseGrantTiming {
-    pub(super) granted_ttl: Duration,
+pub(super) struct IdentityLeaseConfirmedWindow {
+    pub(super) deadline: Instant,
     pub(super) heartbeat_interval: Duration,
 }
 
-pub(super) fn identity_lease_grant_timing(
-    granted_ttl_seconds: i64,
-) -> Result<IdentityLeaseGrantTiming, TsoError> {
-    let granted_ttl_seconds = u64::try_from(granted_ttl_seconds)
+pub(super) fn identity_lease_confirmed_window(
+    request_started_at: Instant,
+    response_observed_at: Instant,
+    confirmed_ttl_seconds: i64,
+) -> Result<IdentityLeaseConfirmedWindow, TsoError> {
+    let confirmed_ttl_seconds = u64::try_from(confirmed_ttl_seconds)
         .ok()
         .filter(|ttl| *ttl > 0)
         .ok_or_else(|| {
             TsoError::Internal(format!(
-                "Etcd identity lease grant returned non-positive TTL: {}",
-                granted_ttl_seconds
+                "Etcd identity lease response returned non-positive TTL: {}",
+                confirmed_ttl_seconds
             ))
         })?;
-    Ok(IdentityLeaseGrantTiming {
-        granted_ttl: Duration::from_secs(granted_ttl_seconds),
-        heartbeat_interval: Duration::from_secs(granted_ttl_seconds.max(3) / 3),
+    let confirmed_ttl = Duration::from_secs(confirmed_ttl_seconds);
+    let deadline = request_started_at
+        .checked_add(confirmed_ttl)
+        .ok_or_else(|| {
+            TsoError::Internal(format!(
+                "Etcd identity lease response TTL {}s exceeds the local monotonic clock range",
+                confirmed_ttl_seconds
+            ))
+        })?;
+    if deadline <= response_observed_at {
+        return Err(TsoError::Internal(format!(
+            "Etcd identity lease response TTL {}s was already exhausted before confirmation",
+            confirmed_ttl_seconds
+        )));
+    }
+    let remaining_ttl = deadline.duration_since(response_observed_at);
+    Ok(IdentityLeaseConfirmedWindow {
+        deadline,
+        heartbeat_interval: remaining_ttl / 3,
     })
 }
 
-pub(super) fn identity_lease_initial_deadline(
-    now: Instant,
-    timing: IdentityLeaseGrantTiming,
-) -> Result<Instant, TsoError> {
-    now.checked_add(timing.granted_ttl).ok_or_else(|| {
-        TsoError::Internal(format!(
-            "Etcd identity lease grant TTL {}s exceeds the local monotonic clock range",
-            timing.granted_ttl.as_secs()
-        ))
-    })
+pub(super) async fn validate_identity_lease_grant_or_revoke<F, Fut>(
+    lease_id: i64,
+    request_started_at: Instant,
+    response_observed_at: Instant,
+    granted_ttl_seconds: i64,
+    revoke: F,
+) -> Result<IdentityLeaseConfirmedWindow, TsoError>
+where
+    F: FnOnce(i64) -> Fut,
+    Fut: Future<Output = ()>,
+{
+    match identity_lease_confirmed_window(
+        request_started_at,
+        response_observed_at,
+        granted_ttl_seconds,
+    ) {
+        Ok(window) => Ok(window),
+        Err(error) => {
+            revoke(lease_id).await;
+            Err(error)
+        }
+    }
 }
 
 pub(super) async fn await_identity_keepalive_step<T>(
@@ -382,29 +412,24 @@ impl EtcdMetadataStore {
         };
 
         let revoke_client = self.client.clone();
+        let grant_request_started_at = Instant::now();
         let grant_response = self
             .etcd_lease_grant(request_ttl_seconds)
             .await
             .map_err(|error| TsoError::Internal(format!("Etcd lease grant failed: {}", error)))?;
         let lease_id = grant_response.id();
         let granted_ttl_seconds = grant_response.ttl();
-        let grant_timing = match identity_lease_grant_timing(granted_ttl_seconds) {
-            Ok(timing) => timing,
-            Err(error) => {
+        let grant_window = validate_identity_lease_grant_or_revoke(
+            lease_id,
+            grant_request_started_at,
+            Instant::now(),
+            granted_ttl_seconds,
+            |lease_id| async move {
                 let mut revoke_client = self.client.clone();
                 let _ = revoke_client.lease_revoke(lease_id).await;
-                return Err(error);
-            }
-        };
-        let initial_lease_alive_until =
-            match identity_lease_initial_deadline(Instant::now(), grant_timing) {
-                Ok(deadline) => deadline,
-                Err(error) => {
-                    let mut revoke_client = self.client.clone();
-                    let _ = revoke_client.lease_revoke(lease_id).await;
-                    return Err(error);
-                }
-            };
+            },
+        )
+        .await?;
 
         let value = Self::serialize_record(
             &record,
@@ -423,53 +448,60 @@ impl EtcdMetadataStore {
         let keepalive_client_source = self.client.clone();
         let request_retry_budget = self.request_retry_budget;
         let (lost_tx, lost_rx) = watch::channel(false);
-        let heartbeat_interval = grant_timing.heartbeat_interval;
+        let initial_lease_alive_until = grant_window.deadline;
+        let initial_heartbeat_interval = grant_window.heartbeat_interval;
         let lease_instance_id = instance_id.to_owned();
         let lease_worker_id = worker_id.to_owned();
         let lease_advertise_endpoint = advertise_endpoint.to_owned();
         let keep_alive_task = tokio::spawn(async move {
             let mut lease_alive_until = initial_lease_alive_until;
+            let mut heartbeat_interval = initial_heartbeat_interval;
             'keepalive: loop {
-                let keepalive_result =
-                    await_identity_keepalive_step(lease_alive_until, keeper.keep_alive()).await;
-                let failure_reason = match keepalive_result {
-                    Ok(Ok(())) => {
-                        match await_identity_keepalive_step(lease_alive_until, stream.message())
-                            .await
-                        {
-                            Ok(Ok(Some(response))) if response.ttl() > 0 => {
-                                let response_ttl = Duration::from_secs(response.ttl() as u64);
-                                match Instant::now().checked_add(response_ttl) {
-                                    Some(deadline) => {
-                                        lease_alive_until = deadline;
-                                        match await_identity_keepalive_step(
-                                            lease_alive_until,
-                                            sleep(heartbeat_interval),
-                                        )
-                                        .await
-                                        {
-                                            Ok(()) => continue,
-                                            Err(_) => {
-                                                "keepalive_heartbeat_deadline_elapsed".to_owned()
+                let heartbeat_result =
+                    await_identity_keepalive_step(lease_alive_until, sleep(heartbeat_interval))
+                        .await;
+                let failure_reason = match heartbeat_result {
+                    Ok(()) => {
+                        let keepalive_request_started_at = Instant::now();
+                        let keepalive_result =
+                            await_identity_keepalive_step(lease_alive_until, keeper.keep_alive())
+                                .await;
+                        match keepalive_result {
+                            Ok(Ok(())) => {
+                                match await_identity_keepalive_step(
+                                    lease_alive_until,
+                                    stream.message(),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(Some(response))) => {
+                                        match identity_lease_confirmed_window(
+                                            keepalive_request_started_at,
+                                            Instant::now(),
+                                            response.ttl(),
+                                        ) {
+                                            Ok(window) => {
+                                                lease_alive_until = window.deadline;
+                                                heartbeat_interval = window.heartbeat_interval;
+                                                continue;
+                                            }
+                                            Err(error) => {
+                                                format!("keepalive_response_invalid: {error}")
                                             }
                                         }
                                     }
-                                    None => format!(
-                                        "keepalive_response_ttl_exceeds_monotonic_clock: {}",
-                                        response.ttl()
-                                    ),
+                                    Ok(Ok(None)) => "keepalive_stream_closed".to_owned(),
+                                    Ok(Err(error)) => {
+                                        format!("keepalive_stream_error: {error}")
+                                    }
+                                    Err(_) => "keepalive_response_deadline_elapsed".to_owned(),
                                 }
                             }
-                            Ok(Ok(Some(response))) => {
-                                format!("keepalive_response_non_positive_ttl: {}", response.ttl())
-                            }
-                            Ok(Ok(None)) => "keepalive_stream_closed".to_owned(),
-                            Ok(Err(error)) => format!("keepalive_stream_error: {error}"),
-                            Err(_) => "keepalive_response_deadline_elapsed".to_owned(),
+                            Ok(Err(error)) => format!("keepalive_send_failed: {error}"),
+                            Err(_) => "keepalive_send_deadline_elapsed".to_owned(),
                         }
                     }
-                    Ok(Err(error)) => format!("keepalive_send_failed: {error}"),
-                    Err(_) => "keepalive_send_deadline_elapsed".to_owned(),
+                    Err(_) => "keepalive_heartbeat_deadline_elapsed".to_owned(),
                 };
 
                 let mut consecutive_reconnect_failures = 0u32;
