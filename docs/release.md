@@ -92,6 +92,10 @@ release-version-check` locally while preparing the version surfaces, and add the
 heading before creating the tag. Publish the Go module with the matching subdirectory tag, for
 example `clients/go/v0.1.0`.
 
+```bash
+make CHRONOS_RELEASE_TAG=v0.1.0 release-version-check
+```
+
 Go, Java, and C++ clients have independent release tags and distributions. Follow
 `clients/compatibility.md`; the `Client Release` workflow validates, packages, and publishes exactly
 one client for each `clients/<language>/vX.Y.Z` tag.

@@ -68,7 +68,10 @@ verify_release_version() {
       }
     ' "${root}/Cargo.lock"
   )"
-  chart_version="$(awk '$1 == "version:" { print $2 }' "${root}/deploy/helm/chronos/Chart.yaml")"
+  chart_version="$(
+    awk '$1 == "version:" { value = $2; gsub(/^"|"$/, "", value); print value }' \
+      "${root}/deploy/helm/chronos/Chart.yaml"
+  )"
   chart_app_version="$(
     awk '$1 == "appVersion:" { value = $2; gsub(/^"|"$/, "", value); print value }' \
       "${root}/deploy/helm/chronos/Chart.yaml"
