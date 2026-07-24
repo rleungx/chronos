@@ -12,6 +12,7 @@
     },
     "image": {
       "type": "object",
+      "additionalProperties": false,
       "required": ["repository", "tag"],
       "properties": {
         "repository": { "type": "string", "minLength": 1 },

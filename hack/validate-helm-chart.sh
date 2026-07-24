@@ -62,6 +62,7 @@ fail!("runtime.terminationGracePeriodSeconds must leave time for bounded shutdow
 replica_schema = schema.dig("properties", "replicaCount", "anyOf")
 fail!("values.schema.json must allow only drain-zero or at least three replicas") unless replica_schema == [{"const" => 0}, {"minimum" => 3}]
 fail!("values.schema.json must reject latest image tag") unless schema.dig("properties", "image", "properties", "tag", "not", "const") == "latest"
+fail!("values.schema.json must reject unknown image properties") unless schema.dig("properties", "image", "additionalProperties") == false
 fail!("values.schema.json must require mTLS security mode") unless schema.dig("properties", "security", "properties", "mode", "const") == "required"
 fail!("values.schema.json must constrain ownership shard count") unless schema.dig("properties", "ownership", "properties", "shardCount", "minimum") == 3
 fail!("values.schema.json must reject removed ownership escape hatches") unless schema.dig("properties", "ownership", "additionalProperties") == false
@@ -108,6 +109,14 @@ fi
 
 if command -v helm >/dev/null 2>&1; then
   helm lint "${chart}"
+  custom_image_rendered="$(helm template chronos "${chart}" --set-string image.tag=0.1.1)"
+  grep -Fq 'image: "ghcr.io/rleungx/chronos:0.1.1"' <<<"${custom_image_rendered}"
+  if helm template chronos "${chart}" \
+    --set image.digset=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+    >/dev/null 2>&1; then
+    echo "Helm chart accepted unknown image.digset typo" >&2
+    exit 1
+  fi
   if helm template chronos "${chart}" --set ownership.allowUnsafeInPlaceMigration=true >/dev/null 2>&1; then
     echo "Helm chart accepted the removed unsafe in-place migration option" >&2
     exit 1
