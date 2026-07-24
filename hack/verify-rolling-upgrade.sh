@@ -150,9 +150,39 @@ expected_order = [
 if list(blocks) != expected_order:
     raise SystemExit(f"identity evidence order mismatch: observed={list(blocks)}")
 
+service_endpoints = summary.get("service_endpoints", "").split(",")
+if len(service_endpoints) != 3 or any(not endpoint for endpoint in service_endpoints):
+    raise SystemExit(f"expected three service endpoints, got {service_endpoints}")
+expected_ack_contract = {
+    "old-worker-0": ("1", "old_only", service_endpoints[0]),
+    "old-worker-1": ("2", "old_only", service_endpoints[1]),
+    "old-worker-2": ("3", "old_only", service_endpoints[2]),
+    "replace-0-started": ("4", "replace_0", ""),
+    "new-worker-0": ("5", "mixed_1", service_endpoints[0]),
+    "replace-1-started": ("6", "replace_1", ""),
+    "new-worker-1": ("7", "mixed_2", service_endpoints[1]),
+    "replace-2-started": ("8", "replace_2", ""),
+    "new-worker-2": ("9", "new_only", service_endpoints[2]),
+}
 last_serving_tso = None
 for label in expected_order:
     block = blocks[label]
+    expected_sequence, expected_phase, expected_target = expected_ack_contract[label]
+    observed_contract = (
+        block.get("sequence"),
+        block.get("phase"),
+        block.get("target_endpoint"),
+    )
+    if block.get("status") != "serving" or observed_contract != (
+        expected_sequence,
+        expected_phase,
+        expected_target,
+    ):
+        raise SystemExit(
+            f"{label} acknowledgement contract mismatch: "
+            f"expected=serving/{expected_sequence}/{expected_phase}/{expected_target} "
+            f"observed={block.get('status')}/{observed_contract}"
+        )
     serving_tso = number(block, "serving_tso")
     if last_serving_tso is not None and serving_tso <= last_serving_tso:
         raise SystemExit(
@@ -215,6 +245,7 @@ forward_upgrade_only=true
 rollback_covered=false
 worker_count=3
 replacement_order=0,1,2
+service_endpoints=127.0.0.1:52051,127.0.0.1:52052,127.0.0.1:52053
 old_pid_0=101
 old_pid_1=102
 old_pid_2=103
@@ -260,7 +291,16 @@ EOF
       echo "[${label}]"
       echo "sequence=${sequence}"
       echo "status=serving"
-      echo "phase=old_only"
+      case "${label}" in
+        old-worker-*) phase=old_only ;;
+        replace-0-started) phase=replace_0 ;;
+        new-worker-0) phase=mixed_1 ;;
+        replace-1-started) phase=replace_1 ;;
+        new-worker-1) phase=mixed_2 ;;
+        replace-2-started) phase=replace_2 ;;
+        new-worker-2) phase=new_only ;;
+      esac
+      echo "phase=${phase}"
       if [[ "${label}" =~ ^(old|new)-worker-([0-2])$ ]]; then
         generation="${BASH_REMATCH[1]}"
         index="${BASH_REMATCH[2]}"
@@ -313,6 +353,22 @@ EOF
     "${summary}" >"${summary}.invalid"
   if verify_rolling_upgrade "${summary}.invalid" >/dev/null 2>&1; then
     echo "rolling-upgrade verifier accepted a replacement that still ran the old build" >&2
+    return 1
+  fi
+
+  sed 's/sequence=5/sequence=4/' "${identity}" >"${identity}.invalid"
+  sed "s#identity_log=${identity}#identity_log=${identity}.invalid#" \
+    "${summary}" >"${summary}.invalid"
+  if verify_rolling_upgrade "${summary}.invalid" >/dev/null 2>&1; then
+    echo "rolling-upgrade verifier accepted a duplicate acknowledgement sequence" >&2
+    return 1
+  fi
+
+  sed 's/phase=mixed_2/phase=old_only/' "${identity}" >"${identity}.invalid"
+  sed "s#identity_log=${identity}#identity_log=${identity}.invalid#" \
+    "${summary}" >"${summary}.invalid"
+  if verify_rolling_upgrade "${summary}.invalid" >/dev/null 2>&1; then
+    echo "rolling-upgrade verifier accepted an acknowledgement phase mismatch" >&2
     return 1
   fi
 

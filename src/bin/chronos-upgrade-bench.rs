@@ -2,8 +2,12 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use async_trait::async_trait;
+use tokio::sync::{Mutex, RwLock};
 use tokio::time::{sleep, timeout};
 use tonic::transport::Channel;
 use tonic::Request;
@@ -63,7 +67,6 @@ struct PhaseCommand {
 struct PendingAck {
     command: PhaseCommand,
     health: Option<HealthResponse>,
-    started_at: Instant,
 }
 
 #[derive(Debug, Default)]
@@ -75,6 +78,47 @@ struct PhaseStats {
     last_tso: Option<u64>,
     max_success_gap_ms: u64,
     last_success_at: Option<Instant>,
+}
+
+#[derive(Clone, Debug)]
+struct RoutePhase {
+    route: Route,
+    phase: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct ServingObservation {
+    ordinal: u64,
+    phase: String,
+    owner_worker_endpoint: String,
+    last_tso: u64,
+}
+
+struct BenchStats {
+    stages: BTreeMap<String, PhaseStats>,
+    ordinal: u64,
+    last_tso: Option<u64>,
+    monotonicity_violations: u64,
+    last_success_at: Option<Instant>,
+    global_max_success_gap_ms: u64,
+    latest_serving: Option<ServingObservation>,
+}
+
+impl Default for BenchStats {
+    fn default() -> Self {
+        Self {
+            stages: PHASES
+                .iter()
+                .map(|phase| ((*phase).to_owned(), PhaseStats::default()))
+                .collect(),
+            ordinal: 0,
+            last_tso: None,
+            monotonicity_violations: 0,
+            last_success_at: None,
+            global_max_success_gap_ms: 0,
+            latest_serving: None,
+        }
+    }
 }
 
 fn parse_endpoints(value: &str) -> Vec<String> {
@@ -318,97 +362,44 @@ async fn allocate(
     .into_inner())
 }
 
-#[tokio::main]
-async fn main() -> AppResult<()> {
-    let config = load_config()?;
-    let started = Instant::now();
-    let mut route = 'wait_for_timeline: loop {
-        for endpoint in &config.endpoints {
-            if let Ok(route) = ensure_timeline(endpoint, &config.timeline_key).await {
-                break 'wait_for_timeline route;
-            }
-        }
-        if started.elapsed() >= Duration::from_secs(30) {
-            return Err("no upgrade endpoint could ensure the timeline within 30s".into());
-        }
-        sleep(Duration::from_millis(100)).await;
-    };
+#[async_trait]
+trait AllocationStep: Send {
+    async fn step(&mut self) -> AppResult<()>;
+}
 
-    let mut stages = PHASES
-        .iter()
-        .map(|phase| ((*phase).to_owned(), PhaseStats::default()))
-        .collect::<BTreeMap<_, _>>();
-    let mut current_phase = None::<String>;
-    let mut current_sequence = 0u64;
-    let mut pending_ack = None::<PendingAck>;
-    let mut clients = BTreeMap::new();
-    let mut ordinal = 0u64;
-    let mut last_tso = None::<u64>;
-    let mut monotonicity_violations = 0u64;
-    let mut last_success_at = None::<Instant>;
-    let mut global_max_success_gap_ms = 0u64;
-    let mut command_count = 0u64;
-    let mut stop_requested = false;
+struct NetworkAllocator {
+    config: Config,
+    route_phase: Arc<RwLock<RoutePhase>>,
+    stats: Arc<Mutex<BenchStats>>,
+    clients: BTreeMap<String, TimestampServiceClient<Channel>>,
+}
 
-    while !stop_requested {
-        if started.elapsed() >= Duration::from_secs(config.max_runtime_secs) {
-            return Err(format!(
-                "upgrade bench exceeded {}s runtime without a stop command",
-                config.max_runtime_secs
-            )
-            .into());
-        }
-
-        if let Some(command) = parse_command(&config.command_file)? {
-            if command.sequence > current_sequence {
-                if command.phase == "stop" {
-                    stop_requested = true;
-                    continue;
-                }
-                let observed_health = if let Some(target) = &command.target_endpoint {
-                    Some(health(target).await?)
-                } else {
-                    None
-                };
-                current_sequence = command.sequence;
-                current_phase = Some(command.phase.clone());
-                pending_ack = Some(PendingAck {
-                    command,
-                    health: observed_health,
-                    started_at: Instant::now(),
-                });
-                command_count = command_count.saturating_add(1);
-            }
-        }
-
-        let Some(phase) = current_phase.as_deref() else {
-            sleep(Duration::from_millis(config.poll_interval_ms)).await;
-            continue;
+#[async_trait]
+impl AllocationStep for NetworkAllocator {
+    async fn step(&mut self) -> AppResult<()> {
+        let snapshot = self.route_phase.read().await.clone();
+        let Some(phase) = snapshot.phase else {
+            sleep(Duration::from_millis(self.config.poll_interval_ms)).await;
+            return Ok(());
         };
-        ordinal = ordinal.saturating_add(1);
-        let stats = stages
-            .get_mut(phase)
-            .ok_or_else(|| format!("missing stats for phase {phase}"))?;
-        if let Some(pending) = pending_ack.as_ref() {
-            if let Some(target) = &pending.command.target_endpoint {
-                if route.owner_worker_endpoint != *target {
-                    if pending.started_at.elapsed() >= Duration::from_secs(20) {
-                        return Err(format!(
-                            "command {} did not transfer the timeline to {} within 20s",
-                            pending.command.sequence, target
-                        )
-                        .into());
-                    }
-                    let previous_owner = route.owner_worker_endpoint.clone();
-                    route = try_transfer_to(&config, &route, target).await;
-                    if route.owner_worker_endpoint != previous_owner {
-                        clients.clear();
-                    }
-                }
-            }
-        }
-        stats.requests = stats.requests.saturating_add(1);
-        match allocate(&mut clients, &route, ordinal, config.request_timeout_ms).await {
+        let ordinal = {
+            let mut stats = self.stats.lock().await;
+            stats.ordinal = stats.ordinal.saturating_add(1);
+            let stage = stats
+                .stages
+                .get_mut(&phase)
+                .ok_or_else(|| format!("missing stats for phase {phase}"))?;
+            stage.requests = stage.requests.saturating_add(1);
+            stats.ordinal
+        };
+        match allocate(
+            &mut self.clients,
+            &snapshot.route,
+            ordinal,
+            self.config.request_timeout_ms,
+        )
+        .await
+        {
             Ok(response) => {
                 let first = response
                     .ranges
@@ -420,80 +411,255 @@ async fn main() -> AppResult<()> {
                     .last()
                     .ok_or("allocation response has no ranges")?
                     .end_tso;
-                if first > last || last_tso.is_some_and(|previous| first <= previous) {
-                    monotonicity_violations = monotonicity_violations.saturating_add(1);
-                }
-                last_tso = Some(last_tso.map_or(last, |previous| previous.max(last)));
-                route.epoch = response.epoch;
-                route.route_version = response.route_version;
-                stats.success = stats.success.saturating_add(1);
-                stats.first_tso.get_or_insert(first);
-                stats.last_tso = Some(stats.last_tso.map_or(last, |value| value.max(last)));
                 let success_at = Instant::now();
-                if let Some(previous) = last_success_at {
-                    global_max_success_gap_ms = global_max_success_gap_ms
-                        .max(success_at.duration_since(previous).as_millis() as u64);
+                {
+                    let mut stats = self.stats.lock().await;
+                    if first > last || stats.last_tso.is_some_and(|previous| first <= previous) {
+                        stats.monotonicity_violations =
+                            stats.monotonicity_violations.saturating_add(1);
+                    }
+                    stats.last_tso =
+                        Some(stats.last_tso.map_or(last, |previous| previous.max(last)));
+                    if let Some(previous) = stats.last_success_at {
+                        stats.global_max_success_gap_ms = stats
+                            .global_max_success_gap_ms
+                            .max(success_at.duration_since(previous).as_millis() as u64);
+                    }
+                    stats.last_success_at = Some(success_at);
+                    stats.latest_serving = Some(ServingObservation {
+                        ordinal,
+                        phase: phase.clone(),
+                        owner_worker_endpoint: snapshot.route.owner_worker_endpoint.clone(),
+                        last_tso: last,
+                    });
+                    let stage = stats
+                        .stages
+                        .get_mut(&phase)
+                        .ok_or_else(|| format!("missing stats for phase {phase}"))?;
+                    stage.success = stage.success.saturating_add(1);
+                    stage.first_tso.get_or_insert(first);
+                    stage.last_tso = Some(stage.last_tso.map_or(last, |value| value.max(last)));
+                    if let Some(previous) = stage.last_success_at {
+                        stage.max_success_gap_ms = stage
+                            .max_success_gap_ms
+                            .max(success_at.duration_since(previous).as_millis() as u64);
+                    }
+                    stage.last_success_at = Some(success_at);
                 }
-                last_success_at = Some(success_at);
-                if let Some(previous) = stats.last_success_at {
-                    stats.max_success_gap_ms = stats
-                        .max_success_gap_ms
-                        .max(success_at.duration_since(previous).as_millis() as u64);
-                }
-                stats.last_success_at = Some(success_at);
-                let command_is_serving = pending_ack.as_ref().is_some_and(|pending| {
-                    pending
-                        .command
-                        .target_endpoint
-                        .as_ref()
-                        .is_none_or(|target| target == &route.owner_worker_endpoint)
-                });
-                if command_is_serving {
-                    let pending = pending_ack
-                        .take()
-                        .expect("serving command must have pending acknowledgement");
-                    write_ack(&config.ack_file, &pending, &route, last)?;
+                let mut shared = self.route_phase.write().await;
+                if shared.route.owner_worker_endpoint == snapshot.route.owner_worker_endpoint
+                    && response.route_version >= shared.route.route_version
+                {
+                    shared.route.epoch = response.epoch;
+                    shared.route.route_version = response.route_version;
                 }
             }
             Err(_) => {
-                stats.failed = stats.failed.saturating_add(1);
-                if let Ok(refreshed) = refresh_route(&config.endpoints, &config.timeline_key).await
-                {
-                    if refreshed.owner_worker_endpoint != route.owner_worker_endpoint {
-                        clients.clear();
-                    }
-                    route = refreshed;
-                } else {
-                    sleep(Duration::from_millis(config.poll_interval_ms)).await;
-                }
+                let mut stats = self.stats.lock().await;
+                let stage = stats
+                    .stages
+                    .get_mut(&phase)
+                    .ok_or_else(|| format!("missing stats for phase {phase}"))?;
+                stage.failed = stage.failed.saturating_add(1);
             }
         }
+        Ok(())
     }
+}
 
+async fn run_allocation_loop<S: AllocationStep>(
+    mut allocator: S,
+    stop: Arc<AtomicBool>,
+) -> AppResult<()> {
+    while !stop.load(Ordering::Acquire) {
+        allocator.step().await?;
+    }
+    Ok(())
+}
+
+async fn wait_for_serving_observation(
+    stats: &Arc<Mutex<BenchStats>>,
+    minimum_ordinal: u64,
+    expected_phase: &str,
+    target_endpoint: Option<&str>,
+    deadline: Instant,
+) -> AppResult<ServingObservation> {
+    loop {
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "no {expected_phase} serving allocation observed after ordinal {minimum_ordinal} for target {}",
+                target_endpoint.unwrap_or("any")
+            )
+            .into());
+        }
+        if let Some(observation) = stats.lock().await.latest_serving.clone() {
+            if observation.ordinal > minimum_ordinal
+                && observation.phase == expected_phase
+                && target_endpoint.is_none_or(|target| target == observation.owner_worker_endpoint)
+            {
+                return Ok(observation);
+            }
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn run_command_driver(
+    config: &Config,
+    route_phase: Arc<RwLock<RoutePhase>>,
+    stats: Arc<Mutex<BenchStats>>,
+    stop: Arc<AtomicBool>,
+) -> AppResult<u64> {
+    let started = Instant::now();
+    let mut current_sequence = 0u64;
+    let mut command_count = 0u64;
+    loop {
+        if started.elapsed() >= Duration::from_secs(config.max_runtime_secs) {
+            return Err(format!(
+                "upgrade bench exceeded {}s runtime without a stop command",
+                config.max_runtime_secs
+            )
+            .into());
+        }
+        let Some(command) = parse_command(&config.command_file)? else {
+            sleep(Duration::from_millis(config.poll_interval_ms)).await;
+            continue;
+        };
+        if command.sequence <= current_sequence {
+            sleep(Duration::from_millis(config.poll_interval_ms)).await;
+            continue;
+        }
+        if command.phase == "stop" {
+            stop.store(true, Ordering::Release);
+            return Ok(command_count);
+        }
+
+        let baseline_ordinal = stats.lock().await.ordinal;
+        {
+            let mut shared = route_phase.write().await;
+            shared.phase = Some(command.phase.clone());
+        }
+        let observed_health = if let Some(target) = &command.target_endpoint {
+            Some(health(target).await?)
+        } else {
+            None
+        };
+        let deadline = Instant::now() + Duration::from_secs(20);
+        if let Some(target) = &command.target_endpoint {
+            loop {
+                let route = route_phase.read().await.route.clone();
+                if route.owner_worker_endpoint == *target {
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    return Err(format!(
+                        "command {} did not transfer the timeline to {} within 20s",
+                        command.sequence, target
+                    )
+                    .into());
+                }
+                let refreshed = try_transfer_to(config, &route, target).await;
+                let mut shared = route_phase.write().await;
+                if refreshed.route_version >= shared.route.route_version {
+                    shared.route = refreshed;
+                }
+                drop(shared);
+                sleep(Duration::from_millis(25)).await;
+            }
+        }
+        let observation = wait_for_serving_observation(
+            &stats,
+            baseline_ordinal,
+            &command.phase,
+            command.target_endpoint.as_deref(),
+            deadline,
+        )
+        .await?;
+        let route = route_phase.read().await.route.clone();
+        write_ack(
+            &config.ack_file,
+            &PendingAck {
+                command: command.clone(),
+                health: observed_health,
+            },
+            &route,
+            observation.last_tso,
+        )?;
+        current_sequence = command.sequence;
+        command_count = command_count.saturating_add(1);
+    }
+}
+
+#[tokio::main]
+async fn main() -> AppResult<()> {
+    let config = load_config()?;
+    let started = Instant::now();
+    let route = 'wait_for_timeline: loop {
+        for endpoint in &config.endpoints {
+            if let Ok(route) = ensure_timeline(endpoint, &config.timeline_key).await {
+                break 'wait_for_timeline route;
+            }
+        }
+        if started.elapsed() >= Duration::from_secs(30) {
+            return Err("no upgrade endpoint could ensure the timeline within 30s".into());
+        }
+        sleep(Duration::from_millis(100)).await;
+    };
+
+    let route_phase = Arc::new(RwLock::new(RoutePhase { route, phase: None }));
+    let stats = Arc::new(Mutex::new(BenchStats::default()));
+    let stop = Arc::new(AtomicBool::new(false));
+    let allocator_handle = tokio::spawn(run_allocation_loop(
+        NetworkAllocator {
+            config: config.clone(),
+            route_phase: route_phase.clone(),
+            stats: stats.clone(),
+            clients: BTreeMap::new(),
+        },
+        stop.clone(),
+    ));
+    let driver_result = run_command_driver(&config, route_phase, stats.clone(), stop.clone()).await;
+    stop.store(true, Ordering::Release);
+    let allocator_result = allocator_handle.await?;
+    let command_count = driver_result?;
+    allocator_result?;
+
+    let stats = stats.lock().await;
     println!("result=success");
     println!("timeline_key={}", config.timeline_key);
     println!("command_count={command_count}");
-    println!("monotonicity_violations_total={monotonicity_violations}");
-    println!("global_max_success_gap_ms={global_max_success_gap_ms}");
+    println!(
+        "monotonicity_violations_total={}",
+        stats.monotonicity_violations
+    );
+    println!(
+        "global_max_success_gap_ms={}",
+        stats.global_max_success_gap_ms
+    );
     println!(
         "global_first_tso={}",
-        stages
+        stats
+            .stages
             .values()
             .filter_map(|stats| stats.first_tso)
             .min()
             .unwrap_or(0)
     );
-    println!("global_last_tso={}", last_tso.unwrap_or(0));
+    println!("global_last_tso={}", stats.last_tso.unwrap_or(0));
     for phase in PHASES {
-        let stats = stages
+        let phase_stats = stats
+            .stages
             .get(phase)
             .ok_or_else(|| format!("missing final stats for phase {phase}"))?;
-        println!("{phase}_requests_total={}", stats.requests);
-        println!("{phase}_success_total={}", stats.success);
-        println!("{phase}_failed_total={}", stats.failed);
-        println!("{phase}_first_tso={}", stats.first_tso.unwrap_or(0));
-        println!("{phase}_last_tso={}", stats.last_tso.unwrap_or(0));
-        println!("{phase}_max_success_gap_ms={}", stats.max_success_gap_ms);
+        println!("{phase}_requests_total={}", phase_stats.requests);
+        println!("{phase}_success_total={}", phase_stats.success);
+        println!("{phase}_failed_total={}", phase_stats.failed);
+        println!("{phase}_first_tso={}", phase_stats.first_tso.unwrap_or(0));
+        println!("{phase}_last_tso={}", phase_stats.last_tso.unwrap_or(0));
+        println!(
+            "{phase}_max_success_gap_ms={}",
+            phase_stats.max_success_gap_ms
+        );
     }
     Ok(())
 }
@@ -501,6 +667,20 @@ async fn main() -> AppResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicU64;
+
+    struct CountingAllocator {
+        progress: Arc<AtomicU64>,
+    }
+
+    #[async_trait]
+    impl AllocationStep for CountingAllocator {
+        async fn step(&mut self) -> AppResult<()> {
+            self.progress.fetch_add(1, Ordering::Relaxed);
+            tokio::task::yield_now().await;
+            Ok(())
+        }
+    }
 
     fn command_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -536,5 +716,33 @@ mod tests {
         fs::write(&command, "1|rollback|-\n").expect("write command");
         assert!(parse_command(&command).is_err());
         fs::remove_file(command).expect("remove command");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pending_control_future_does_not_stop_allocation_progress() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let progress = Arc::new(AtomicU64::new(0));
+        let allocator = tokio::spawn(run_allocation_loop(
+            CountingAllocator {
+                progress: progress.clone(),
+            },
+            stop.clone(),
+        ));
+        let control = tokio::spawn(std::future::pending::<()>());
+
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            progress.load(Ordering::Relaxed) > 1,
+            "allocator must continue stepping while the control future is permanently pending"
+        );
+
+        stop.store(true, Ordering::Release);
+        allocator
+            .await
+            .expect("allocator task should join")
+            .expect("allocator loop should succeed");
+        control.abort();
     }
 }
