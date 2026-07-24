@@ -41,6 +41,7 @@ const REBALANCE_ALLOCATE_RETRY_BACKOFF_MS: u64 = 25;
 enum Scenario {
     StatusScan,
     StatusScanFiltered,
+    AllocateOnly,
     AllocateDuringRebalance,
 }
 
@@ -49,6 +50,7 @@ impl Scenario {
         match self {
             Self::StatusScan => "status_scan",
             Self::StatusScanFiltered => "status_scan_filtered",
+            Self::AllocateOnly => "allocate_only",
             Self::AllocateDuringRebalance => "allocate_during_rebalance",
         }
     }
@@ -111,6 +113,8 @@ struct RebalanceWorkerStats {
     route_refresh_total: u64,
     route_refresh_latencies_us: Vec<u64>,
     monotonicity_violations_total: u64,
+    first_tso: Option<u64>,
+    last_tso: Option<u64>,
     error_counts: HashMap<String, u64>,
 }
 
@@ -131,6 +135,8 @@ struct RebalanceBenchStats {
     route_refresh_total: u64,
     route_refresh_latencies_us: Vec<u64>,
     monotonicity_violations_total: u64,
+    first_tso: Option<u64>,
+    last_tso: Option<u64>,
     error_counts: HashMap<String, u64>,
     transfer_attempts_total: u64,
     transfer_success_total: u64,
@@ -142,6 +148,7 @@ fn parse_scenario(value: &str) -> AppResult<Scenario> {
     match value.trim().to_ascii_lowercase().as_str() {
         "status_scan" => Ok(Scenario::StatusScan),
         "status_scan_filtered" => Ok(Scenario::StatusScanFiltered),
+        "allocate_only" => Ok(Scenario::AllocateOnly),
         "allocate_during_rebalance" => Ok(Scenario::AllocateDuringRebalance),
         other => Err(format!("unsupported control bench scenario: {other}").into()),
     }
@@ -657,14 +664,15 @@ fn next_target_generator(current: u32, targets: &[u32]) -> Option<u32> {
     Some(targets[0])
 }
 
-async fn run_allocate_during_rebalance_bench(
+async fn run_allocation_bench(
     config: &BenchConfig,
     seeded_routes: &[RouteSnapshot],
 ) -> AppResult<RebalanceBenchStats> {
     if seeded_routes.is_empty() {
-        return Err("allocate_during_rebalance requires seeded timelines".into());
+        return Err("allocation scenario requires seeded timelines".into());
     }
-    if config.transfer_target_generators.is_empty()
+    if config.scenario == Scenario::AllocateDuringRebalance
+        && config.transfer_target_generators.is_empty()
         && config.transfer_target_owner_endpoints.is_empty()
     {
         return Err(
@@ -835,6 +843,12 @@ async fn run_allocate_during_rebalance_bench(
                         stats.allocate_tsos_total += count_tsos(&response);
                         stats.monotonicity_violations_total +=
                             record_monotonicity(&mut last_end_by_timeline, &response);
+                        if let Some(first) = response.ranges.first() {
+                            stats.first_tso.get_or_insert(first.start_tso);
+                        }
+                        if let Some(last) = response.ranges.last() {
+                            stats.last_tso = Some(last.end_tso);
+                        }
                     }
 
                     if let Some(mut route) = route_snapshots.get_mut(&response.timeline_key) {
@@ -856,6 +870,7 @@ async fn run_allocate_during_rebalance_bench(
     let transfer_target_owner_endpoints = config.transfer_target_owner_endpoints.clone();
     let transfer_interval_ms = config.transfer_interval_ms;
     let route_to_owners = config.route_to_owners;
+    let transfers_enabled = config.scenario == Scenario::AllocateDuringRebalance;
     let driver_handle = tokio::spawn(async move {
         let mut driver_routes = seeded_routes_for_driver
             .iter()
@@ -865,6 +880,9 @@ async fn run_allocate_during_rebalance_bench(
         let mut transfer_idx = 0usize;
 
         barrier_driver.wait().await;
+        if !transfers_enabled {
+            return Ok(stats);
+        }
         let mut control_clients = BTreeMap::new();
         ensure_control_client(&mut control_clients, &endpoint).await?;
         let mut next_tick = Instant::now();
@@ -966,6 +984,20 @@ async fn run_allocate_during_rebalance_bench(
             .route_refresh_latencies_us
             .extend(stats.route_refresh_latencies_us);
         total.monotonicity_violations_total += stats.monotonicity_violations_total;
+        if let Some(first_tso) = stats.first_tso {
+            total.first_tso = Some(
+                total
+                    .first_tso
+                    .map_or(first_tso, |current| current.min(first_tso)),
+            );
+        }
+        if let Some(last_tso) = stats.last_tso {
+            total.last_tso = Some(
+                total
+                    .last_tso
+                    .map_or(last_tso, |current| current.max(last_tso)),
+            );
+        }
         for (label, count) in stats.error_counts {
             *total.error_counts.entry(label).or_insert(0) += count;
         }
@@ -982,7 +1014,7 @@ async fn run_allocate_during_rebalance_bench(
     Ok(total)
 }
 
-fn print_rebalance_summary(config: &BenchConfig, stats: RebalanceBenchStats) {
+fn print_allocation_summary(config: &BenchConfig, stats: RebalanceBenchStats) {
     let elapsed = config.duration_secs as f64;
     let mut allocate_latencies = stats.allocate_latencies_us;
     let mut transfer_latencies = stats.transfer_latencies_us;
@@ -1028,6 +1060,8 @@ fn print_rebalance_summary(config: &BenchConfig, stats: RebalanceBenchStats) {
             .saturating_sub(stats.allocate_success_total)
     );
     println!("allocate_tsos_total={}", stats.allocate_tsos_total);
+    println!("allocation_first_tso={}", stats.first_tso.unwrap_or(0));
+    println!("allocation_last_tso={}", stats.last_tso.unwrap_or(0));
     println!(
         "allocate_req_per_sec={:.2}",
         stats.allocate_requests_total as f64 / elapsed
@@ -1180,9 +1214,9 @@ async fn main() -> AppResult<()> {
             let stats = run_status_scan_bench(&config).await?;
             print_status_summary(&config, stats);
         }
-        Scenario::AllocateDuringRebalance => {
-            let stats = run_allocate_during_rebalance_bench(&config, &seeded_routes).await?;
-            print_rebalance_summary(&config, stats);
+        Scenario::AllocateOnly | Scenario::AllocateDuringRebalance => {
+            let stats = run_allocation_bench(&config, &seeded_routes).await?;
+            print_allocation_summary(&config, stats);
         }
     }
 
@@ -1204,6 +1238,10 @@ mod tests {
             parse_scenario("allocate_during_rebalance").unwrap(),
             Scenario::AllocateDuringRebalance
         );
+        assert_eq!(
+            parse_scenario("allocate_only").unwrap(),
+            Scenario::AllocateOnly
+        );
     }
 
     #[test]
@@ -1215,6 +1253,35 @@ mod tests {
                 TimelineState::Active as i32,
                 TimelineState::Recovering as i32
             ]
+        );
+    }
+
+    #[test]
+    fn record_monotonicity_rejects_duplicate_or_reversed_ranges() {
+        let response = |start_tso, end_tso| chronos::proto::v1::AllocateTimestampsResponse {
+            timeline_key: "cluster-fault.0".to_owned(),
+            generator_id: 7,
+            epoch: 1,
+            route_version: 1,
+            ranges: vec![chronos::proto::v1::TimestampRange { start_tso, end_tso }],
+        };
+        let mut last_end_by_timeline = HashMap::new();
+
+        assert_eq!(
+            record_monotonicity(&mut last_end_by_timeline, &response(100, 100)),
+            0
+        );
+        assert_eq!(
+            record_monotonicity(&mut last_end_by_timeline, &response(101, 101)),
+            0
+        );
+        assert_eq!(
+            record_monotonicity(&mut last_end_by_timeline, &response(101, 101)),
+            1
+        );
+        assert_eq!(
+            record_monotonicity(&mut last_end_by_timeline, &response(99, 99)),
+            1
         );
     }
 

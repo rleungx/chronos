@@ -214,6 +214,8 @@ jobs:
     env:
       CHRONOS_BUILD_COMMIT: ${{ github.sha }}
       RUST_BACKTRACE: 1
+      CHRONOS_ARTIFACT_DIR: ${{ github.workspace }}/artifacts
+      CHRONOS_KEEP_ARTIFACTS_ON_SUCCESS: 1
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
@@ -239,6 +241,19 @@ jobs:
           exit 1
       - name: Run clustered Layer 4 validation
         run: make test-layer-4-clustered
+      - name: Run clustered etcd leader-loss validation
+        run: make test-cluster-leader-loss
+      - name: Upload clustered leader-loss artifacts
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: chronos-cluster-leader-loss-artifacts
+          path: artifacts/cluster-leader-loss/
+          if-no-files-found: error
+          retention-days: ${{ env.CHRONOS_ARTIFACT_RETENTION_DAYS }}
+      - name: Verify clustered leader-loss evidence
+        if: always()
+        run: bash hack/verify-cluster-leader-loss.sh artifacts/cluster-leader-loss/summary.txt
       - name: Stop clustered etcd
         if: always()
         run: make etcd-cluster-reset

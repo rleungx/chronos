@@ -354,5 +354,9 @@ pods are alive. The activation phase applies the plan ID, StatefulSet replica co
 mapping, and PDB `minAvailable=replicas-1` together. The manifest validator rejects mismatched
 replicas/worker-count/PDB values, and Helm blocks an in-place worker-count change.
 
-You still need environment evidence for clustered etcd quorum behavior, backup/restore drills,
-larger worker counts, staged rollout safety, and production alert threshold tuning.
+`make test-cluster-leader-loss` runs a continuous single-timeline allocation stream against a
+three-member etcd cluster, stops the actual etcd leader, observes a different leader and higher
+Raft term while the stream is still running, and verifies non-overlapping TSO ranges before,
+during, and after the election. It covers quorum-preserving leader loss; separate environment
+evidence is still required for owner-to-etcd network partitions, quorum loss, larger worker counts,
+staged rollout safety, and production alert threshold tuning.

@@ -13,7 +13,7 @@ ARTIFACT_ROOT="${1:-${CHRONOS_ARTIFACT_DIR:-artifacts}}"
 shift || true
 
 if [[ $# -eq 0 ]]; then
-  set -- soak chaos failover auto-failover scale-matrix rebalance restore
+  set -- soak chaos failover auto-failover scale-matrix rebalance restore cluster-leader-loss
 fi
 
 BUILD_INFO="${ARTIFACT_ROOT%/}/BUILD_INFO"
@@ -271,6 +271,13 @@ for target in "$@"; do
         before-probe.log post-snapshot-probe.log restored-replay-probe.log after-restore-probe.log
       bash "${REPO_ROOT}/hack/verify-dr-monotonicity.sh" \
         "${ARTIFACT_ROOT%/}/restore/summary.txt"
+      ;;
+    cluster-leader-loss)
+      verify_dir cluster-leader-loss summary.txt artifact-index.txt chronos.log \
+        fault-span-bench.log post-fault-bench.log \
+        etcd-before.json etcd-after.json
+      bash "${REPO_ROOT}/hack/verify-cluster-leader-loss.sh" \
+        "${ARTIFACT_ROOT%/}/cluster-leader-loss/summary.txt"
       ;;
     *)
       echo "unsupported evidence target: ${target}" >&2
