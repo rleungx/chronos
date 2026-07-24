@@ -110,11 +110,26 @@ fi
 if command -v helm >/dev/null 2>&1; then
   helm lint "${chart}"
   custom_image_rendered="$(helm template chronos "${chart}" --set-string image.tag=0.1.1)"
-  grep -Fq 'image: "ghcr.io/rleungx/chronos:0.1.1"' <<<"${custom_image_rendered}"
-  if helm template chronos "${chart}" \
+  if [[ "$(grep -Fc 'image: "ghcr.io/rleungx/chronos:0.1.1"' <<<"${custom_image_rendered}")" -ne 2 ]]; then
+    echo "Helm chart must render the custom image tag for both Chronos containers" >&2
+    exit 1
+  fi
+  custom_digest="sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  custom_digest_rendered="$(
+    helm template chronos "${chart}" --set-string image.digest="${custom_digest}"
+  )"
+  if [[ "$(grep -Fc "image: \"ghcr.io/rleungx/chronos@${custom_digest}\"" <<<"${custom_digest_rendered}")" -ne 2 ]]; then
+    echo "Helm chart must render the custom image digest for both Chronos containers" >&2
+    exit 1
+  fi
+  if typo_error="$(helm template chronos "${chart}" \
     --set image.digset=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
-    >/dev/null 2>&1; then
+    2>&1 >/dev/null)"; then
     echo "Helm chart accepted unknown image.digset typo" >&2
+    exit 1
+  fi
+  if ! grep -Fq 'Additional property digset is not allowed' <<<"${typo_error}"; then
+    echo "Helm chart rejected image.digset for an unexpected reason: ${typo_error}" >&2
     exit 1
   fi
   if helm template chronos "${chart}" --set ownership.allowUnsafeInPlaceMigration=true >/dev/null 2>&1; then
@@ -124,6 +139,10 @@ if command -v helm >/dev/null 2>&1; then
   rendered="$(mktemp)"
   trap 'rm -f "${rendered}"' EXIT
   helm template chronos "${chart}" --namespace chronos >"${rendered}"
+  if [[ "$(grep -Fc 'image: "ghcr.io/rleungx/chronos:0.1.0"' "${rendered}")" -ne 2 ]]; then
+    echo "Helm chart must render the default image for both Chronos containers" >&2
+    exit 1
+  fi
   grep -Fq "CHRONOS_GENERATOR_OWNERSHIP_MODULO: \"256\"" "${rendered}"
   grep -Fq "CHRONOS_OWNERSHIP_WORKER_COUNT: \"3\"" "${rendered}"
   grep -Fq "CHRONOS_OWNERSHIP_ASSIGNMENT_SEED: \"20260516\"" "${rendered}"
