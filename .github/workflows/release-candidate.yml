@@ -20,12 +20,9 @@ jobs:
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
       - name: Validate root release version surfaces and tag
-        run: |
-          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
-            make CHRONOS_RELEASE_TAG="$GITHUB_REF_NAME" release-version-check
-          else
-            make release-version-check
-          fi
+        env:
+          CHRONOS_RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+        run: make release-version-check
 
   release-check:
     runs-on: ubuntu-latest

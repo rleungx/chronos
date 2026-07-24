@@ -93,7 +93,7 @@ heading before creating the tag. Publish the Go module with the matching subdire
 example `clients/go/v0.1.0`.
 
 ```bash
-make CHRONOS_RELEASE_TAG=v0.1.0 release-version-check
+CHRONOS_RELEASE_TAG=v0.1.0 make release-version-check
 ```
 
 Go, Java, and C++ clients have independent release tags and distributions. Follow

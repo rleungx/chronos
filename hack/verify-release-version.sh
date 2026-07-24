@@ -88,8 +88,35 @@ verify_release_version() {
     ' "${root}/deploy/helm/chronos/values.yaml"
   )"
   docker_version="$(
-    sed -n 's/.*org\.opencontainers\.image\.version="\([^"]*\)".*/\1/p' \
-      "${root}/Dockerfile"
+    awk '
+      function extract_version(line, value) {
+        if (line !~ /org\.opencontainers\.image\.version="[^"]*"/) {
+          return
+        }
+        value = line
+        sub(/^.*org\.opencontainers\.image\.version="/, "", value)
+        sub(/".*$/, "", value)
+        print value
+      }
+      /^[[:space:]]*#/ { next }
+      !in_label && /^[[:space:]]*LABEL[[:space:]]+/ {
+        in_label = 1
+        line = $0
+        sub(/^[[:space:]]*LABEL[[:space:]]+/, "", line)
+        extract_version(line)
+        if (line !~ /\\[[:space:]]*$/) {
+          in_label = 0
+        }
+        next
+      }
+      in_label {
+        line = $0
+        extract_version(line)
+        if (line !~ /\\[[:space:]]*$/) {
+          in_label = 0
+        }
+      }
+    ' "${root}/Dockerfile"
   )"
 
   require_version "Cargo.lock chronos package" "${lock_version}" "${cargo_version}" || return 1
@@ -152,7 +179,8 @@ image:
   tag: "1.2.3"
 EOF
   cat >"${root}/Dockerfile" <<'EOF'
-LABEL org.opencontainers.image.version="1.2.3"
+LABEL org.opencontainers.image.title="chronos" \
+      org.opencontainers.image.version="1.2.3"
 EOF
   cat >"${root}/CHANGELOG.md" <<'EOF'
 ## [Unreleased]
@@ -188,6 +216,18 @@ self_test() {
   expect_failure "a tag that differs from the package version" \
     verify_release_version "${test_dir}" "v1.2.4"
 
+  local hostile_tag
+  local injection_marker="${test_dir}/injected"
+  hostile_tag='v$(touch>'"${injection_marker}"')'
+  git check-ref-format "refs/tags/${hostile_tag}"
+  expect_failure "a hostile but valid git tag" \
+    env CHRONOS_RELEASE_TAG="${hostile_tag}" \
+    make --no-print-directory -C "${REPO_ROOT}" release-version-check
+  if [[ -e "${injection_marker}" ]]; then
+    echo "release-version Make path executed hostile tag content" >&2
+    return 1
+  fi
+
   write_fixture "${test_dir}"
   sed -i.bak 's/version = "1.2.3"/version = "1.2.4"/' "${test_dir}/Cargo.lock"
   expect_failure "Cargo.lock drift" verify_release_version "${test_dir}"
@@ -214,6 +254,15 @@ self_test() {
   write_fixture "${test_dir}"
   sed -i.bak 's/version="1.2.3"/version="1.2.4"/' "${test_dir}/Dockerfile"
   expect_failure "Docker label drift" verify_release_version "${test_dir}"
+
+  write_fixture "${test_dir}"
+  sed -i.bak 's/^LABEL /# LABEL /' "${test_dir}/Dockerfile"
+  expect_failure "a comment-only Docker version label" verify_release_version "${test_dir}"
+
+  write_fixture "${test_dir}"
+  sed -i.bak 's/^LABEL org.opencontainers.image.title="chronos" \\/RUN true/' \
+    "${test_dir}/Dockerfile"
+  expect_failure "an orphaned Docker version value" verify_release_version "${test_dir}"
 
   write_fixture "${test_dir}"
   sed -i.bak 's/\[1.2.3\]/[1.2.4]/' "${test_dir}/CHANGELOG.md"

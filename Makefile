@@ -194,7 +194,7 @@ test-release-version-verifier:
 	bash hack/verify-release-version.sh --self-test
 
 release-version-check:
-	CHRONOS_RELEASE_TAG="$(CHRONOS_RELEASE_TAG)" bash hack/verify-release-version.sh
+	bash hack/verify-release-version.sh
 
 test-layer-1:
 	cargo test --locked --lib --test crate_root_api_smoke --test tso_planes_public_api --test lifecycle_semantics
