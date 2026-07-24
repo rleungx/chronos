@@ -21,6 +21,13 @@ require_non_negative_integer "assignment seed" "${ASSIGNMENT_SEED}"
 require_positive_integer "lease ttl ms" "${LEASE_TTL_MS}"
 require_positive_integer "safety gap ms" "${SAFETY_GAP_MS}"
 
+IDENTITY_GRANT_REQUEST_TTL_SECONDS=$((LEASE_TTL_MS / 1000))
+if [[ $((LEASE_TTL_MS % 1000)) -ne 0 ]]; then
+  IDENTITY_GRANT_REQUEST_TTL_SECONDS=$((IDENTITY_GRANT_REQUEST_TTL_SECONDS + 1))
+fi
+IDENTITY_GRANT_REQUEST_TTL_MS=$((IDENTITY_GRANT_REQUEST_TTL_SECONDS * 1000))
+MINIMUM_IDENTITY_LEASE_WAIT_MS=$((IDENTITY_GRANT_REQUEST_TTL_MS + SAFETY_GAP_MS))
+
 moved_total=0
 stable_total=0
 declare -a incoming_by_new=()
@@ -75,7 +82,11 @@ echo "kubernetes_statefulset_replicas=${NEW_WORKERS}"
 echo "kubernetes_pdb_min_available=$((NEW_WORKERS - 1))"
 echo "kubernetes_configmap_env=CHRONOS_OWNERSHIP_PLAN_ID=${PLAN_ID},CHRONOS_GENERATOR_OWNERSHIP_MODULO=${SHARD_COUNT},CHRONOS_OWNERSHIP_WORKER_COUNT=${NEW_WORKERS},CHRONOS_OWNERSHIP_ASSIGNMENT_SEED=${ASSIGNMENT_SEED}"
 echo "migration_requires_quiesced_ingress=true"
-echo "identity_lease_expiry_wait_ms=$((LEASE_TTL_MS + SAFETY_GAP_MS))"
+echo "identity_lease_ttl_configured_ms=${LEASE_TTL_MS}"
+echo "identity_lease_grant_request_ttl_seconds=${IDENTITY_GRANT_REQUEST_TTL_SECONDS}"
+echo "identity_lease_grant_request_ttl_ms=${IDENTITY_GRANT_REQUEST_TTL_MS}"
+echo "minimum_identity_lease_wait_ms=${MINIMUM_IDENTITY_LEASE_WAIT_MS}"
+echo "activation_requires_identity_prefix_empty=true"
 echo "drain_phase=quiesce_ingress,keep_old_ownership_config,scale_statefulset_to_0,wait_identity_lease_expiry"
 echo "activation_phase=apply_new_ownership_plan,scale_statefulset_to_${NEW_WORKERS},wait_ready,restore_ingress"
 echo "rollout_order=generate_and_archive_plan,quiesce_ingress,scale_statefulset_to_0,wait_identity_lease_expiry,update_configmap,update_statefulset_replicas,wait_ready,restore_ingress,run_scale_matrix,rebalance_if_needed"

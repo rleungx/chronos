@@ -5,7 +5,10 @@ use super::EtcdMetadataStore;
 use super::{
     cluster_format::active_identity_formats_are_compatible,
     identity_claim_matches_record,
-    identity_lifecycle::{await_identity_keepalive_reconnect, await_identity_keepalive_step},
+    identity_lifecycle::{
+        await_identity_keepalive_reconnect, await_identity_keepalive_step,
+        identity_lease_grant_timing, identity_lease_initial_deadline,
+    },
     identity_record_belongs_to_ownership_plan, parse_prev_route, parse_timeline_filter_record,
     route_update_for_watch_event, verify_instance_identity_lease_record,
     InstanceIdentityLeaseRecord, RouteOnlyTimelineRecord, TimelineRoute, TimelineRouteRecord,
@@ -51,6 +54,26 @@ async fn identity_reconnect_after_stream_error_cannot_outlive_confirmed_deadline
 
     assert!(result.is_err());
     assert!(Instant::now() >= backoff_deadline);
+}
+
+#[test]
+fn identity_grant_response_drives_initial_deadline_and_heartbeat_cadence() {
+    let timing = identity_lease_grant_timing(6).expect("positive server grant TTL should be valid");
+    let now = Instant::now();
+    let deadline =
+        identity_lease_initial_deadline(now, timing).expect("six seconds should fit the clock");
+
+    assert_eq!(timing.granted_ttl, Duration::from_secs(6));
+    assert_eq!(timing.heartbeat_interval, Duration::from_secs(2));
+    assert_eq!(deadline.duration_since(now), Duration::from_secs(6));
+}
+
+#[test]
+fn identity_grant_response_rejects_non_positive_ttl_before_claim() {
+    for ttl in [0, -1] {
+        let error = identity_lease_grant_timing(ttl).unwrap_err();
+        assert!(error.to_string().contains("non-positive TTL"));
+    }
 }
 
 fn sample_route(generator_id: u32, route_version: u64) -> TimelineRoute {

@@ -5,6 +5,42 @@ use std::future::Future;
 use tokio::time::error::Elapsed;
 use tokio::time::timeout_at;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct IdentityLeaseGrantTiming {
+    pub(super) granted_ttl: Duration,
+    pub(super) heartbeat_interval: Duration,
+}
+
+pub(super) fn identity_lease_grant_timing(
+    granted_ttl_seconds: i64,
+) -> Result<IdentityLeaseGrantTiming, TsoError> {
+    let granted_ttl_seconds = u64::try_from(granted_ttl_seconds)
+        .ok()
+        .filter(|ttl| *ttl > 0)
+        .ok_or_else(|| {
+            TsoError::Internal(format!(
+                "Etcd identity lease grant returned non-positive TTL: {}",
+                granted_ttl_seconds
+            ))
+        })?;
+    Ok(IdentityLeaseGrantTiming {
+        granted_ttl: Duration::from_secs(granted_ttl_seconds),
+        heartbeat_interval: Duration::from_secs(granted_ttl_seconds.max(3) / 3),
+    })
+}
+
+pub(super) fn identity_lease_initial_deadline(
+    now: Instant,
+    timing: IdentityLeaseGrantTiming,
+) -> Result<Instant, TsoError> {
+    now.checked_add(timing.granted_ttl).ok_or_else(|| {
+        TsoError::Internal(format!(
+            "Etcd identity lease grant TTL {}s exceeds the local monotonic clock range",
+            timing.granted_ttl.as_secs()
+        ))
+    })
+}
+
 pub(super) async fn await_identity_keepalive_step<T>(
     lease_alive_until: Instant,
     future: impl Future<Output = T>,
@@ -334,7 +370,7 @@ impl EtcdMetadataStore {
             worker_id,
             advertise_endpoint
         );
-        let ttl_seconds = ttl.as_secs().max(1) as i64;
+        let request_ttl_seconds = identity_lease_grant_request_ttl_seconds(ttl)?;
         let key = self.instance_identity_key(instance_id);
         let record = InstanceIdentityLeaseRecord {
             instance_id: instance_id.to_owned(),
@@ -346,11 +382,29 @@ impl EtcdMetadataStore {
         };
 
         let revoke_client = self.client.clone();
-        let lease_id = self
-            .etcd_lease_grant(ttl_seconds)
+        let grant_response = self
+            .etcd_lease_grant(request_ttl_seconds)
             .await
-            .map_err(|error| TsoError::Internal(format!("Etcd lease grant failed: {}", error)))?
-            .id();
+            .map_err(|error| TsoError::Internal(format!("Etcd lease grant failed: {}", error)))?;
+        let lease_id = grant_response.id();
+        let granted_ttl_seconds = grant_response.ttl();
+        let grant_timing = match identity_lease_grant_timing(granted_ttl_seconds) {
+            Ok(timing) => timing,
+            Err(error) => {
+                let mut revoke_client = self.client.clone();
+                let _ = revoke_client.lease_revoke(lease_id).await;
+                return Err(error);
+            }
+        };
+        let initial_lease_alive_until =
+            match identity_lease_initial_deadline(Instant::now(), grant_timing) {
+                Ok(deadline) => deadline,
+                Err(error) => {
+                    let mut revoke_client = self.client.clone();
+                    let _ = revoke_client.lease_revoke(lease_id).await;
+                    return Err(error);
+                }
+            };
 
         let value = Self::serialize_record(
             &record,
@@ -369,13 +423,12 @@ impl EtcdMetadataStore {
         let keepalive_client_source = self.client.clone();
         let request_retry_budget = self.request_retry_budget;
         let (lost_tx, lost_rx) = watch::channel(false);
-        let heartbeat_interval = Duration::from_secs((ttl_seconds.max(3) / 3) as u64);
+        let heartbeat_interval = grant_timing.heartbeat_interval;
         let lease_instance_id = instance_id.to_owned();
         let lease_worker_id = worker_id.to_owned();
         let lease_advertise_endpoint = advertise_endpoint.to_owned();
         let keep_alive_task = tokio::spawn(async move {
-            let mut lease_alive_until =
-                Instant::now() + Duration::from_secs(ttl_seconds.max(1) as u64);
+            let mut lease_alive_until = initial_lease_alive_until;
             'keepalive: loop {
                 let keepalive_result =
                     await_identity_keepalive_step(lease_alive_until, keeper.keep_alive()).await;
@@ -385,10 +438,27 @@ impl EtcdMetadataStore {
                             .await
                         {
                             Ok(Ok(Some(response))) if response.ttl() > 0 => {
-                                lease_alive_until = Instant::now()
-                                    + Duration::from_secs(response.ttl().max(1) as u64);
-                                sleep(heartbeat_interval).await;
-                                continue;
+                                let response_ttl = Duration::from_secs(response.ttl() as u64);
+                                match Instant::now().checked_add(response_ttl) {
+                                    Some(deadline) => {
+                                        lease_alive_until = deadline;
+                                        match await_identity_keepalive_step(
+                                            lease_alive_until,
+                                            sleep(heartbeat_interval),
+                                        )
+                                        .await
+                                        {
+                                            Ok(()) => continue,
+                                            Err(_) => {
+                                                "keepalive_heartbeat_deadline_elapsed".to_owned()
+                                            }
+                                        }
+                                    }
+                                    None => format!(
+                                        "keepalive_response_ttl_exceeds_monotonic_clock: {}",
+                                        response.ttl()
+                                    ),
+                                }
                             }
                             Ok(Ok(Some(response))) => {
                                 format!("keepalive_response_non_positive_ttl: {}", response.ttl())
@@ -476,7 +546,10 @@ impl EtcdMetadataStore {
             lease_id,
             instance_id,
             worker_id,
-            advertise_endpoint
+            advertise_endpoint,
+            configured_ttl_ms = %ttl.as_millis(),
+            request_ttl_seconds,
+            granted_ttl_seconds
         );
 
         Ok(InstanceIdentityLease::new(

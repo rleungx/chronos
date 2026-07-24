@@ -1,6 +1,7 @@
 use std::env;
 
-use chronos::TsoConfig;
+use chronos::{metadata::identity_lease_grant_request_ttl_seconds, TsoConfig};
+use tokio::time::Duration;
 
 use crate::AppResult;
 
@@ -33,7 +34,7 @@ pub(crate) async fn run_cli_or_service() -> AppResult<()> {
         CliCommand::PrintEffectiveConfig => {
             let startup = load_startup_config()?;
             let plan = validate_startup_preflight(&startup)?;
-            print_effective_config(&startup, &plan);
+            print_effective_config(&startup, &plan)?;
             Ok(())
         }
         CliCommand::PrintOwnershipEnv => {
@@ -45,7 +46,7 @@ pub(crate) async fn run_cli_or_service() -> AppResult<()> {
             let startup = load_startup_config()?;
             let plan = validate_startup_preflight(&startup)?;
             println!("configuration valid");
-            print_effective_config(&startup, &plan);
+            print_effective_config(&startup, &plan)?;
             Ok(())
         }
     }
@@ -105,7 +106,10 @@ export CHRONOS_LOG_FILTER=info
     );
 }
 
-fn print_effective_config(startup: &LoadedStartupConfig, plan: &ValidatedStartupPlan<'_>) {
+fn print_effective_config(
+    startup: &LoadedStartupConfig,
+    plan: &ValidatedStartupPlan<'_>,
+) -> AppResult<()> {
     println!("build_version={}", chronos::build_version());
     println!("build_commit={}", chronos::build_commit());
     println!("metadata_kind={}", startup.metadata_kind());
@@ -116,7 +120,7 @@ fn print_effective_config(startup: &LoadedStartupConfig, plan: &ValidatedStartup
         "metrics_transport={}",
         metrics_transport_label(plan.metrics_transport())
     );
-    print_config_lines(&startup.config);
+    print_config_lines(&startup.config)?;
     match &startup.metadata {
         StartupMetadata::Memory => println!("metadata_backend=memory"),
         StartupMetadata::Etcd(etcd) => {
@@ -125,9 +129,10 @@ fn print_effective_config(startup: &LoadedStartupConfig, plan: &ValidatedStartup
             println!("etcd_prefix={}", etcd.prefix);
         }
     }
+    Ok(())
 }
 
-fn print_config_lines(config: &TsoConfig) {
+fn print_config_lines(config: &TsoConfig) -> AppResult<()> {
     println!("worker_id={}", config.worker_id);
     println!("instance_id={}", config.effective_instance_id());
     println!("advertise_endpoint={}", config.advertise_endpoint);
@@ -156,6 +161,21 @@ fn print_config_lines(config: &TsoConfig) {
     println!("generator_ownership_remainders={}", remainders);
     println!("safety_gap_ms={}", config.safety_gap_ms);
     println!("max_clock_skew_ms={}", config.max_clock_skew_ms);
+    let identity_ttl = Duration::from_millis(config.lease_ttl_ms);
+    let identity_grant_request_seconds = identity_lease_grant_request_ttl_seconds(identity_ttl)?;
+    let identity_grant_request_ms = u128::try_from(identity_grant_request_seconds)
+        .ok()
+        .and_then(|seconds| seconds.checked_mul(1_000))
+        .ok_or("identity lease grant request TTL milliseconds overflowed u128")?;
+    println!("identity_lease_ttl_configured_ms={}", config.lease_ttl_ms);
+    println!(
+        "identity_lease_grant_request_ttl_seconds={}",
+        identity_grant_request_seconds
+    );
+    println!(
+        "identity_lease_grant_request_ttl_ms={}",
+        identity_grant_request_ms
+    );
     println!("auto_failover_enabled={}", config.auto_failover_enabled);
     println!(
         "auto_failover_interval_ms={}",
@@ -172,6 +192,7 @@ fn print_config_lines(config: &TsoConfig) {
         chronos::metadata::CURRENT_CLUSTER_FORMAT_VERSION
     );
     println!("tso_max_supported_unix_ms={}", chronos::MAX_UNIX_MS);
+    Ok(())
 }
 
 fn metrics_transport_label(transport: MetricsTransport) -> &'static str {

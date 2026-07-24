@@ -51,7 +51,7 @@ use self::retry::{
 
 use super::{
     identity::InstanceIdentityLeaseRecord,
-    keys,
+    identity_lease_grant_request_ttl_seconds, keys,
     types::{
         timeline_route_update_from_routes, RouteUpdateSignal, CURRENT_CLUSTER_FORMAT_VERSION,
         CURRENT_METADATA_SCHEMA_VERSION,

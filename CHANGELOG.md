@@ -8,6 +8,8 @@ tagged.
 
 ## [Unreleased]
 
+- Round identity lease grant requests up to whole seconds, use the server-selected grant TTL for
+  the initial keepalive deadline, and expose configured versus requested identity TTL values.
 - Recover client routes after owner transport failures.
 - Validate failover and rebalance evidence without masking benchmark failures.
 - Align the Go module path and package metadata with the repository layout.

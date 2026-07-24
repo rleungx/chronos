@@ -57,8 +57,18 @@ change as a planned migration, not an in-place toggle. Old and new writers must 
 concurrently against the same etcd prefix. Use this safe sequence:
 
 1. Quiesce allocation and control ingress and confirm clients have stopped creating work.
-2. Scale the StatefulSet to zero and wait at least
-   `CHRONOS_LEASE_TTL_MS + CHRONOS_SAFETY_GAP_MS`.
+2. Scale the StatefulSet to zero and wait at least the plan's
+   `minimum_identity_lease_wait_ms`. This is only the ceil-to-seconds grant request minimum plus
+   `CHRONOS_SAFETY_GAP_MS`; etcd may have selected a longer grant TTL, and live workers update
+   their last-confirmed deadline from every keepalive response. After the minimum wait, do not
+   activate the new plan until an authoritative prefix query confirms that
+   `${CHRONOS_ETCD_PREFIX}/identity/instances/` has no keys:
+
+   ```bash
+   etcdctl get "${CHRONOS_ETCD_PREFIX}/identity/instances/" --prefix
+   ```
+
+   Keep replicas at zero and repeat the query until it is empty.
 3. While replicas remain zero, apply the new binary, cluster format, plan ID, worker count, shard
    count, seed, and PDB.
 4. Scale to the desired replica count.
