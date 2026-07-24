@@ -228,10 +228,13 @@ for target in "$@"; do
       verify_dir soak summary.txt artifact-index.txt chronos.log bench.log status.log status-filtered.log
       assert_metric_at_least "soak_duration_secs" "${ARTIFACT_ROOT%/}/soak/summary.txt" "3600"
       assert_metric_at_least "soak_warmup_secs" "${ARTIFACT_ROOT%/}/soak/summary.txt" "60"
+      assert_metric_at_least "control_duration_secs" "${ARTIFACT_ROOT%/}/soak/summary.txt" "300"
+      assert_metric_at_least "filtered_duration_secs" "${ARTIFACT_ROOT%/}/soak/summary.txt" "300"
       ;;
     chaos)
-      verify_dir chaos summary.txt artifact-index.txt chronos.log recovery-bench.log
+      verify_dir chaos summary.txt artifact-index.txt chronos.log recovery-probe.log recovery-bench.log
       assert_metric_at_least "bench_duration_secs" "${ARTIFACT_ROOT%/}/chaos/summary.txt" "30"
+      assert_metric_at_least "recovery_probe_completed_attempts" "${ARTIFACT_ROOT%/}/chaos/summary.txt" "1"
       ;;
     failover)
       verify_dir failover summary.txt artifact-index.txt failover-bench.log

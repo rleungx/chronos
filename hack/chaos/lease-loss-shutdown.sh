@@ -16,6 +16,8 @@ WAIT_ATTEMPTS="${CHRONOS_CHAOS_WAIT_ATTEMPTS:-60}"
 WAIT_INTERVAL_SECS="${CHRONOS_CHAOS_WAIT_INTERVAL_SECS:-1}"
 IDENTITY_RELEASE_WAIT_ATTEMPTS="${CHRONOS_CHAOS_IDENTITY_RELEASE_WAIT_ATTEMPTS:-80}"
 IDENTITY_RELEASE_POLL_INTERVAL_SECS="${CHRONOS_CHAOS_IDENTITY_RELEASE_POLL_INTERVAL_SECS:-0.25}"
+RECOVERY_PROBE_ATTEMPTS="${CHRONOS_CHAOS_RECOVERY_PROBE_ATTEMPTS:-20}"
+RECOVERY_PROBE_INTERVAL_SECS="${CHRONOS_CHAOS_RECOVERY_PROBE_INTERVAL_SECS:-0.25}"
 UNIQUE_SUFFIX="$(date +%s)-$$"
 ETCD_PREFIX="${CHRONOS_CHAOS_ETCD_PREFIX:-/chronos-chaos-${UNIQUE_SUFFIX}}"
 WORKER_ID="${CHRONOS_CHAOS_WORKER_ID:-worker-chaos}"
@@ -29,11 +31,14 @@ ARTIFACT_ROOT="${CHRONOS_CHAOS_ARTIFACT_DIR:-${CHRONOS_ARTIFACT_DIR:-}}"
 KEEP_ARTIFACTS_ON_SUCCESS="${CHRONOS_CHAOS_KEEP_ARTIFACTS_ON_SUCCESS:-${CHRONOS_KEEP_ARTIFACTS_ON_SUCCESS:-0}}"
 STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
+require_positive_integer "CHRONOS_CHAOS_RECOVERY_PROBE_ATTEMPTS" "${RECOVERY_PROBE_ATTEMPTS}"
+
 if [[ -n "${ARTIFACT_ROOT}" ]]; then
   ARTIFACT_DIR="${ARTIFACT_ROOT%/}/chaos"
   mkdir -p "${ARTIFACT_DIR}"
   KEEP_ARTIFACTS_ON_SUCCESS=1
   CHRONOS_LOG="${ARTIFACT_DIR}/chronos.log"
+  RECOVERY_PROBE_LOG="${ARTIFACT_DIR}/recovery-probe.log"
   RECOVERY_BENCH_LOG="${ARTIFACT_DIR}/recovery-bench.log"
   ETCD_LOG="${ARTIFACT_DIR}/etcd.log"
   DOCKER_PS_LOG="${ARTIFACT_DIR}/docker-ps.txt"
@@ -44,6 +49,7 @@ if [[ -n "${ARTIFACT_ROOT}" ]]; then
 else
   ARTIFACT_DIR=""
   CHRONOS_LOG="$(mktemp -t chronos-chaos.XXXXXX.log)"
+  RECOVERY_PROBE_LOG="$(mktemp -t chronos-chaos-probe.XXXXXX.log)"
   RECOVERY_BENCH_LOG="$(mktemp -t chronos-chaos-bench.XXXXXX.log)"
   ETCD_LOG=""
   DOCKER_PS_LOG=""
@@ -54,6 +60,7 @@ else
 fi
 
 CHRONOS_PID=""
+RECOVERY_PROBE_COMPLETED_ATTEMPTS=0
 RESULT="failure"
 RELEASE_BIN_DIR="${CHRONOS_RELEASE_BIN_DIR:-${REPO_ROOT}/target/release}"
 ADVERTISE_ENDPOINT="$(derive_local_advertise_endpoint "${SERVICE_ENDPOINT}" "chronos-chaos" "${ADVERTISE_ENDPOINT}")"
@@ -72,6 +79,9 @@ metrics_endpoint=${METRICS_ENDPOINT}
 bench_duration_secs=${BENCH_DURATION_SECS}
 identity_release_wait_attempts=${IDENTITY_RELEASE_WAIT_ATTEMPTS}
 identity_release_poll_interval_secs=${IDENTITY_RELEASE_POLL_INTERVAL_SECS}
+recovery_probe_attempts=${RECOVERY_PROBE_ATTEMPTS}
+recovery_probe_completed_attempts=${RECOVERY_PROBE_COMPLETED_ATTEMPTS}
+recovery_probe_interval_secs=${RECOVERY_PROBE_INTERVAL_SECS}
 etcd_prefix=${ETCD_PREFIX}
 worker_id=${WORKER_ID}
 instance_id=${INSTANCE_ID}
@@ -82,6 +92,7 @@ recovery_latency_p999_us_max=${RECOVERY_LATENCY_P999_US_MAX}
 artifact_dir=${ARTIFACT_DIR}
 artifact_index=${INDEX_LOG}
 chronos_log=${CHRONOS_LOG}
+recovery_probe_log=${RECOVERY_PROBE_LOG}
 recovery_bench_log=${RECOVERY_BENCH_LOG}
 EOF
 }
@@ -108,10 +119,11 @@ cleanup() {
   if [[ ${exit_code} -ne 0 ]]; then
     echo
     echo "[chaos] chronos log: ${CHRONOS_LOG}" >&2
+    echo "[chaos] recovery probe log: ${RECOVERY_PROBE_LOG}" >&2
     echo "[chaos] recovery bench log: ${RECOVERY_BENCH_LOG}" >&2
     [[ -n "${ARTIFACT_DIR}" ]] && echo "[chaos] artifacts: ${ARTIFACT_DIR}" >&2
   elif [[ "${KEEP_ARTIFACTS_ON_SUCCESS}" != "1" ]]; then
-    rm -f "${CHRONOS_LOG}" "${RECOVERY_BENCH_LOG}"
+    rm -f "${CHRONOS_LOG}" "${RECOVERY_PROBE_LOG}" "${RECOVERY_BENCH_LOG}"
   fi
 }
 trap cleanup EXIT
@@ -177,6 +189,49 @@ start_chronos() {
   wait_for_http "http://${METRICS_ENDPOINT}/readyz" "chronos readyz" "${WAIT_ATTEMPTS}" "${WAIT_INTERVAL_SECS}"
 }
 
+wait_for_data_plane_recovery() {
+  : >"${RECOVERY_PROBE_LOG}"
+  local attempt
+  local attempt_log
+  attempt_log="$(mktemp -t chronos-chaos-probe-attempt.XXXXXX.log)"
+  for attempt in $(seq 1 "${RECOVERY_PROBE_ATTEMPTS}"); do
+    RECOVERY_PROBE_COMPLETED_ATTEMPTS="${attempt}"
+    if env \
+      CHRONOS_BENCH_ENDPOINT="http://${SERVICE_ENDPOINT}" \
+      CHRONOS_BENCH_SCENARIO="chaos-recovery-probe-${UNIQUE_SUFFIX}" \
+      CHRONOS_BENCH_CONCURRENCY=1 \
+      CHRONOS_BENCH_TIMELINES=1 \
+      CHRONOS_BENCH_BATCH=1 \
+      CHRONOS_BENCH_DURATION_SECS=1 \
+      CHRONOS_BENCH_WARMUP_SECS=0 \
+      CHRONOS_BENCH_REQUEST_TIMEOUT_MS=500 \
+      CHRONOS_BENCH_CLIENT_TIMEOUT_MS=1000 \
+      "${RELEASE_BIN_DIR}/chronos-bench" >"${attempt_log}" 2>&1; then
+      {
+        echo "attempt=${attempt}"
+        cat "${attempt_log}"
+      } >>"${RECOVERY_PROBE_LOG}"
+      if awk -F= '
+        $1 == "requests" { requests = $2 + 0 }
+        $1 == "allocation_failed_total" { failed = $2 + 0 }
+        END { exit !(requests > 0 && failed == 0) }
+      ' "${attempt_log}"; then
+        rm -f "${attempt_log}"
+        return 0
+      fi
+    else
+      {
+        echo "attempt=${attempt}"
+        cat "${attempt_log}"
+      } >>"${RECOVERY_PROBE_LOG}"
+    fi
+    sleep "${RECOVERY_PROBE_INTERVAL_SECS}"
+  done
+  rm -f "${attempt_log}"
+  echo "chronos data plane did not recover after ${RECOVERY_PROBE_ATTEMPTS} probe attempts" >&2
+  return 1
+}
+
 echo "[chaos] resetting etcd"
 make etcd-reset >/dev/null
 echo "[chaos] starting etcd"
@@ -207,6 +262,9 @@ wait_for_identity_release
 
 echo "[chaos] restarting chronos"
 start_chronos
+
+echo "[chaos] waiting for data-plane recovery"
+wait_for_data_plane_recovery
 
 echo "[chaos] running recovery smoke benchmark"
 env \

@@ -1,3 +1,6 @@
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant};
+
 use tonic::Status;
 use tracing::{error, warn};
 
@@ -5,6 +8,42 @@ use crate::timeline_proxy::TimelineProxyError;
 use crate::TsoError;
 
 use super::public_mapping;
+
+const LEASE_WARNING_INTERVAL: Duration = Duration::from_secs(10);
+
+#[derive(Default)]
+struct WarningRateLimitState {
+    last_emitted_at: Option<Instant>,
+    suppressed: u64,
+}
+
+impl WarningRateLimitState {
+    fn take_suppressed_at(&mut self, now: Instant) -> Option<u64> {
+        if self
+            .last_emitted_at
+            .is_some_and(|last| now.duration_since(last) < LEASE_WARNING_INTERVAL)
+        {
+            self.suppressed = self.suppressed.saturating_add(1);
+            return None;
+        }
+
+        self.last_emitted_at = Some(now);
+        Some(std::mem::take(&mut self.suppressed))
+    }
+}
+
+static TIMELINE_LEASE_WARNING_LIMITER: LazyLock<Mutex<WarningRateLimitState>> =
+    LazyLock::new(|| Mutex::new(WarningRateLimitState::default()));
+static GENERATOR_LEASE_WARNING_LIMITER: LazyLock<Mutex<WarningRateLimitState>> =
+    LazyLock::new(|| Mutex::new(WarningRateLimitState::default()));
+
+fn take_suppressed_warning_count(limiter: &Mutex<WarningRateLimitState>) -> Option<u64> {
+    let mut state = match limiter.lock() {
+        Ok(state) => state,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    state.take_suppressed_at(Instant::now())
+}
 
 pub(super) fn map_tso_error(err: TsoError) -> Status {
     trace_runtime_protection(&err);
@@ -20,20 +59,34 @@ pub(super) fn map_timeline_proxy_error(err: TimelineProxyError) -> Status {
 
 fn trace_runtime_protection(err: &TsoError) {
     match err {
-        TsoError::LeaseExpired { timeline_key } => warn!(
-            component = "runtime_protection",
-            event = "lease_expired",
-            result = "failure",
-            reason = "timeline_lease_expired",
-            timeline_key
-        ),
-        TsoError::GeneratorLeaseExpired { generator_id } => warn!(
-            component = "runtime_protection",
-            event = "lease_expired",
-            result = "failure",
-            reason = "generator_lease_expired",
-            generator_id
-        ),
+        TsoError::LeaseExpired { timeline_key } => {
+            if let Some(suppressed_since_last) =
+                take_suppressed_warning_count(&TIMELINE_LEASE_WARNING_LIMITER)
+            {
+                warn!(
+                    component = "runtime_protection",
+                    event = "lease_expired",
+                    result = "failure",
+                    reason = "timeline_lease_expired",
+                    timeline_key,
+                    suppressed_since_last
+                );
+            }
+        }
+        TsoError::GeneratorLeaseExpired { generator_id } => {
+            if let Some(suppressed_since_last) =
+                take_suppressed_warning_count(&GENERATOR_LEASE_WARNING_LIMITER)
+            {
+                warn!(
+                    component = "runtime_protection",
+                    event = "lease_expired",
+                    result = "failure",
+                    reason = "generator_lease_expired",
+                    generator_id,
+                    suppressed_since_last
+                );
+            }
+        }
         TsoError::TimelineIngressSaturated {
             timeline_key,
             max_lanes,
@@ -95,5 +148,21 @@ mod tests {
 
         assert_eq!(status.code(), Code::NotFound);
         assert_eq!(detail.code, ErrorCode::TimelineNotFound as i32);
+    }
+
+    #[test]
+    fn lease_warning_limiter_reports_suppressed_count_per_window() {
+        let mut limiter = WarningRateLimitState::default();
+        let started_at = Instant::now();
+
+        assert_eq!(limiter.take_suppressed_at(started_at), Some(0));
+        assert_eq!(
+            limiter.take_suppressed_at(started_at + Duration::from_secs(1)),
+            None
+        );
+        assert_eq!(
+            limiter.take_suppressed_at(started_at + LEASE_WARNING_INTERVAL),
+            Some(1)
+        );
     }
 }

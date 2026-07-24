@@ -2,6 +2,7 @@ mod coordination;
 mod renewal;
 
 use std::cmp::max;
+use std::collections::VecDeque;
 
 use tokio::time::Instant;
 
@@ -397,8 +398,16 @@ impl TsoService {
             }
             Err(TsoError::CasFailed) => {
                 self.generator_runtime.remove_lease(generator_id);
-                self.ensure_generator_lease_with_cancellation(generator_id, cancellation)
-                    .await
+                let result = self
+                    .ensure_generator_lease_with_cancellation(generator_id, cancellation)
+                    .await;
+                if result.is_err() && self.generator_runtime.lease_state(generator_id).is_none() {
+                    // Keep the entry visible to background maintenance, but do not restore its
+                    // ready token: the CAS conflict means ownership may have changed remotely.
+                    self.generator_runtime
+                        .upsert_lease(generator_id, lease_state);
+                }
+                result
             }
             Err(e) => Err(e),
         }
@@ -453,7 +462,11 @@ impl TsoService {
                 continue;
             };
             if lease_state.lease_expire_at_ms <= now_ms {
-                self.generator_runtime.remove_lease(generator_id);
+                record_recovery_event(
+                    "service",
+                    "batch_generator_refresh",
+                    "expired_lease_tracked",
+                );
                 continue;
             }
 
@@ -515,33 +528,68 @@ impl TsoService {
             return;
         }
 
-        match self.metadata.compare_exchange_generators(&operations).await {
-            Ok(revisions) => {
-                for ((generator_id, mut state), revision) in
-                    next_states.into_iter().zip(revisions.into_iter())
-                {
-                    state.revision = revision;
-                    self.generator_runtime
-                        .mark_generator_ready_for_lease(generator_id, state.generator_lease_token);
-                    self.generator_runtime.upsert_lease(generator_id, state);
-                    self.clear_generator_ownership_drift(generator_id);
+        let mut pending_batches = VecDeque::from([(operations, next_states)]);
+        while let Some((mut batch_operations, mut batch_states)) = pending_batches.pop_front() {
+            match self
+                .metadata
+                .compare_exchange_generators(&batch_operations)
+                .await
+            {
+                Ok(revisions) => {
+                    if revisions.len() != batch_states.len() {
+                        record_recovery_event(
+                            "service",
+                            "batch_generator_refresh",
+                            "invalid_revision_count",
+                        );
+                        continue;
+                    }
+                    for ((generator_id, mut state), revision) in
+                        batch_states.into_iter().zip(revisions.into_iter())
+                    {
+                        state.revision = revision;
+                        self.generator_runtime.mark_generator_ready_for_lease(
+                            generator_id,
+                            state.generator_lease_token,
+                        );
+                        self.generator_runtime.upsert_lease(generator_id, state);
+                        self.clear_generator_ownership_drift(generator_id);
+                    }
                 }
-            }
-            Err(_) => {
-                record_recovery_event("service", "batch_generator_refresh", "batch_cas_failed");
-                for operation in operations {
+                Err(TsoError::CasFailed) if batch_operations.len() > 1 => {
+                    record_recovery_event("service", "batch_generator_refresh", "batch_cas_split");
+                    let split_at = batch_operations.len() / 2;
+                    let right_operations = batch_operations.split_off(split_at);
+                    let right_states = batch_states.split_off(split_at);
+                    pending_batches.push_front((right_operations, right_states));
+                    pending_batches.push_front((batch_operations, batch_states));
+                }
+                Err(TsoError::CasFailed) => {
+                    record_recovery_event(
+                        "service",
+                        "batch_generator_refresh",
+                        "generator_cas_conflict",
+                    );
+                    let generator_id = batch_operations[0].generator_id;
                     let refresh_now_ms = self.clock.now_ms();
                     if self
-                        .refresh_generator_lease(operation.generator_id, refresh_now_ms)
+                        .refresh_generator_lease(generator_id, refresh_now_ms)
                         .await
                         .is_err()
                     {
                         record_recovery_event(
                             "service",
                             "batch_generator_refresh",
-                            "fallback_refresh_failed",
+                            "conflict_refresh_failed",
                         );
                     }
+                }
+                Err(_) => {
+                    record_recovery_event(
+                        "service",
+                        "batch_generator_refresh",
+                        "batch_store_failed",
+                    );
                 }
             }
         }
@@ -1248,6 +1296,122 @@ mod tests {
     #[async_trait]
     impl ControlPlaneStore for FallbackAdvancingLeaseStore {}
 
+    #[derive(Clone, Default)]
+    struct ConflictIsolatingLeaseStore {
+        batch_calls: Arc<StdMutex<Vec<Vec<u32>>>>,
+        single_calls: Arc<StdMutex<Vec<u32>>>,
+    }
+
+    #[async_trait]
+    impl TimelineAuthority for ConflictIsolatingLeaseStore {
+        async fn load_timeline(
+            &self,
+            _timeline_key: &str,
+        ) -> Result<Option<(TimelineRecord, u64)>, TsoError> {
+            Ok(None)
+        }
+
+        async fn list_timelines(&self) -> Result<Vec<TimelineRecord>, TsoError> {
+            Ok(Vec::new())
+        }
+
+        async fn create_timeline(
+            &self,
+            _timeline_key: &str,
+            _record: &TimelineRecord,
+        ) -> Result<u64, TsoError> {
+            Ok(1)
+        }
+
+        async fn compare_exchange_timeline(
+            &self,
+            _timeline_key: &str,
+            _expected_revision: u64,
+            _record: &TimelineRecord,
+        ) -> Result<u64, TsoError> {
+            Ok(1)
+        }
+
+        async fn compare_exchange_timelines(
+            &self,
+            _operations: &[TimelineBatchOp],
+        ) -> Result<Vec<u64>, TsoError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[async_trait]
+    impl GeneratorLeaseAuthority for ConflictIsolatingLeaseStore {
+        async fn load_generator(
+            &self,
+            generator_id: u32,
+        ) -> Result<Option<(GeneratorRecord, u64)>, TsoError> {
+            Ok(Some((
+                GeneratorRecord {
+                    schema_version: 1,
+                    generator_id,
+                    owner_worker_endpoint: "127.0.0.1:50051".into(),
+                    owner_instance_id: "lease-instance".into(),
+                    generator_lease_token: 1,
+                    lease_expire_at_ms: Some(150),
+                    last_issued_tso: None,
+                    issued_upper_bound: None,
+                    updated_at_ms: 100,
+                },
+                1,
+            )))
+        }
+
+        async fn create_generator(
+            &self,
+            _generator_id: u32,
+            _record: &GeneratorRecord,
+        ) -> Result<u64, TsoError> {
+            Ok(1)
+        }
+
+        async fn compare_exchange_generator(
+            &self,
+            generator_id: u32,
+            expected_revision: u64,
+            _record: &GeneratorRecord,
+        ) -> Result<u64, TsoError> {
+            self.single_calls.lock().unwrap().push(generator_id);
+            Ok(expected_revision + 1)
+        }
+
+        async fn compare_exchange_generators(
+            &self,
+            operations: &[GeneratorBatchOp],
+        ) -> Result<Vec<u64>, TsoError> {
+            let generator_ids = operations
+                .iter()
+                .map(|operation| operation.generator_id)
+                .collect::<Vec<_>>();
+            self.batch_calls.lock().unwrap().push(generator_ids.clone());
+            if generator_ids.contains(&1) {
+                Err(TsoError::CasFailed)
+            } else {
+                Ok(operations
+                    .iter()
+                    .map(|operation| operation.previous_revision + 1)
+                    .collect())
+            }
+        }
+    }
+
+    impl RouteUpdateSource for ConflictIsolatingLeaseStore {
+        fn subscribe_route_updates(
+            &self,
+        ) -> broadcast::Receiver<crate::metadata::RouteUpdateSignal> {
+            let (_tx, rx) = broadcast::channel(1);
+            rx
+        }
+    }
+
+    #[async_trait]
+    impl ControlPlaneStore for ConflictIsolatingLeaseStore {}
+
     #[tokio::test]
     async fn refresh_generator_leases_batch_reloads_now_ms_for_fallback_refreshes() {
         let clock = Arc::new(ManualClock::new(100));
@@ -1286,6 +1450,160 @@ mod tests {
         let lease_state = service.generator_runtime.lease_state(0).unwrap();
         assert_eq!(lease_state.lease_expire_at_ms, 180);
         assert_eq!(metadata.compare_exchange_calls.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn refresh_generator_leases_batch_isolates_one_conflicting_generator() {
+        let metadata = Arc::new(ConflictIsolatingLeaseStore::default());
+        let service = TsoService::new(
+            required_test_config(TsoConfig {
+                generator_lease_ttl_ms: 50,
+                lease_ttl_ms: 50,
+                generator_maintenance_interval_ms: 10,
+                ..TsoConfig::default()
+            }),
+            Arc::new(ManualClock::new(100)),
+            metadata.clone(),
+        )
+        .unwrap();
+
+        service.background.begin_shutdown();
+        service.background.drain_tasks().await;
+        for generator_id in 0..4 {
+            service
+                .generator_runtime
+                .mark_generator_ready_for_lease(generator_id, 1);
+            service.generator_runtime.upsert_lease(
+                generator_id,
+                crate::runtime::GeneratorLeaseState {
+                    revision: 1,
+                    owner_instance_id: "lease-instance".into(),
+                    generator_lease_token: 1,
+                    lease_expire_at_ms: 150,
+                    last_persisted_tso: None,
+                    issued_upper_bound: None,
+                },
+            );
+        }
+
+        service
+            .refresh_generator_leases_batch(vec![0, 1, 2, 3])
+            .await;
+
+        assert_eq!(*metadata.single_calls.lock().unwrap(), vec![1]);
+        let batch_calls = metadata.batch_calls.lock().unwrap();
+        assert_eq!(batch_calls.first(), Some(&vec![0, 1, 2, 3]));
+        assert!(batch_calls
+            .iter()
+            .any(|ids| ids.len() > 1 && !ids.contains(&1)));
+        for generator_id in 0..4 {
+            assert_eq!(
+                service
+                    .generator_runtime
+                    .lease_state(generator_id)
+                    .unwrap()
+                    .revision,
+                2
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_generator_leases_batch_keeps_expired_lease_tracked() {
+        let metadata = Arc::new(MemoryMetadataStore::new());
+        metadata
+            .create_generator(
+                0,
+                &GeneratorRecord {
+                    schema_version: 1,
+                    generator_id: 0,
+                    owner_worker_endpoint: "127.0.0.1:50051".into(),
+                    owner_instance_id: "lease-instance".into(),
+                    generator_lease_token: 1,
+                    lease_expire_at_ms: Some(90),
+                    last_issued_tso: None,
+                    issued_upper_bound: None,
+                    updated_at_ms: 50,
+                },
+            )
+            .await
+            .unwrap();
+        let service = TsoService::new(
+            required_test_config(TsoConfig {
+                generator_lease_ttl_ms: 50,
+                lease_ttl_ms: 50,
+                generator_maintenance_interval_ms: 10,
+                safety_gap_ms: 50,
+                ..TsoConfig::default()
+            }),
+            Arc::new(ManualClock::new(100)),
+            metadata,
+        )
+        .unwrap();
+
+        service.background.begin_shutdown();
+        service.background.drain_tasks().await;
+        service
+            .generator_runtime
+            .mark_generator_ready_for_lease(0, 1);
+        service.generator_runtime.upsert_lease(
+            0,
+            crate::runtime::GeneratorLeaseState {
+                revision: 1,
+                owner_instance_id: "lease-instance".into(),
+                generator_lease_token: 1,
+                lease_expire_at_ms: 90,
+                last_persisted_tso: None,
+                issued_upper_bound: None,
+            },
+        );
+
+        service.refresh_generator_leases_batch(vec![0]).await;
+
+        assert!(service.generator_runtime.lease_state(0).is_some());
+        assert_eq!(service.generator_runtime.lease_keys(), vec![0]);
+    }
+
+    #[tokio::test]
+    async fn failed_conflict_reload_keeps_lease_tracked_but_not_ready() {
+        let service = TsoService::new(
+            required_test_config(TsoConfig {
+                generator_lease_ttl_ms: 50,
+                lease_ttl_ms: 50,
+                generator_maintenance_interval_ms: 10,
+                grpc_request_timeout_ms: Some(1),
+                ..TsoConfig::default()
+            }),
+            Arc::new(ManualClock::new(100)),
+            Arc::new(AlwaysCasFailLeaseStore),
+        )
+        .unwrap();
+
+        service.background.begin_shutdown();
+        service.background.drain_tasks().await;
+        service
+            .generator_runtime
+            .mark_generator_ready_for_lease(0, 1);
+        service.generator_runtime.upsert_lease(
+            0,
+            crate::runtime::GeneratorLeaseState {
+                revision: 1,
+                owner_instance_id: "lease-instance".into(),
+                generator_lease_token: 1,
+                lease_expire_at_ms: 150,
+                last_persisted_tso: None,
+                issued_upper_bound: None,
+            },
+        );
+
+        let error = service
+            .refresh_generator_lease_inner(0, 100, true)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, TsoError::CasFailed));
+        assert!(service.generator_runtime.lease_state(0).is_some());
+        assert!(!service.is_generator_lease_valid(0, 100));
     }
 
     #[tokio::test]

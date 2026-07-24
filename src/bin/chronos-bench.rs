@@ -367,6 +367,10 @@ fn format_counts(counts: &BTreeMap<String, u64>) -> String {
         .join(",")
 }
 
+fn operation_is_measured(completed_at: Instant, warmup_until: Instant) -> bool {
+    completed_at >= warmup_until
+}
+
 fn decode_error_detail(status: &Status) -> Option<ErrorDetail> {
     chronos::rpc::decode_error_detail_from_status_details(status.details())
 }
@@ -695,8 +699,9 @@ async fn run() -> AppResult<()> {
                 let result =
                     allocate_timestamps_with_timeout(client, request, client_timeout_ms).await;
                 let elapsed = start.elapsed().as_micros() as u64;
+                let measured = operation_is_measured(Instant::now(), warmup_until);
                 match result {
-                    Ok(_) if start >= warmup_until => {
+                    Ok(_) if measured => {
                         stats.requests += 1;
                         stats.tsos += batch as u64;
                         stats.latencies_us.push(elapsed);
@@ -705,7 +710,7 @@ async fn run() -> AppResult<()> {
                     Err(reason) => {
                         stats.failed += 1;
                         record_count(&mut stats.failure_reasons, &reason);
-                        if start >= warmup_until {
+                        if measured {
                             stats.measured_failed += 1;
                             record_count(&mut stats.measured_failure_reasons, &reason);
                         }
@@ -884,6 +889,21 @@ mod tests {
             format_counts(&counts),
             "client_timeout:1,temporarily_unavailable:2"
         );
+    }
+
+    #[test]
+    fn operation_completing_after_warmup_is_measured() {
+        let warmup_until = Instant::now() + Duration::from_secs(1);
+
+        assert!(!operation_is_measured(
+            warmup_until - Duration::from_millis(1),
+            warmup_until
+        ));
+        assert!(operation_is_measured(warmup_until, warmup_until));
+        assert!(operation_is_measured(
+            warmup_until + Duration::from_millis(1),
+            warmup_until
+        ));
     }
 
     #[test]

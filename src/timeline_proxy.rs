@@ -1,5 +1,5 @@
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::MutexGuard as StdMutexGuard;
@@ -25,6 +25,8 @@ pub struct TimelineScopedAllocator {
 }
 
 const TIMEOUT_CLEANUP_GRACE_MS: u64 = 10;
+const TIMEOUT_STAGE_ALLOCATION: u8 = 0;
+const TIMEOUT_STAGE_SERIALIZER_WAIT: u8 = 1;
 
 struct TimelineSerializer {
     serialize: Mutex<()>,
@@ -79,23 +81,27 @@ impl TimelineScopedAllocator {
         &self,
         request: AllocateTimestampsRequest,
     ) -> Result<AllocateTimestampsResponse, TsoError> {
-        self.allocate_timestamps_cancellable(request, None).await
+        self.allocate_timestamps_cancellable(request, None, None)
+            .await
     }
 
     async fn allocate_timestamps_cancellable(
         &self,
         request: AllocateTimestampsRequest,
         cancellation: Option<RequestCancellation>,
+        timeout_stage: Option<&AtomicU8>,
     ) -> Result<AllocateTimestampsResponse, TsoError> {
         let serializer_lease = self.serializer_for(request.timeline_key.as_str())?;
         let serializer = serializer_lease.serializer.clone();
         let allocation_result = match serializer.serialize.try_lock() {
             Ok(_guard) => {
+                Self::set_timeout_stage(timeout_stage, TIMEOUT_STAGE_ALLOCATION);
                 self.data_plane
                     .allocate_timestamps_with_cancellation(request, cancellation)
                     .await
             }
             Err(_) => {
+                Self::set_timeout_stage(timeout_stage, TIMEOUT_STAGE_SERIALIZER_WAIT);
                 let wait_started = Instant::now();
                 let _guard = Self::lock_serializer_with_cancellation(
                     &serializer_lease.serializer,
@@ -103,6 +109,7 @@ impl TimelineScopedAllocator {
                 )
                 .await?;
                 metrics::TSO_TIMELINE_PROXY_WAIT.observe(wait_started.elapsed().as_secs_f64());
+                Self::set_timeout_stage(timeout_stage, TIMEOUT_STAGE_ALLOCATION);
                 self.data_plane
                     .allocate_timestamps_with_cancellation(request, cancellation)
                     .await
@@ -110,6 +117,23 @@ impl TimelineScopedAllocator {
         };
         drop(serializer_lease);
         allocation_result
+    }
+
+    fn set_timeout_stage(timeout_stage: Option<&AtomicU8>, stage: u8) {
+        if let Some(timeout_stage) = timeout_stage {
+            timeout_stage.store(stage, Ordering::Release);
+        }
+    }
+
+    fn record_timeout(timeout_stage: &AtomicU8) {
+        metrics::TSO_TIMELINE_PROXY_TIMEOUT_TOTAL.inc();
+        let stage = match timeout_stage.load(Ordering::Acquire) {
+            TIMEOUT_STAGE_SERIALIZER_WAIT => "serializer_wait",
+            _ => "allocation",
+        };
+        metrics::TSO_TIMELINE_PROXY_TIMEOUT_STAGE_TOTAL
+            .with_label_values(&[stage])
+            .inc();
     }
 
     async fn lock_serializer_with_cancellation<'a>(
@@ -143,7 +167,12 @@ impl TimelineScopedAllocator {
         }
 
         let cancellation = RequestCancellation::new();
-        let allocation = self.allocate_timestamps_cancellable(request, Some(cancellation.clone()));
+        let timeout_stage = AtomicU8::new(TIMEOUT_STAGE_ALLOCATION);
+        let allocation = self.allocate_timestamps_cancellable(
+            request,
+            Some(cancellation.clone()),
+            Some(&timeout_stage),
+        );
         tokio::pin!(allocation);
 
         tokio::select! {
@@ -151,7 +180,7 @@ impl TimelineScopedAllocator {
                 match result {
                     Ok(response) => Ok(response),
                     Err(TsoError::RequestCancelled) => {
-                        metrics::TSO_TIMELINE_PROXY_TIMEOUT_TOTAL.inc();
+                        Self::record_timeout(&timeout_stage);
                         Err(TimelineProxyError::TimedOut)
                     }
                     Err(error) => Err(TimelineProxyError::Tso(error)),
@@ -161,7 +190,7 @@ impl TimelineScopedAllocator {
                 cancellation.cancel();
                 let cleanup_grace = Duration::from_millis(TIMEOUT_CLEANUP_GRACE_MS.min(timeout_ms as u64));
                 let _ = tokio::time::timeout(cleanup_grace, &mut allocation).await;
-                metrics::TSO_TIMELINE_PROXY_TIMEOUT_TOTAL.inc();
+                Self::record_timeout(&timeout_stage);
                 Err(TimelineProxyError::TimedOut)
             }
         }
@@ -504,6 +533,7 @@ mod tests {
                             client_request_id: "cancelled-serializer-waiter".to_string(),
                         },
                         Some(cancellation),
+                        None,
                     )
                     .await
             })
@@ -528,6 +558,40 @@ mod tests {
         drop(busy_guard);
         drop(lease);
         assert_eq!(allocator.active_references_for_test(timeline_key), Some(0));
+    }
+
+    #[tokio::test]
+    async fn serializer_wait_timeout_records_stage_metric() {
+        let allocator = test_allocator(1);
+        let timeline_key = "proxy.unit.timeout-stage";
+        let lease = allocator.serializer_for(timeline_key).unwrap();
+        let busy_guard = lease.serializer.serialize.lock().await;
+        let before = metrics::TSO_TIMELINE_PROXY_TIMEOUT_STAGE_TOTAL
+            .with_label_values(&["serializer_wait"])
+            .get();
+
+        let result = allocator
+            .allocate_timestamps_with_timeout(
+                AllocateTimestampsRequest {
+                    timeline_key: timeline_key.to_owned(),
+                    count: 1,
+                    expected_epoch: 1,
+                    expected_route_version: 1,
+                    client_request_id: "serializer-wait-timeout".to_owned(),
+                },
+                5,
+            )
+            .await;
+
+        assert!(matches!(result, Err(TimelineProxyError::TimedOut)));
+        assert!(
+            metrics::TSO_TIMELINE_PROXY_TIMEOUT_STAGE_TOTAL
+                .with_label_values(&["serializer_wait"])
+                .get()
+                > before
+        );
+        drop(busy_guard);
+        drop(lease);
     }
 
     #[tokio::test]

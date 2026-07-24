@@ -229,8 +229,12 @@ your hardware, but do not remove the gates.
 
 - Soak: `CHRONOS_SOAK_REQ_PER_SEC_MIN`, `CHRONOS_SOAK_LATENCY_P95_US_MAX`,
   `CHRONOS_SOAK_LATENCY_P99_US_MAX`, `CHRONOS_SOAK_LATENCY_P999_US_MAX`,
+  `CHRONOS_SOAK_CONTROL_DURATION_SECS`, `CHRONOS_SOAK_FILTERED_DURATION_SECS`,
   `CHRONOS_SOAK_CONTROL_RPC_P999_US_MAX`, `CHRONOS_SOAK_CONTROL_SCAN_P999_US_MAX`,
-  `CHRONOS_SOAK_FILTERED_RPC_P999_US_MAX`, `CHRONOS_SOAK_FILTERED_SCAN_P999_US_MAX`
+  `CHRONOS_SOAK_FILTERED_RPC_P999_US_MAX`, `CHRONOS_SOAK_FILTERED_SCAN_P999_US_MAX`. The allocation
+  phase defaults to 3600 seconds; the two control-plane phases default to 300 seconds each. When
+  `CHRONOS_SOAK_DURATION_SECS` is explicitly set for a quick run, both control phases inherit it
+  unless their dedicated duration variables are also set.
 - Allocation bench: `CHRONOS_BENCH_IDEMPOTENCY` defaults to `false` for hot-path performance, and
   `CHRONOS_BENCH_REQUEST_TIMEOUT_MS` defaults to `1000`. Use
   `CHRONOS_BENCH_CLIENT_TIMEOUT_MS` to set the benchmark client's protection timeout separately
@@ -250,7 +254,9 @@ your hardware, but do not remove the gates.
   explicitly validating request-record idempotency cost.
 - Chaos recovery: `CHRONOS_CHAOS_RECOVERY_REQ_PER_SEC_MIN`,
   `CHRONOS_CHAOS_RECOVERY_LATENCY_P95_US_MAX`,
-  `CHRONOS_CHAOS_RECOVERY_LATENCY_P999_US_MAX`
+  `CHRONOS_CHAOS_RECOVERY_LATENCY_P999_US_MAX`,
+  `CHRONOS_CHAOS_RECOVERY_PROBE_ATTEMPTS`. Chaos recovery requires a successful allocation probe
+  after `/readyz` and before the measured recovery window.
 - Failover: `CHRONOS_FAILOVER_ALLOCATE_SUCCESS_PER_SEC_MIN`,
   `CHRONOS_FAILOVER_ALLOCATE_LATENCY_P95_US_MAX`,
   `CHRONOS_FAILOVER_ALLOCATE_LATENCY_P999_US_MAX`,

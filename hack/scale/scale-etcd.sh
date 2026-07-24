@@ -544,7 +544,6 @@ cleanup() {
   write_profile_summary
   write_summary
   write_artifact_index "${ARTIFACT_DIR}" "${INDEX_LOG}"
-  make etcd-reset >/dev/null 2>&1 || true
   local pid
   if [[ "${#CHRONOS_PIDS[@]}" -gt 0 ]]; then
     for pid in "${CHRONOS_PIDS[@]}"; do

@@ -31,9 +31,11 @@ make test-restore-dr
 bash hack/verify-evidence.sh artifacts/release-gate
 ```
 
-The production gate runs a one-hour soak, at least 30 seconds of post-chaos traffic, 60-second
-failover windows, and the fixed 2/3/5/8 scale matrix with an 80% linear-efficiency floor. It does
-not accept the single-host plateau escape hatch. For local iteration use `make test-soak-quick`,
+The production gate runs a one-hour allocation soak followed by two five-minute control-plane
+status passes, at least 30 seconds of post-chaos traffic, 60-second failover windows, and the fixed
+2/3/5/8 scale matrix with an 80% linear-efficiency floor. Scheduled and release-candidate soak jobs
+reserve 90 minutes for that workload plus setup and teardown. The gate does not accept the
+single-host plateau escape hatch. For local iteration use `make test-soak-quick`,
 `make test-chaos-quick`, and `make test-failover-bench-quick`; quick evidence is intentionally not
 eligible for release promotion.
 

@@ -253,6 +253,13 @@ pub static TSO_TIMELINE_PROXY_TIMEOUT_TOTAL: LazyLock<IntCounter> = LazyLock::ne
         "Total number of timeline proxy timeout events",
     )
 });
+pub static TSO_TIMELINE_PROXY_TIMEOUT_STAGE_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec_metric(
+        "tso_timeline_proxy_timeout_stage_total",
+        "Timeline proxy timeout events by the stage active at the deadline",
+        &["stage"],
+    )
+});
 pub static TSO_WATCH_RESYNC_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     register_int_counter_vec_metric(
         "tso_watch_resync_total",

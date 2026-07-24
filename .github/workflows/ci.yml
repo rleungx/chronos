@@ -22,7 +22,7 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
       - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c
         with:
-          go-version-file: clients/go/go.mod
+          go-version: '1.25.x'
       - name: Install actionlint
         run: go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
       - name: Validate GitHub Actions workflows
@@ -245,7 +245,7 @@ jobs:
 
   soak-real-etcd:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 90
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     needs:
       - release-artifacts

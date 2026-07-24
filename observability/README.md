@@ -51,6 +51,7 @@ validation, dashboard assets, and links to the runbooks that explain what to do 
 - `ChronosMetadataErrors`
 - `ChronosWatchResyncs`
 - `ChronosProxySaturation`
+- `ChronosProxyTimeouts`
 - `ChronosStartupPreflightFailures`
 - `ChronosStartupBootstrapFailures`
 
@@ -78,9 +79,11 @@ The overview dashboard is intended to answer four operator questions quickly:
 ## Local validation harnesses
 
 - `make test-soak` runs an etcd-backed release-mode soak/load sanity sequence using
-  `chronos-bench` and `chronos-control-bench`.
+  a one-hour `chronos-bench` allocation phase and two five-minute `chronos-control-bench` status
+  phases.
 - `make test-chaos` injects an etcd failure, verifies Chronos degrades or exits, restores etcd,
-  restarts Chronos, and runs a recovery smoke benchmark.
+  restarts Chronos, waits for a successful data-plane allocation probe, and runs a recovery smoke
+  benchmark.
 
 Both harnesses honor `CHRONOS_ARTIFACT_DIR`. When it is set, they retain:
 
@@ -88,6 +91,7 @@ Both harnesses honor `CHRONOS_ARTIFACT_DIR`. When it is set, they retain:
 - `artifact-index.txt`
 - `chronos.log`
 - bench/control-plane logs
+- `recovery-probe.log` for chaos runs
 - `readyz.txt`
 - `metrics.txt`
 - `docker-ps.txt`
@@ -99,9 +103,15 @@ downloadable artifacts instead of only console output.
 Useful overrides for local runs:
 
 - `CHRONOS_ARTIFACT_DIR=/path/to/artifacts`
-- `CHRONOS_SOAK_DURATION_SECS`, `CHRONOS_SOAK_WARMUP_SECS`
+- `CHRONOS_SOAK_DURATION_SECS`, `CHRONOS_SOAK_CONTROL_DURATION_SECS`,
+  `CHRONOS_SOAK_FILTERED_DURATION_SECS`, `CHRONOS_SOAK_WARMUP_SECS`
 - `CHRONOS_SOAK_CONTROL_TIMELINES`, `CHRONOS_SOAK_CONCURRENCY`
 - `CHRONOS_CHAOS_BENCH_DURATION_SECS`
+
+When `tso_timeline_proxy_timeout_total` increases, use
+`tso_timeline_proxy_timeout_stage_total{stage="serializer_wait"}` and
+`tso_timeline_proxy_timeout_stage_total{stage="allocation"}` to distinguish queueing behind the
+per-timeline serializer from time spent inside allocation.
 
 ## CI artifact handoff
 

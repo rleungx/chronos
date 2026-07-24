@@ -107,6 +107,7 @@ impl TsoService {
             return;
         };
         let mut interval = tokio::time::interval(Duration::from_millis(interval_ms));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 changed = shutdown_rx.changed() => {
