@@ -27,6 +27,10 @@ if [[ -n "${ARTIFACT_ROOT}" ]]; then
   KEEP_ARTIFACTS_ON_SUCCESS=1
   CHRONOS_LOG="${ARTIFACT_DIR}/chronos.log"
   CONTROL_LOG="${ARTIFACT_DIR}/restore-control.log"
+  BEFORE_PROBE_LOG="${ARTIFACT_DIR}/before-probe.log"
+  POST_SNAPSHOT_PROBE_LOG="${ARTIFACT_DIR}/post-snapshot-probe.log"
+  RESTORED_REPLAY_PROBE_LOG="${ARTIFACT_DIR}/restored-replay-probe.log"
+  AFTER_RESTORE_PROBE_LOG="${ARTIFACT_DIR}/after-restore-probe.log"
   SNAPSHOT_FILE="${ARTIFACT_DIR}/snapshot.db"
   SUMMARY_LOG="${ARTIFACT_DIR}/summary.txt"
   INDEX_LOG="${ARTIFACT_DIR}/artifact-index.txt"
@@ -34,13 +38,23 @@ else
   ARTIFACT_DIR=""
   CHRONOS_LOG="$(mktemp -t chronos-restore.XXXXXX.log)"
   CONTROL_LOG="$(mktemp -t chronos-restore-control.XXXXXX.log)"
+  BEFORE_PROBE_LOG="$(mktemp -t chronos-restore-before-probe.XXXXXX.log)"
+  POST_SNAPSHOT_PROBE_LOG="$(mktemp -t chronos-restore-post-snapshot-probe.XXXXXX.log)"
+  RESTORED_REPLAY_PROBE_LOG="$(mktemp -t chronos-restore-replay-probe.XXXXXX.log)"
+  AFTER_RESTORE_PROBE_LOG="$(mktemp -t chronos-restore-after-probe.XXXXXX.log)"
   SNAPSHOT_FILE="$(mktemp -t chronos-restore-snapshot.XXXXXX.db)"
-  SUMMARY_LOG=""
+  SUMMARY_LOG="$(mktemp -t chronos-restore-summary.XXXXXX.txt)"
   INDEX_LOG=""
 fi
 
 RESULT="failure"
 CHRONOS_PID=""
+BEFORE_HIGH_WATER=""
+POST_SNAPSHOT_HIGH_WATER=""
+PERSISTED_RECOVERY_FLOOR=""
+RESTORED_REQUEST_REPLAY_TSO=""
+AFTER_FIRST_TSO=""
+IDEMPOTENCY_REPLAY_VERIFIED="false"
 RELEASE_BIN_DIR="${CHRONOS_RELEASE_BIN_DIR:-${REPO_ROOT}/target/release}"
 ADVERTISE_ENDPOINT="$(derive_local_advertise_endpoint "${SERVICE_ENDPOINT}" "chronos-restore" "${ADVERTISE_ENDPOINT}")"
 
@@ -58,10 +72,35 @@ instance_id_before=${INSTANCE_ID_BEFORE}
 instance_id_after=${INSTANCE_ID_AFTER}
 etcd_prefix=${ETCD_PREFIX}
 worker_id=${WORKER_ID}
+before_high_water=${BEFORE_HIGH_WATER}
+post_snapshot_high_water=${POST_SNAPSHOT_HIGH_WATER}
+persisted_recovery_floor=${PERSISTED_RECOVERY_FLOOR}
+restored_request_replay_tso=${RESTORED_REQUEST_REPLAY_TSO}
+after_first_tso=${AFTER_FIRST_TSO}
+idempotency_replay_verified=${IDEMPOTENCY_REPLAY_VERIFIED}
 snapshot_file=${SNAPSHOT_FILE}
 chronos_log=${CHRONOS_LOG}
 control_log=${CONTROL_LOG}
+before_probe_log=${BEFORE_PROBE_LOG}
+post_snapshot_probe_log=${POST_SNAPSHOT_PROBE_LOG}
+restored_replay_probe_log=${RESTORED_REPLAY_PROBE_LOG}
+after_restore_probe_log=${AFTER_RESTORE_PROBE_LOG}
 EOF
+}
+
+run_allocation_probe() {
+  local request_id=$1
+  local output_log=$2
+  env \
+    CHRONOS_BENCH_ENDPOINT="http://${SERVICE_ENDPOINT}" \
+    CHRONOS_BENCH_CONTROL_ENDPOINTS="http://${SERVICE_ENDPOINT}" \
+    CHRONOS_BENCH_SCENARIO="restore-${UNIQUE_SUFFIX}" \
+    CHRONOS_BENCH_TIMELINES=1 \
+    CHRONOS_BENCH_BATCH=1 \
+    CHRONOS_BENCH_IDEMPOTENCY=true \
+    CHRONOS_BENCH_PROBE_ONLY=true \
+    CHRONOS_BENCH_PROBE_REQUEST_ID="${request_id}" \
+    "${RELEASE_BIN_DIR}/chronos-bench" | tee "${output_log}"
 }
 
 cleanup() {
@@ -82,7 +121,7 @@ make etcd-reset >/dev/null
 make etcd-up >/dev/null
 wait_for_etcd 60 1
 
-ensure_release_binaries "${RELEASE_BIN_DIR}" chronos chronos-control-bench
+ensure_release_binaries "${RELEASE_BIN_DIR}" chronos chronos-bench chronos-control-bench
 
 env \
   CHRONOS_SECURITY_MODE=dev-insecure \
@@ -112,9 +151,18 @@ env \
   CHRONOS_CONTROL_BENCH_WARMUP_SECS=1 \
   "${RELEASE_BIN_DIR}/chronos-control-bench" | tee "${CONTROL_LOG}"
 
+run_allocation_probe "before-${UNIQUE_SUFFIX}" "${BEFORE_PROBE_LOG}"
+BEFORE_HIGH_WATER="$(extract_metric "probe_last_tso" "${BEFORE_PROBE_LOG}")"
+GENERATOR_ID="$(extract_metric "probe_generator_id" "${BEFORE_PROBE_LOG}")"
+BEFORE_REPLAY_VERIFIED="$(extract_metric "probe_idempotency_replay_verified" "${BEFORE_PROBE_LOG}")"
+
 docker exec -e ETCDCTL_API=3 chronos-etcd etcdctl --endpoints="http://${ETCD_ENDPOINTS}" snapshot save /tmp/restore.db >/dev/null
 docker cp chronos-etcd:/tmp/restore.db "${SNAPSHOT_FILE}" >/dev/null
 docker exec chronos-etcd etcdutl snapshot status /tmp/restore.db -w table >/dev/null
+
+run_allocation_probe "post-snapshot-${UNIQUE_SUFFIX}" "${POST_SNAPSHOT_PROBE_LOG}"
+POST_SNAPSHOT_HIGH_WATER="$(extract_metric "probe_last_tso" "${POST_SNAPSHOT_PROBE_LOG}")"
+POST_SNAPSHOT_REPLAY_VERIFIED="$(extract_metric "probe_idempotency_replay_verified" "${POST_SNAPSHOT_PROBE_LOG}")"
 
 kill "${CHRONOS_PID}" >/dev/null 2>&1 || true
 wait "${CHRONOS_PID}" 2>/dev/null || true
@@ -146,6 +194,20 @@ for _ in $(seq 1 60); do
   sleep 1
 done
 
+GENERATOR_RECORD="$(
+  docker exec -e ETCDCTL_API=3 chronos-etcd-restore /usr/local/bin/etcdctl \
+    --endpoints="http://127.0.0.1:2379" \
+    get "${ETCD_PREFIX}/generators/${GENERATOR_ID}" --print-value-only
+)"
+PERSISTED_RECOVERY_FLOOR="$(
+  python3 -c 'import json, sys
+record = json.load(sys.stdin)
+floors = [value for value in (record.get("last_issued_tso"), record.get("issued_upper_bound")) if value is not None]
+if not floors:
+    raise SystemExit("generator record has no persisted recovery floor")
+print(max(floors))' <<<"${GENERATOR_RECORD}"
+)"
+
 env \
   CHRONOS_SECURITY_MODE=dev-insecure \
   CHRONOS_METADATA=etcd \
@@ -174,7 +236,24 @@ env \
   CHRONOS_CONTROL_BENCH_WARMUP_SECS=1 \
   "${RELEASE_BIN_DIR}/chronos-control-bench" | tee -a "${CONTROL_LOG}"
 
+run_allocation_probe "before-${UNIQUE_SUFFIX}" "${RESTORED_REPLAY_PROBE_LOG}"
+RESTORED_REQUEST_REPLAY_TSO="$(extract_metric "probe_last_tso" "${RESTORED_REPLAY_PROBE_LOG}")"
+RESTORED_REQUEST_REPLAY_VERIFIED="$(
+  extract_metric "probe_idempotency_replay_verified" "${RESTORED_REPLAY_PROBE_LOG}"
+)"
+
+run_allocation_probe "after-restore-${UNIQUE_SUFFIX}" "${AFTER_RESTORE_PROBE_LOG}"
+AFTER_FIRST_TSO="$(extract_metric "probe_first_tso" "${AFTER_RESTORE_PROBE_LOG}")"
+AFTER_RESTORE_REPLAY_VERIFIED="$(extract_metric "probe_idempotency_replay_verified" "${AFTER_RESTORE_PROBE_LOG}")"
+if [[ "${BEFORE_REPLAY_VERIFIED}" == "true" &&
+  "${POST_SNAPSHOT_REPLAY_VERIFIED}" == "true" &&
+  "${RESTORED_REQUEST_REPLAY_VERIFIED}" == "true" &&
+  "${AFTER_RESTORE_REPLAY_VERIFIED}" == "true" ]]; then
+  IDEMPOTENCY_REPLAY_VERIFIED="true"
+fi
+
 RESULT="success"
 write_summary
+bash "${REPO_ROOT}/hack/verify-dr-monotonicity.sh" "${SUMMARY_LOG}"
 write_artifact_index "${ARTIFACT_DIR}" "${INDEX_LOG}"
 echo "[restore] success"

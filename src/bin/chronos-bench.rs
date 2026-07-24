@@ -57,6 +57,8 @@ struct BenchConfig {
     route_to_owners: bool,
     owner_endpoint_filter: BTreeSet<String>,
     owner_affinity: bool,
+    probe_only: bool,
+    probe_request_id: String,
     cold_probe_enabled: bool,
     cold_probe_concurrency: usize,
     cold_request_timeout_ms: u64,
@@ -108,6 +110,14 @@ struct ColdProbeStats {
     latencies_us: Vec<u64>,
 }
 
+struct ProbeResult {
+    timeline_key: String,
+    generator_id: u32,
+    first_tso: u64,
+    last_tso: u64,
+    idempotency_replay_verified: bool,
+}
+
 fn parse_resource_tier(value: &str) -> ResourceTier {
     match value.to_ascii_lowercase().as_str() {
         "shared" => ResourceTier::Shared,
@@ -150,6 +160,8 @@ fn load_config() -> BenchConfig {
     let route_to_owners = env_bool_or("CHRONOS_BENCH_ROUTE_TO_OWNERS", false);
     let owner_endpoint_filter = parse_endpoint_filter("CHRONOS_BENCH_OWNER_ENDPOINT_FILTER");
     let owner_affinity = env_bool_or("CHRONOS_BENCH_OWNER_AFFINITY", route_to_owners);
+    let probe_only = env_bool_or("CHRONOS_BENCH_PROBE_ONLY", false);
+    let probe_request_id = env_or_string("CHRONOS_BENCH_PROBE_REQUEST_ID", "probe");
     let cold_probe_enabled = env_bool_or("CHRONOS_BENCH_COLD_PROBE", false);
     let cold_probe_concurrency = env_or(
         "CHRONOS_BENCH_COLD_PROBE_CONCURRENCY",
@@ -178,6 +190,8 @@ fn load_config() -> BenchConfig {
         route_to_owners,
         owner_endpoint_filter,
         owner_affinity,
+        probe_only,
+        probe_request_id,
         cold_probe_enabled,
         cold_probe_concurrency,
         cold_request_timeout_ms,
@@ -419,6 +433,48 @@ fn allocation_error_label(status: &Status) -> String {
         .to_owned()
 }
 
+fn probe_bounds(
+    response: &AllocateTimestampsResponse,
+    expected_count: u32,
+) -> AppResult<(u64, u64)> {
+    let first_tso = response
+        .ranges
+        .first()
+        .map(|range| range.start_tso)
+        .ok_or("probe allocation returned no ranges")?;
+    let last_tso = response
+        .ranges
+        .last()
+        .map(|range| range.end_tso)
+        .ok_or("probe allocation returned no ranges")?;
+    let mut allocated = 0u64;
+    for range in &response.ranges {
+        if range.end_tso < range.start_tso {
+            return Err("probe allocation returned an invalid range".into());
+        }
+        allocated = allocated
+            .checked_add(range.end_tso - range.start_tso + 1)
+            .ok_or("probe allocation range count overflowed")?;
+    }
+    if allocated != expected_count as u64 {
+        return Err(format!(
+            "probe allocation returned {allocated} timestamps, expected {expected_count}"
+        )
+        .into());
+    }
+    Ok((first_tso, last_tso))
+}
+
+fn verify_idempotent_replay(
+    original: &AllocateTimestampsResponse,
+    replay: &AllocateTimestampsResponse,
+) -> AppResult<()> {
+    if original != replay {
+        return Err("probe idempotency replay returned a different allocation response".into());
+    }
+    Ok(())
+}
+
 async fn allocate_timestamps_with_timeout(
     client: &mut TimestampServiceClient<Channel>,
     request: Request<AllocateTimestampsRequest>,
@@ -499,6 +555,70 @@ fn affinity_group_assignment(global_worker_idx: usize, group_count: usize) -> (u
         global_worker_idx % group_count,
         global_worker_idx / group_count,
     )
+}
+
+async fn run_probe(
+    config: &BenchConfig,
+    routes: &[BenchRoute],
+    allocation_channels: &ChannelPools,
+) -> AppResult<ProbeResult> {
+    if routes.len() != 1 {
+        return Err(format!(
+            "probe-only mode requires exactly one timeline, got {}",
+            routes.len()
+        )
+        .into());
+    }
+    if !config.idempotency_enabled || config.probe_request_id.is_empty() {
+        return Err(
+            "probe-only mode requires CHRONOS_BENCH_IDEMPOTENCY=true and a non-empty CHRONOS_BENCH_PROBE_REQUEST_ID"
+                .into(),
+        );
+    }
+
+    let route = &routes[0];
+    let allocation_endpoint = route.allocation_endpoint(&config.endpoint, config.route_to_owners);
+    let mut clients = clients_from_channel_pools(allocation_channels);
+    let client = pooled_client_mut(&mut clients, &allocation_endpoint, 0)?;
+    let allocation_request = AllocateTimestampsRequest {
+        timeline_key: route.timeline_key.clone(),
+        count: config.batch,
+        expected_epoch: route.epoch,
+        expected_route_version: route.route_version,
+        client_request_id: if config.idempotency_enabled {
+            config.probe_request_id.clone()
+        } else {
+            String::new()
+        },
+        request_timeout_ms: config.request_timeout_ms.min(u32::MAX as u64) as u32,
+    };
+    let response = allocate_timestamps_with_timeout(
+        client,
+        Request::new(allocation_request.clone()),
+        config.client_timeout_ms,
+    )
+    .await
+    .map_err(|reason| format!("probe allocation failed: {reason}"))?
+    .into_inner();
+    let (first_tso, last_tso) = probe_bounds(&response, config.batch)?;
+
+    let replay = allocate_timestamps_with_timeout(
+        client,
+        Request::new(allocation_request),
+        config.client_timeout_ms,
+    )
+    .await
+    .map_err(|reason| format!("probe idempotency replay failed: {reason}"))?
+    .into_inner();
+    verify_idempotent_replay(&response, &replay)?;
+
+    Ok(ProbeResult {
+        timeline_key: response.timeline_key,
+        generator_id: response.generator_id,
+        first_tso,
+        last_tso,
+        idempotency_replay_verified: true,
+    })
 }
 
 async fn run_cold_probe(
@@ -611,6 +731,19 @@ async fn run() -> AppResult<()> {
         )
         .await?,
     );
+    if config.probe_only {
+        let probe = run_probe(&config, &routes, &allocation_channels).await?;
+        println!("scenario={}", config.scenario);
+        println!("probe_timeline_key={}", probe.timeline_key);
+        println!("probe_generator_id={}", probe.generator_id);
+        println!("probe_first_tso={}", probe.first_tso);
+        println!("probe_last_tso={}", probe.last_tso);
+        println!(
+            "probe_idempotency_replay_verified={}",
+            probe.idempotency_replay_verified
+        );
+        return Ok(());
+    }
     let cold_probe_stats =
         run_cold_probe(&config, routes.clone(), allocation_channels.clone()).await?;
     let affinity_groups = Arc::new(if config.owner_affinity {
@@ -873,6 +1006,43 @@ mod tests {
         let status = Status::unavailable("connection refused");
 
         assert_eq!(allocation_error_label(&status), "transport_unavailable");
+    }
+
+    #[test]
+    fn probe_bounds_require_the_expected_allocation_count() {
+        let response = AllocateTimestampsResponse {
+            timeline_key: "bench.restore.0".to_owned(),
+            generator_id: 7,
+            epoch: 1,
+            route_version: 1,
+            ranges: vec![chronos::proto::v1::TimestampRange {
+                start_tso: 100,
+                end_tso: 101,
+            }],
+        };
+
+        assert_eq!(probe_bounds(&response, 2).unwrap(), (100, 101));
+        assert!(probe_bounds(&response, 1).is_err());
+    }
+
+    #[test]
+    fn probe_idempotency_replay_rejects_a_different_range() {
+        let original = AllocateTimestampsResponse {
+            timeline_key: "bench.restore.0".to_owned(),
+            generator_id: 7,
+            epoch: 1,
+            route_version: 1,
+            ranges: vec![chronos::proto::v1::TimestampRange {
+                start_tso: 100,
+                end_tso: 100,
+            }],
+        };
+        let mut replay = original.clone();
+
+        assert!(verify_idempotent_replay(&original, &replay).is_ok());
+        replay.ranges[0].start_tso = 101;
+        replay.ranges[0].end_tso = 101;
+        assert!(verify_idempotent_replay(&original, &replay).is_err());
     }
 
     #[test]

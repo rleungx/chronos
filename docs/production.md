@@ -257,6 +257,13 @@ your hardware, but do not remove the gates.
   `CHRONOS_CHAOS_RECOVERY_LATENCY_P999_US_MAX`,
   `CHRONOS_CHAOS_RECOVERY_PROBE_ATTEMPTS`. Chaos recovery requires a successful allocation probe
   after `/readyz` and before the measured recovery window.
+- Restore DR: `make test-restore-dr` records an allocation before the snapshot, another acknowledged
+  allocation after the snapshot, the recovery floor read from the restored snapshot, and the first
+  fresh allocation after restore. The evidence gate requires
+  `before_high_water <= persisted_recovery_floor`,
+  `before_high_water < post_snapshot_high_water`, and
+  `after_first_tso > max(persisted_recovery_floor, post_snapshot_high_water)`. It also verifies that
+  replaying the snapshotted request ID returns its original range.
 - Failover: `CHRONOS_FAILOVER_ALLOCATE_SUCCESS_PER_SEC_MIN`,
   `CHRONOS_FAILOVER_ALLOCATE_LATENCY_P95_US_MAX`,
   `CHRONOS_FAILOVER_ALLOCATE_LATENCY_P999_US_MAX`,

@@ -32,6 +32,7 @@ ETCD_ENDPOINTS ?= 127.0.0.1:2379
 	test-soak-quick \
 	test-chaos \
 	test-chaos-quick \
+	test-dr-monotonicity-verifier \
 	test-restore-dr \
 	promtool-check \
 	observability-check \
@@ -268,6 +269,9 @@ test-chaos-quick:
 	CHRONOS_CHAOS_BENCH_DURATION_SECS=5 \
 	$(MAKE) test-chaos
 
+test-dr-monotonicity-verifier:
+	bash hack/verify-dr-monotonicity.sh --self-test
+
 test-restore-dr:
 	CHRONOS_SKIP_RELEASE_BUILD=$(CHRONOS_SKIP_RELEASE_BUILD) \
 	CHRONOS_RELEASE_BIN_DIR=$(CHRONOS_RELEASE_BIN_DIR) \
@@ -465,6 +469,7 @@ release-security-check: release-package
 release-check-core:
 	$(MAKE) test-layer-0
 	$(MAKE) test-release-core
+	$(MAKE) test-dr-monotonicity-verifier
 	$(MAKE) proto-generated-check
 	$(MAKE) proto-breaking-check
 	$(MAKE) observability-check

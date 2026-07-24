@@ -267,7 +267,10 @@ for target in "$@"; do
       verify_dir rebalance summary.txt artifact-index.txt chronos-a.log chronos-b.log rebalance-bench.log
       ;;
     restore)
-      verify_dir restore summary.txt artifact-index.txt chronos.log restore-control.log snapshot.db
+      verify_dir restore summary.txt artifact-index.txt chronos.log restore-control.log snapshot.db \
+        before-probe.log post-snapshot-probe.log restored-replay-probe.log after-restore-probe.log
+      bash "${REPO_ROOT}/hack/verify-dr-monotonicity.sh" \
+        "${ARTIFACT_ROOT%/}/restore/summary.txt"
       ;;
     *)
       echo "unsupported evidence target: ${target}" >&2
