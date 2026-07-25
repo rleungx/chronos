@@ -47,6 +47,7 @@ RESULT="failure"
 write_summary() {
   cat >"${summary_log}" <<EOF
 result=${RESULT}
+evidence_class=co_located_stress
 profile=${matrix_profile}
 worker_counts=${matrix_workers}
 linear_efficiency_min=${matrix_efficiency_min}
@@ -261,3 +262,4 @@ RESULT="success"
 write_summary
 write_artifact_index "${artifact_root}" "${index_log}"
 echo "[scale-matrix] success"
+echo "[scale-matrix] evidence_class=co_located_stress; production scale evidence remains UNVERIFIED"

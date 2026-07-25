@@ -6,6 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 source "${REPO_ROOT}/hack/lib/common.sh"
+source "${REPO_ROOT}/hack/verify-scale-evidence-authority.sh"
 
 cd "${REPO_ROOT}"
 
@@ -44,13 +45,6 @@ verify_dir() {
   done
 }
 
-trim() {
-  local value=$1
-  value="${value#"${value%%[![:space:]]*}"}"
-  value="${value%"${value##*[![:space:]]}"}"
-  printf '%s' "${value}"
-}
-
 assert_positive_integer_metric() {
   local key=$1
   local file=$2
@@ -79,71 +73,6 @@ assert_metric_file_exists() {
     echo "metric ${key} points to missing or empty file ${path} in ${file}" >&2
     return 1
   fi
-}
-
-verify_scale_matrix_summary() {
-  local summary=$1
-  [[ "$(extract_metric "profile" "${summary}")" == "production" ]] || {
-    echo "scale matrix evidence must use profile=production: ${summary}" >&2
-    return 1
-  }
-  [[ "$(extract_metric "allow_single_host_plateau" "${summary}")" == "false" ]] || {
-    echo "production scale matrix must not allow a single-host plateau: ${summary}" >&2
-    return 1
-  }
-  assert_metric_present "worker_counts" "${summary}"
-  assert_metric_present "linear_efficiency_min" "${summary}"
-  assert_metric_present "baseline_workers" "${summary}"
-  assert_positive_metric "baseline_req_per_sec" "${summary}"
-
-  local worker_counts
-  local efficiency_min
-  worker_counts="$(extract_metric "worker_counts" "${summary}")"
-  efficiency_min="$(extract_metric "linear_efficiency_min" "${summary}")"
-  assert_metric_at_least "linear_efficiency_min" "${summary}" "0.80"
-  for required_worker in 2 3 5 8; do
-    case ",${worker_counts}," in
-      *",${required_worker},"*) ;;
-      *)
-        echo "production scale matrix is missing worker count ${required_worker}: ${summary}" >&2
-        return 1
-        ;;
-    esac
-  done
-
-  local -a workers
-  IFS=',' read -ra workers <<<"${worker_counts}"
-  [[ "${#workers[@]}" -gt 0 ]] || {
-    echo "scale matrix summary has no worker counts: ${summary}" >&2
-    return 1
-  }
-
-  local worker
-  for worker in "${workers[@]}"; do
-    worker="$(trim "${worker}")"
-    [[ -n "${worker}" ]] || continue
-    assert_metric_present "workers_${worker}_summary" "${summary}"
-    assert_metric_at_least "workers_${worker}_route_owner_endpoints" "${summary}" "${worker}"
-    assert_metric_at_least "workers_${worker}_route_owner_min_timelines" "${summary}" "1"
-    assert_metric_present "workers_${worker}_route_owner_counts" "${summary}"
-    assert_positive_metric "workers_${worker}_concurrency" "${summary}"
-    assert_positive_metric "workers_${worker}_timelines" "${summary}"
-    assert_positive_metric "workers_${worker}_allocation_client_channels" "${summary}"
-    assert_positive_metric "workers_${worker}_concurrency_per_allocation_channel" "${summary}"
-    assert_positive_metric "workers_${worker}_bench_client_processes" "${summary}"
-    assert_metric_present "workers_${worker}_owner_affinity" "${summary}"
-    [[ "$(extract_metric "workers_${worker}_owner_affinity" "${summary}")" == "true" ]] || {
-      echo "workers_${worker}_owner_affinity must be true in ${summary}" >&2
-      return 1
-    }
-    assert_positive_metric "workers_${worker}_req_per_sec" "${summary}"
-    assert_metric_present "workers_${worker}_linear_expected_req_per_sec_at_min_efficiency" "${summary}"
-    assert_metric_at_least "workers_${worker}_linear_efficiency" "${summary}" "${efficiency_min}"
-    assert_zero_metric "workers_${worker}_allocation_failed_total" "${summary}"
-    assert_metric_present "workers_${worker}_latency_p95_us" "${summary}"
-    assert_metric_present "workers_${worker}_latency_p99_us" "${summary}"
-    assert_metric_present "workers_${worker}_latency_p999_us" "${summary}"
-  done
 }
 
 verify_profile_summary() {
@@ -249,11 +178,12 @@ for target in "$@"; do
     scale)
       verify_scale_run_dir "${ARTIFACT_ROOT%/}/scale"
       ;;
-    scale-matrix)
+    scale-matrix | scale-matrix-stress)
       matrix_dir="${ARTIFACT_ROOT%/}/scale-matrix"
       [[ -d "${matrix_dir}" ]] || { echo "missing artifact directory: ${matrix_dir}" >&2; exit 1; }
-      assert_summary_success "${matrix_dir}/summary.txt"
-      verify_scale_matrix_summary "${matrix_dir}/summary.txt"
+      authority_mode="production"
+      [[ "${target}" == "scale-matrix-stress" ]] && authority_mode="stress"
+      verify_scale_matrix_summary "${matrix_dir}/summary.txt" "${authority_mode}"
       [[ -f "${matrix_dir}/artifact-index.txt" ]] || { echo "missing artifact-index.txt in ${matrix_dir}" >&2; exit 1; }
       found_run=0
       for run_dir in "${matrix_dir}"/workers-*/scale; do

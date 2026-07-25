@@ -40,15 +40,11 @@ single-host plateau escape hatch. For local iteration use `make test-soak-quick`
 `make test-chaos-quick`, and `make test-failover-bench-quick`; quick evidence is intentionally not
 eligible for release promotion.
 
-For production scale evidence, also run `make test-scale-matrix-production` on production-like
-hosts with benchmark clients isolated from Chronos workers. Archive the generated
-`scale-matrix/summary.txt`; it records per-worker throughput, linear efficiency, and the minimum
-expected throughput for the configured efficiency floor. The scale harness also retains
-`host-info.txt`, `host-load-before.txt`, `host-load-after.txt`, and profile summaries with p95/p99
-stage latency upper bounds, per-worker allocation share, and per-worker route ownership. `make
-release-evidence-check` verifies that retained scale-matrix evidence includes every worker size, a
-passing linear-efficiency value, zero allocation failures, per-node logs/metrics/readiness snapshots,
-host snapshots, and derived profile summaries for latency triage.
+`make test-scale-matrix-production` applies the 2/3/5/8 production workload budget, but the current
+harness co-locates clients, Chronos workers, and etcd and emits only
+`evidence_class=co_located_stress`. Its artifacts remain useful for regression triage, but even a
+stress PASS is not production scale evidence. Release verification fails as `UNVERIFIED` until a
+separate L2 observed-topology producer and verifier exist.
 
 ## Required config checks
 

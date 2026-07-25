@@ -13,6 +13,7 @@ ETCD_ENDPOINTS ?= 127.0.0.1:2379
 	etcd-cluster-health \
 	test-layer-0 \
 	test-release-version-verifier \
+	test-scale-evidence-authority-verifier \
 	test-ownership-plan \
 	release-version-check \
 	test-layer-1 \
@@ -189,11 +190,15 @@ test-layer-0:
 	cargo fmt --all -- --check
 	cargo clippy --locked --all-targets -- -D warnings
 	$(MAKE) test-release-version-verifier
+	$(MAKE) test-scale-evidence-authority-verifier
 	$(MAKE) test-ownership-plan
 	$(MAKE) release-version-check
 
 test-release-version-verifier:
 	bash hack/verify-release-version.sh --self-test
+
+test-scale-evidence-authority-verifier:
+	bash hack/verify-scale-evidence-authority.sh --self-test
 
 test-ownership-plan:
 	bash hack/scale/ownership-plan.sh --self-test

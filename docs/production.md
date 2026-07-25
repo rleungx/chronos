@@ -328,13 +328,10 @@ your hardware, but do not remove the gates.
   is set explicitly. This prevents a single benchmark process from becoming the default linearity
   bottleneck.
   `CHRONOS_SCALE_MATRIX_LINEAR_EFFICIENCY_MIN` controls the minimum relative throughput
-  efficiency versus the first matrix entry and defaults to `0.55` for the local single-host gate.
-  Use a stricter value, such as `0.80`, when benchmark clients and Chronos workers run on separate
-  production-like hosts. Use a higher `CHRONOS_SCALE_MATRIX_CONCURRENCY_PER_WORKER` in those
-  environments for saturation testing.
+  efficiency versus the first matrix entry and defaults to `0.55` for the smoke profile.
   `make test-scale-matrix-production` runs the same matrix with `2,3,5,8` workers and a default
-  `0.80` linear-efficiency floor. Use it on production-like hosts with isolated benchmark clients
-  before claiming linear scale-out capacity.
+  `0.80` linear-efficiency floor. Both current targets emit co-located stress evidence, not
+  production scale evidence.
 - Rebalance: `CHRONOS_REBALANCE_ALLOCATE_SUCCESS_PER_SEC_MIN`,
   `CHRONOS_REBALANCE_ALLOCATE_LATENCY_P95_US_MAX`,
   `CHRONOS_REBALANCE_ALLOCATE_LATENCY_P999_US_MAX`,
@@ -369,14 +366,10 @@ keeps one process unless configured explicitly. Local client processes still com
 workers, so production capacity claims should come from isolated benchmark clients. `make test-scale-bench`
 defaults to two workers; use `CHRONOS_SCALE_WORKERS=N` to run the same harness for one size, or
 `make test-scale-matrix` with `CHRONOS_SCALE_MATRIX_WORKERS=2,3,5,8` for a multi-size local matrix.
-Use `make test-scale-matrix-production` for the stricter production-style linearity gate once the
-benchmark clients are isolated from Chronos workers. The production target fixes the matrix at
-2/3/5/8 workers, requires at least 80% linear efficiency, and does not accept the single-host
-plateau escape hatch. Keep the generated `scale-matrix/summary.txt`
-with release evidence; it includes per-worker linear efficiency and the minimum expected
-throughput at the configured efficiency floor. Evidence verification also rechecks that each matrix
-entry contains throughput, linear-efficiency, zero-allocation-failure metrics, and profile p95/p99
-latency evidence, so incomplete or stale scale artifacts cannot pass the release evidence gate.
+Use `make test-scale-matrix-production` for the stricter 2/3/5/8, 80%-efficiency workload profile;
+it still emits `evidence_class=co_located_stress`. Stress verification rechecks every matrix entry,
+but production release verification rejects this class as `UNVERIFIED`; a profile name or passing
+budget cannot authorize production evidence.
 Scale `profile-summary.txt` also contains derived per-worker average and p95/p99/p999 allocation,
 cached admission-wait, cached serve, proxy-wait latencies, plus per-worker allocation share, so a
 regression can be triaged from retained artifacts before collecting deeper host profiles.

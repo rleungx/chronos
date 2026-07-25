@@ -386,7 +386,7 @@ jobs:
           path: artifacts/release
       - name: Restore release executable bits
         run: chmod +x artifacts/release/chronos artifacts/release/chronos-bench artifacts/release/chronos-control-bench artifacts/release/chronos-failover-bench artifacts/release/chronos-upgrade-bench
-      - name: Run etcd-backed scale matrix
+      - name: Run co-located production-profile scale stress
         run: make test-scale-matrix-production
       - name: Upload scale matrix artifacts
         if: always()
@@ -396,7 +396,10 @@ jobs:
           path: artifacts/scale-matrix/
           if-no-files-found: error
           retention-days: ${{ env.CHRONOS_ARTIFACT_RETENTION_DAYS }}
-      - name: Verify scale matrix evidence
+      - name: Verify co-located scale stress evidence
+        if: always()
+        run: bash hack/verify-evidence.sh artifacts scale-matrix-stress
+      - name: Require L2 production scale evidence
         if: always()
         run: bash hack/verify-evidence.sh artifacts scale-matrix
       - name: Reset etcd after scale matrix job
