@@ -28,8 +28,6 @@ pub const PRODUCTION_MAX_TIMELINE_PROXY_LANES: usize = 8_192;
 pub const PRODUCTION_MAX_TIMELINE_RUNTIME_ENTRIES: usize = 16_384;
 pub const DEFAULT_REQUEST_RECORD_PENDING_TIMEOUT_MS: u64 = 300_000;
 pub const DEFAULT_REQUEST_RECORD_RETENTION_MS: u64 = 3_600_000;
-pub const DEFAULT_REQUEST_RECORD_CLEANUP_INTERVAL_MS: u64 = 60_000;
-pub const DEFAULT_REQUEST_RECORD_CLEANUP_BATCH_SIZE: usize = 512;
 pub const DEFAULT_AUTO_FAILOVER_INTERVAL_MS: u64 = 1_000;
 pub const DEFAULT_AUTO_FAILOVER_BATCH_SIZE: usize = 16;
 pub const DEFAULT_MAX_CLOCK_SKEW_MS: u64 = 500;
@@ -199,8 +197,6 @@ pub struct TsoConfig {
     pub max_timeline_records: usize,
     pub request_record_pending_timeout_ms: u64,
     pub request_record_retention_ms: u64,
-    pub request_record_cleanup_interval_ms: u64,
-    pub request_record_cleanup_batch_size: usize,
     pub auto_failover_enabled: bool,
     pub auto_failover_interval_ms: u64,
     pub auto_failover_batch_size: usize,
@@ -264,8 +260,6 @@ impl Default for TsoConfig {
             max_timeline_records: DEFAULT_MAX_TIMELINE_RECORDS,
             request_record_pending_timeout_ms: DEFAULT_REQUEST_RECORD_PENDING_TIMEOUT_MS,
             request_record_retention_ms: DEFAULT_REQUEST_RECORD_RETENTION_MS,
-            request_record_cleanup_interval_ms: DEFAULT_REQUEST_RECORD_CLEANUP_INTERVAL_MS,
-            request_record_cleanup_batch_size: DEFAULT_REQUEST_RECORD_CLEANUP_BATCH_SIZE,
             auto_failover_enabled: false,
             auto_failover_interval_ms: DEFAULT_AUTO_FAILOVER_INTERVAL_MS,
             auto_failover_batch_size: DEFAULT_AUTO_FAILOVER_BATCH_SIZE,
@@ -589,14 +583,6 @@ impl TsoConfig {
         validate_positive_u64_value(
             "CHRONOS_REQUEST_RECORD_RETENTION_MS",
             self.request_record_retention_ms,
-        )?;
-        validate_positive_u64_value(
-            "CHRONOS_REQUEST_RECORD_CLEANUP_INTERVAL_MS",
-            self.request_record_cleanup_interval_ms,
-        )?;
-        validate_positive_usize_value(
-            "CHRONOS_REQUEST_RECORD_CLEANUP_BATCH_SIZE",
-            self.request_record_cleanup_batch_size,
         )?;
         validate_positive_u64_value(
             "CHRONOS_AUTO_FAILOVER_INTERVAL_MS",

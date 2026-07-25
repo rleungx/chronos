@@ -13,6 +13,9 @@ use tokio::task::JoinHandle;
 use crate::recovery::record_recovery_event;
 use crate::{TimelineLifecycleState, TransferReason, TsoError};
 
+const REQUEST_RECORD_CLEANUP_INTERVAL_MS: u64 = 60_000;
+const REQUEST_RECORD_CLEANUP_BATCH_SIZE: usize = 512;
+
 pub(super) struct BackgroundCoordinator {
     shutdown_tx: watch::Sender<bool>,
     tasks: StdMutex<Vec<JoinHandle<()>>>,
@@ -143,7 +146,7 @@ impl TsoService {
     ) {
         let Some(interval_ms) = service
             .upgrade()
-            .map(|service| service.config.request_record_cleanup_interval_ms)
+            .map(|_| REQUEST_RECORD_CLEANUP_INTERVAL_MS)
         else {
             return;
         };
@@ -169,7 +172,7 @@ impl TsoService {
                     match request_records
                         .prune_completed_request_records(
                             cutoff_ms,
-                            service.config.request_record_cleanup_batch_size,
+                            REQUEST_RECORD_CLEANUP_BATCH_SIZE,
                         )
                         .await
                     {

@@ -7,8 +7,12 @@ use crate::AppResult;
 pub(crate) const DEFAULT_ETCD_PREFIX: &str = "/chronos";
 const DEFAULT_LOG_FILTER: &str = "info";
 
-const REMOVED_STARTUP_TUNING_ENV_VARS: &[&str] =
-    &["CHRONOS_GENERATOR_OWNERSHIP", "CHRONOS_ROUTE_CACHE_TTL_MS"];
+const REMOVED_STARTUP_TUNING_ENV_VARS: &[&str] = &[
+    "CHRONOS_GENERATOR_OWNERSHIP",
+    "CHRONOS_REQUEST_RECORD_CLEANUP_BATCH_SIZE",
+    "CHRONOS_REQUEST_RECORD_CLEANUP_INTERVAL_MS",
+    "CHRONOS_ROUTE_CACHE_TTL_MS",
+];
 
 #[derive(Debug, Clone)]
 pub(crate) struct LoadedStartupConfig {
@@ -354,10 +358,6 @@ fn apply_capacity_env(config: &mut TsoConfig) -> AppResult<()> {
         &mut config.max_timeline_records,
     )?;
     apply_parsed_env(
-        "CHRONOS_REQUEST_RECORD_CLEANUP_BATCH_SIZE",
-        &mut config.request_record_cleanup_batch_size,
-    )?;
-    apply_parsed_env(
         "CHRONOS_AUTO_FAILOVER_BATCH_SIZE",
         &mut config.auto_failover_batch_size,
     )?;
@@ -426,10 +426,6 @@ fn apply_timing_env(config: &mut TsoConfig) -> AppResult<()> {
     apply_parsed_env(
         "CHRONOS_REQUEST_RECORD_RETENTION_MS",
         &mut config.request_record_retention_ms,
-    )?;
-    apply_parsed_env(
-        "CHRONOS_REQUEST_RECORD_CLEANUP_INTERVAL_MS",
-        &mut config.request_record_cleanup_interval_ms,
     )?;
     Ok(())
 }

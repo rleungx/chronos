@@ -283,7 +283,12 @@ fn load_tso_config_accepts_generator_ownership_partition_env() {
 fn load_tso_config_rejects_removed_internal_tuning_env_vars() {
     let _guard = ENV_LOCK.lock().unwrap();
 
-    for key in ["CHRONOS_ROUTE_CACHE_TTL_MS", "CHRONOS_GENERATOR_OWNERSHIP"] {
+    for key in [
+        "CHRONOS_ROUTE_CACHE_TTL_MS",
+        "CHRONOS_GENERATOR_OWNERSHIP",
+        "CHRONOS_REQUEST_RECORD_CLEANUP_INTERVAL_MS",
+        "CHRONOS_REQUEST_RECORD_CLEANUP_BATCH_SIZE",
+    ] {
         clear_tso_env();
         unsafe { env::set_var(key, "test-value") };
 
