@@ -304,26 +304,45 @@ impl TsoService {
         Ok(self.valid_generator_lease_upper_bound(generator_id, now_ms))
     }
 
-    pub(super) async fn refresh_generator_lease(
-        &self,
-        generator_id: u32,
-        now_ms: u64,
-    ) -> Result<(), TsoError> {
-        self.refresh_generator_lease_inner(generator_id, now_ms, false)
+    pub(super) async fn refresh_generator_lease(&self, generator_id: u32) -> Result<(), TsoError> {
+        self.refresh_generator_lease_inner(generator_id, false)
             .await
     }
 
     pub(super) async fn refresh_generator_lease_inner(
         &self,
         generator_id: u32,
-        now_ms: u64,
         force: bool,
     ) -> Result<(), TsoError> {
-        self.refresh_generator_lease_inner_with_cancellation(generator_id, now_ms, force, None)
+        self.refresh_generator_lease_inner_with_cancellation(generator_id, force, None)
             .await
     }
 
     pub(super) async fn refresh_generator_lease_inner_with_cancellation(
+        &self,
+        generator_id: u32,
+        force: bool,
+        cancellation: Option<RequestCancellation>,
+    ) -> Result<(), TsoError> {
+        let _flight = self
+            .acquire_generator_lease_singleflight_with_cancellation(
+                generator_id,
+                cancellation.clone(),
+            )
+            .await?;
+        Self::check_request_cancellation(cancellation.as_ref())?;
+        let now_ms = self.clock.now_ms();
+        self.refresh_generator_lease_after_singleflight_with_cancellation(
+            generator_id,
+            now_ms,
+            force,
+            cancellation,
+        )
+        .await
+    }
+
+    // The caller must hold this generator's lease singleflight for the full await.
+    async fn refresh_generator_lease_after_singleflight_with_cancellation(
         &self,
         generator_id: u32,
         now_ms: u64,
@@ -399,7 +418,7 @@ impl TsoService {
             Err(TsoError::CasFailed) => {
                 self.generator_runtime.remove_lease(generator_id);
                 let result = self
-                    .ensure_generator_lease_with_cancellation(generator_id, cancellation)
+                    .ensure_generator_lease_after_singleflight(generator_id, cancellation)
                     .await;
                 if result.is_err() && self.generator_runtime.lease_state(generator_id).is_none() {
                     // Keep the entry visible to background maintenance, but do not restore its
@@ -439,7 +458,7 @@ impl TsoService {
                 .await;
         }
 
-        self.refresh_generator_lease_inner_with_cancellation(
+        self.refresh_generator_lease_after_singleflight_with_cancellation(
             generator_id,
             now_ms,
             true,
@@ -571,12 +590,7 @@ impl TsoService {
                         "generator_cas_conflict",
                     );
                     let generator_id = batch_operations[0].generator_id;
-                    let refresh_now_ms = self.clock.now_ms();
-                    if self
-                        .refresh_generator_lease(generator_id, refresh_now_ms)
-                        .await
-                        .is_err()
-                    {
+                    if self.refresh_generator_lease(generator_id).await.is_err() {
                         record_recovery_event(
                             "service",
                             "batch_generator_refresh",
@@ -604,7 +618,7 @@ mod tests {
 
     use async_trait::async_trait;
     use tokio::sync::broadcast;
-    use tokio::time::{timeout, Duration};
+    use tokio::time::{sleep, timeout, Duration};
 
     use crate::metadata::MemoryMetadataStore;
     use crate::metadata::{
@@ -612,7 +626,8 @@ mod tests {
         RouteUpdateSource, TimelineAuthority, TimelineBatchOp, TimelineRecord,
     };
     use crate::{
-        ManualClock, OwnershipDriftEvidence, TsoConfig, TsoError, TsoService, WorkerReadinessSink,
+        encode_tso, ManualClock, OwnershipDriftEvidence, TsoConfig, TsoError, TsoService,
+        WorkerReadinessSink,
     };
 
     #[derive(Default)]
@@ -1597,13 +1612,174 @@ mod tests {
         );
 
         let error = service
-            .refresh_generator_lease_inner(0, 100, true)
+            .refresh_generator_lease_inner(0, true)
             .await
             .unwrap_err();
 
         assert!(matches!(error, TsoError::CasFailed));
         assert!(service.generator_runtime.lease_state(0).is_some());
         assert!(!service.is_generator_lease_valid(0, 100));
+    }
+
+    #[tokio::test]
+    async fn refresh_wrapper_reloads_now_ms_after_waiting_for_singleflight() {
+        let metadata = Arc::new(MemoryMetadataStore::new());
+        metadata
+            .create_generator(
+                0,
+                &GeneratorRecord {
+                    schema_version: 1,
+                    generator_id: 0,
+                    owner_worker_endpoint: "127.0.0.1:50051".into(),
+                    owner_instance_id: "lease-instance".into(),
+                    generator_lease_token: 1,
+                    lease_expire_at_ms: Some(300),
+                    last_issued_tso: None,
+                    issued_upper_bound: None,
+                    updated_at_ms: 100,
+                },
+            )
+            .await
+            .unwrap();
+        let clock = Arc::new(ManualClock::new(100));
+        let service = TsoService::new(
+            required_test_config(TsoConfig {
+                generator_lease_ttl_ms: 50,
+                lease_ttl_ms: 50,
+                generator_maintenance_interval_ms: 10,
+                ..TsoConfig::default()
+            }),
+            clock.clone(),
+            metadata.clone(),
+        )
+        .unwrap();
+
+        service.background.begin_shutdown();
+        service.background.drain_tasks().await;
+        service
+            .generator_runtime
+            .mark_generator_ready_for_lease(0, 1);
+        service.generator_runtime.upsert_lease(
+            0,
+            crate::runtime::GeneratorLeaseState {
+                revision: 1,
+                owner_instance_id: "lease-instance".into(),
+                generator_lease_token: 1,
+                lease_expire_at_ms: 300,
+                last_persisted_tso: None,
+                issued_upper_bound: None,
+            },
+        );
+
+        let held_flight = service
+            .acquire_generator_lease_singleflight_with_cancellation(0, None)
+            .await
+            .unwrap();
+        let refresh = service.refresh_generator_lease_inner(0, true);
+        tokio::pin!(refresh);
+        tokio::select! {
+            result = &mut refresh => panic!("refresh unexpectedly bypassed held flight: {result:?}"),
+            _ = sleep(Duration::from_millis(20)) => {}
+        }
+        clock.set(125);
+        drop(held_flight);
+        timeout(Duration::from_millis(100), &mut refresh)
+            .await
+            .expect("refresh should proceed after the held flight releases")
+            .unwrap();
+
+        let (record, _) = metadata.load_generator(0).await.unwrap().unwrap();
+        assert_eq!(record.updated_at_ms, 125);
+        assert_eq!(record.lease_expire_at_ms, Some(175));
+        let runtime = service.generator_runtime.lease_state(0).unwrap();
+        assert_eq!(runtime.lease_expire_at_ms, 175);
+    }
+
+    #[tokio::test]
+    async fn force_refresh_conflict_does_not_reacquire_held_singleflight() {
+        let metadata = Arc::new(MemoryMetadataStore::new());
+        let old_upper_bound = encode_tso(120, 0, 0).unwrap();
+        let authoritative_upper_bound = encode_tso(140, 0, 0).unwrap();
+        metadata
+            .create_generator(
+                0,
+                &GeneratorRecord {
+                    schema_version: 1,
+                    generator_id: 0,
+                    owner_worker_endpoint: "127.0.0.1:50051".into(),
+                    owner_instance_id: "lease-instance".into(),
+                    generator_lease_token: 1,
+                    lease_expire_at_ms: Some(150),
+                    last_issued_tso: None,
+                    issued_upper_bound: Some(old_upper_bound),
+                    updated_at_ms: 100,
+                },
+            )
+            .await
+            .unwrap();
+        let service = TsoService::new(
+            required_test_config(TsoConfig {
+                generator_lease_ttl_ms: 50,
+                lease_ttl_ms: 50,
+                generator_maintenance_interval_ms: 10,
+                ..TsoConfig::default()
+            }),
+            Arc::new(ManualClock::new(100)),
+            metadata.clone(),
+        )
+        .unwrap();
+
+        service.background.begin_shutdown();
+        service.background.drain_tasks().await;
+        service
+            .generator_runtime
+            .mark_generator_ready_for_lease(0, 1);
+        service.generator_runtime.upsert_lease(
+            0,
+            crate::runtime::GeneratorLeaseState {
+                revision: 1,
+                owner_instance_id: "lease-instance".into(),
+                generator_lease_token: 1,
+                lease_expire_at_ms: 150,
+                last_persisted_tso: None,
+                issued_upper_bound: Some(old_upper_bound),
+            },
+        );
+        let (mut authoritative, revision) = metadata.load_generator(0).await.unwrap().unwrap();
+        authoritative.lease_expire_at_ms = Some(180);
+        authoritative.issued_upper_bound = Some(authoritative_upper_bound);
+        authoritative.updated_at_ms = 130;
+        let authoritative_revision = metadata
+            .compare_exchange_generator(0, revision, &authoritative)
+            .await
+            .unwrap();
+
+        let nested_refresh = timeout(
+            Duration::from_millis(100),
+            service.refresh_generator_lease_if_unchanged_with_cancellation(
+                0,
+                Some(old_upper_bound),
+                None,
+            ),
+        )
+        .await;
+        timeout(
+            Duration::from_millis(100),
+            service.ensure_generator_lease(0),
+        )
+        .await
+        .expect("the same metadata store must support a non-nested reload")
+        .unwrap();
+        assert!(
+            nested_refresh.is_ok(),
+            "CAS conflict reload must not wait on its already-held singleflight"
+        );
+        nested_refresh.unwrap().unwrap();
+
+        let reloaded = service.generator_runtime.lease_state(0).unwrap();
+        assert_eq!(reloaded.revision, authoritative_revision);
+        assert_eq!(reloaded.lease_expire_at_ms, 180);
+        assert_eq!(reloaded.issued_upper_bound, Some(authoritative_upper_bound));
     }
 
     #[tokio::test]
