@@ -11,6 +11,12 @@ pub(super) struct IdentityLeaseConfirmedWindow {
     pub(super) heartbeat_interval: Duration,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum IdentityKeepaliveResponseDecision {
+    Confirmed(IdentityLeaseConfirmedWindow),
+    LoseAuthority(String),
+}
+
 pub(super) fn identity_lease_confirmed_window(
     request_started_at: Instant,
     response_observed_at: Instant,
@@ -68,6 +74,23 @@ where
             revoke(lease_id).await;
             Err(error)
         }
+    }
+}
+
+pub(super) fn identity_keepalive_response_decision(
+    request_started_at: Instant,
+    response_observed_at: Instant,
+    response_ttl_seconds: i64,
+) -> IdentityKeepaliveResponseDecision {
+    match identity_lease_confirmed_window(
+        request_started_at,
+        response_observed_at,
+        response_ttl_seconds,
+    ) {
+        Ok(window) => IdentityKeepaliveResponseDecision::Confirmed(window),
+        Err(error) => IdentityKeepaliveResponseDecision::LoseAuthority(format!(
+            "keepalive_response_invalid: {error}"
+        )),
     }
 }
 
@@ -466,12 +489,12 @@ impl EtcdMetadataStore {
                             .await
                         {
                             Ok(Ok(Some(response))) => {
-                                match identity_lease_confirmed_window(
+                                match identity_keepalive_response_decision(
                                     keepalive_request_started_at,
                                     Instant::now(),
                                     response.ttl(),
                                 ) {
-                                    Ok(window) => {
+                                    IdentityKeepaliveResponseDecision::Confirmed(window) => {
                                         lease_alive_until = window.deadline;
                                         match await_identity_keepalive_step(
                                             lease_alive_until,
@@ -485,8 +508,19 @@ impl EtcdMetadataStore {
                                             }
                                         }
                                     }
-                                    Err(error) => {
-                                        format!("keepalive_response_invalid: {error}")
+                                    IdentityKeepaliveResponseDecision::LoseAuthority(reason) => {
+                                        error!(
+                                            component = "identity_lease",
+                                            event = "keepalive_lost",
+                                            result = "failure",
+                                            reason = %reason,
+                                            lease_id,
+                                            instance_id = lease_instance_id,
+                                            worker_id = lease_worker_id,
+                                            advertise_endpoint = lease_advertise_endpoint
+                                        );
+                                        let _ = lost_tx.send(true);
+                                        break 'keepalive;
                                     }
                                 }
                             }

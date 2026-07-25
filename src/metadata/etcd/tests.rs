@@ -7,7 +7,8 @@ use super::{
     identity_claim_matches_record,
     identity_lifecycle::{
         await_identity_keepalive_reconnect, await_identity_keepalive_step,
-        identity_lease_confirmed_window, validate_identity_lease_grant_or_revoke,
+        identity_keepalive_response_decision, identity_lease_confirmed_window,
+        validate_identity_lease_grant_or_revoke, IdentityKeepaliveResponseDecision,
     },
     identity_record_belongs_to_ownership_plan, parse_prev_route, parse_timeline_filter_record,
     route_update_for_watch_event, verify_instance_identity_lease_record,
@@ -177,6 +178,36 @@ async fn identity_grant_exhausted_during_response_delay_is_revoked() {
 
     assert!(error.to_string().contains("already exhausted"));
     assert_eq!(revoked_lease.load(Ordering::SeqCst), 19);
+}
+
+#[test]
+fn invalid_identity_keepalive_response_loses_authority_without_reconnect() {
+    let request_started_at = Instant::now();
+    let response_observed_at = request_started_at + Duration::from_secs(2);
+    let old_deadline = response_observed_at + Duration::from_secs(10);
+
+    for response_ttl in [0, 1] {
+        assert!(old_deadline > response_observed_at);
+        let reconnect_calls = AtomicUsize::new(0);
+        let decision = identity_keepalive_response_decision(
+            request_started_at,
+            response_observed_at,
+            response_ttl,
+        );
+        let lost = match decision {
+            IdentityKeepaliveResponseDecision::LoseAuthority(reason) => {
+                assert!(reason.contains("keepalive_response_invalid"));
+                true
+            }
+            IdentityKeepaliveResponseDecision::Confirmed(_) => {
+                reconnect_calls.fetch_add(1, Ordering::SeqCst);
+                false
+            }
+        };
+
+        assert!(lost, "invalid response must immediately lose authority");
+        assert_eq!(reconnect_calls.load(Ordering::SeqCst), 0);
+    }
 }
 
 fn sample_route(generator_id: u32, route_version: u64) -> TimelineRoute {
