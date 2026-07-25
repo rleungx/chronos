@@ -104,6 +104,37 @@ async fn one_second_identity_window_schedules_heartbeat_before_deadline() {
 }
 
 #[tokio::test]
+async fn one_second_identity_window_can_send_immediately_after_setup_delay() {
+    let now = Instant::now();
+    let window = identity_lease_confirmed_window(now, now, 1).unwrap();
+    tokio::time::sleep(Duration::from_millis(700)).await;
+
+    let result = await_identity_keepalive_step(window.deadline, std::future::ready("sent")).await;
+
+    assert_eq!(result.unwrap(), "sent");
+    assert!(Instant::now() < window.deadline);
+}
+
+#[tokio::test]
+async fn successful_identity_reconnect_can_send_immediately_without_an_extra_cadence_sleep() {
+    let deadline = Instant::now() + Duration::from_millis(200);
+    let reconnected = await_identity_keepalive_reconnect(
+        deadline,
+        Duration::from_millis(10),
+        std::future::ready("stream"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(reconnected, "stream");
+
+    let sent = await_identity_keepalive_step(deadline, std::future::ready("sent"))
+        .await
+        .unwrap();
+    assert_eq!(sent, "sent");
+    assert!(Instant::now() < deadline);
+}
+
+#[tokio::test]
 async fn invalid_identity_grant_is_revoked_before_the_caller_can_claim() {
     for ttl in [0, -1] {
         let revoked_lease = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));

@@ -449,59 +449,54 @@ impl EtcdMetadataStore {
         let request_retry_budget = self.request_retry_budget;
         let (lost_tx, lost_rx) = watch::channel(false);
         let initial_lease_alive_until = grant_window.deadline;
-        let initial_heartbeat_interval = grant_window.heartbeat_interval;
         let lease_instance_id = instance_id.to_owned();
         let lease_worker_id = worker_id.to_owned();
         let lease_advertise_endpoint = advertise_endpoint.to_owned();
         let keep_alive_task = tokio::spawn(async move {
             let mut lease_alive_until = initial_lease_alive_until;
-            let mut heartbeat_interval = initial_heartbeat_interval;
             'keepalive: loop {
-                let heartbeat_result =
-                    await_identity_keepalive_step(lease_alive_until, sleep(heartbeat_interval))
-                        .await;
-                let failure_reason = match heartbeat_result {
-                    Ok(()) => {
-                        let keepalive_request_started_at = Instant::now();
-                        let keepalive_result =
-                            await_identity_keepalive_step(lease_alive_until, keeper.keep_alive())
-                                .await;
-                        match keepalive_result {
-                            Ok(Ok(())) => {
-                                match await_identity_keepalive_step(
-                                    lease_alive_until,
-                                    stream.message(),
-                                )
-                                .await
-                                {
-                                    Ok(Ok(Some(response))) => {
-                                        match identity_lease_confirmed_window(
-                                            keepalive_request_started_at,
-                                            Instant::now(),
-                                            response.ttl(),
-                                        ) {
-                                            Ok(window) => {
-                                                lease_alive_until = window.deadline;
-                                                heartbeat_interval = window.heartbeat_interval;
-                                                continue;
-                                            }
-                                            Err(error) => {
-                                                format!("keepalive_response_invalid: {error}")
+                // Send immediately on initial entry and after a successful reconnect. Only a
+                // confirmed response earns the sleep before the next request.
+                let keepalive_request_started_at = Instant::now();
+                let keepalive_result =
+                    await_identity_keepalive_step(lease_alive_until, keeper.keep_alive()).await;
+                let failure_reason = match keepalive_result {
+                    Ok(Ok(())) => {
+                        match await_identity_keepalive_step(lease_alive_until, stream.message())
+                            .await
+                        {
+                            Ok(Ok(Some(response))) => {
+                                match identity_lease_confirmed_window(
+                                    keepalive_request_started_at,
+                                    Instant::now(),
+                                    response.ttl(),
+                                ) {
+                                    Ok(window) => {
+                                        lease_alive_until = window.deadline;
+                                        match await_identity_keepalive_step(
+                                            lease_alive_until,
+                                            sleep(window.heartbeat_interval),
+                                        )
+                                        .await
+                                        {
+                                            Ok(()) => continue,
+                                            Err(_) => {
+                                                "keepalive_heartbeat_deadline_elapsed".to_owned()
                                             }
                                         }
                                     }
-                                    Ok(Ok(None)) => "keepalive_stream_closed".to_owned(),
-                                    Ok(Err(error)) => {
-                                        format!("keepalive_stream_error: {error}")
+                                    Err(error) => {
+                                        format!("keepalive_response_invalid: {error}")
                                     }
-                                    Err(_) => "keepalive_response_deadline_elapsed".to_owned(),
                                 }
                             }
-                            Ok(Err(error)) => format!("keepalive_send_failed: {error}"),
-                            Err(_) => "keepalive_send_deadline_elapsed".to_owned(),
+                            Ok(Ok(None)) => "keepalive_stream_closed".to_owned(),
+                            Ok(Err(error)) => format!("keepalive_stream_error: {error}"),
+                            Err(_) => "keepalive_response_deadline_elapsed".to_owned(),
                         }
                     }
-                    Err(_) => "keepalive_heartbeat_deadline_elapsed".to_owned(),
+                    Ok(Err(error)) => format!("keepalive_send_failed: {error}"),
+                    Err(_) => "keepalive_send_deadline_elapsed".to_owned(),
                 };
 
                 let mut consecutive_reconnect_failures = 0u32;

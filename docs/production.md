@@ -65,7 +65,35 @@ concurrently against the same etcd prefix. Use this safe sequence:
    `${CHRONOS_ETCD_PREFIX}/identity/instances/` has no keys:
 
    ```bash
-   etcdctl get "${CHRONOS_ETCD_PREFIX}/identity/instances/" --prefix
+   check_chronos_identity_prefix_empty() {
+     : "${CHRONOS_ETCD_ENDPOINTS:?must match the Chronos production configuration}"
+     : "${CHRONOS_ETCD_PREFIX:?must match the Chronos production configuration}"
+     local -a etcdctl_args=(--endpoints="${CHRONOS_ETCD_ENDPOINTS}")
+     case "${CHRONOS_ETCD_CA_FILE:-}:${CHRONOS_ETCD_CERT_FILE:-}:${CHRONOS_ETCD_KEY_FILE:-}" in
+       ::) ;;
+       ?*:?*:?*)
+         etcdctl_args+=(
+           --cacert="${CHRONOS_ETCD_CA_FILE}"
+           --cert="${CHRONOS_ETCD_CERT_FILE}"
+           --key="${CHRONOS_ETCD_KEY_FILE}"
+         )
+         ;;
+       *)
+         echo "CHRONOS_ETCD_CA_FILE/CERT_FILE/KEY_FILE must be all set or all unset" >&2
+         return 1
+         ;;
+     esac
+     local active_identity_keys
+     active_identity_keys="$(
+       ETCDCTL_API=3 etcdctl "${etcdctl_args[@]}" \
+         get "${CHRONOS_ETCD_PREFIX}/identity/instances/" --prefix --keys-only
+     )" || return
+     if [[ -n "${active_identity_keys}" ]]; then
+       printf 'active Chronos identity keys remain:\n%s\n' "${active_identity_keys}" >&2
+       return 1
+     fi
+   }
+   check_chronos_identity_prefix_empty
    ```
 
    Keep replicas at zero and repeat the query until it is empty.
