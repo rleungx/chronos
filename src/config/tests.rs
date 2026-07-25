@@ -214,6 +214,55 @@ fn validate_for_startup_rejects_generator_lease_ttl_not_above_maintenance_interv
 }
 
 #[test]
+fn effective_generator_maintenance_cadence_reports_each_bound() {
+    let cases = [
+        (25, 100, 0, 25, "configured"),
+        (50, 100, 0, 50, "configured"),
+        (200, 100, 0, 50, "issued_horizon_cap"),
+        (500, 100, 0, 50, "issued_horizon_cap"),
+        (200, 0, 0, 1, "issued_horizon_cap"),
+        (200, 1, 0, 1, "issued_horizon_cap"),
+        (2, 100, 3, 1, "lease_ttl_cap"),
+        (2, 2, 3, 1, "issued_horizon_and_lease_ttl_cap"),
+        (200, u64::MAX, u64::MAX, 200, "configured"),
+    ];
+
+    for (configured_ms, issued_horizon_ms, generator_lease_ttl_ms, expected_ms, expected_reason) in
+        cases
+    {
+        let config = TsoConfig {
+            generator_maintenance_interval_ms: configured_ms,
+            pre_borrow_ms: issued_horizon_ms,
+            generator_lease_ttl_ms,
+            ..valid_config()
+        };
+        assert_eq!(
+            config.effective_generator_maintenance_cadence(),
+            (expected_ms, expected_reason),
+            "configured={configured_ms} horizon={issued_horizon_ms} \
+             generator_ttl={generator_lease_ttl_ms}"
+        );
+    }
+}
+
+#[test]
+fn effective_generator_lease_ttl_inherits_identity_ttl_only_when_unset() {
+    let inherited = TsoConfig {
+        lease_ttl_ms: 1_500,
+        generator_lease_ttl_ms: 0,
+        ..valid_config()
+    };
+    assert_eq!(inherited.effective_generator_lease_ttl_ms(), 1_500);
+
+    let explicit = TsoConfig {
+        lease_ttl_ms: 1_500,
+        generator_lease_ttl_ms: 2_500,
+        ..valid_config()
+    };
+    assert_eq!(explicit.effective_generator_lease_ttl_ms(), 2_500);
+}
+
+#[test]
 fn validate_for_startup_rejects_missing_default_tier_capacity() {
     let mut config = valid_config();
     config.default_resource_tier = ResourceTier::Warm;

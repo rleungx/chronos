@@ -176,6 +176,23 @@ fn print_config_lines(config: &TsoConfig) -> AppResult<()> {
         "identity_lease_grant_request_ttl_ms={}",
         identity_grant_request_ms
     );
+    let (generator_maintenance_effective_ms, generator_maintenance_reason) =
+        config.effective_generator_maintenance_cadence();
+    println!(
+        "generator_lease_ttl_configured_ms={}",
+        config.generator_lease_ttl_ms
+    );
+    println!(
+        "generator_lease_ttl_effective_ms={}",
+        config.effective_generator_lease_ttl_ms()
+    );
+    println!(
+        "generator_maintenance_interval_configured_ms={}",
+        config.generator_maintenance_interval_ms
+    );
+    println!("generator_maintenance_interval_effective_ms={generator_maintenance_effective_ms}");
+    println!("generator_issued_horizon_ms={}", config.pre_borrow_ms);
+    println!("generator_maintenance_cadence_reason={generator_maintenance_reason}");
     println!("auto_failover_enabled={}", config.auto_failover_enabled);
     println!(
         "auto_failover_interval_ms={}",

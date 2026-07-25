@@ -237,8 +237,11 @@ impl TsoService {
 
         self.ensure_generator_lease(record.route.generator_id)
             .await?;
-        self.refresh_generator_lease_inner(record.route.generator_id, true)
-            .await
+        self.refresh_generator_lease_inner(
+            record.route.generator_id,
+            super::lease::GeneratorLeaseRefreshReason::ExplicitRenewal,
+        )
+        .await
     }
 }
 

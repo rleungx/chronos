@@ -105,7 +105,7 @@ impl TsoService {
     ) {
         let Some(interval_ms) = service
             .upgrade()
-            .map(|service| service.config.generator_maintenance_interval_ms)
+            .map(|service| service.config.effective_generator_maintenance_cadence().0)
         else {
             return;
         };

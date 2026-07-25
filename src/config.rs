@@ -302,6 +302,31 @@ impl TsoConfig {
         }
     }
 
+    pub fn effective_generator_lease_ttl_ms(&self) -> u64 {
+        if self.generator_lease_ttl_ms == 0 {
+            self.lease_ttl_ms
+        } else {
+            self.generator_lease_ttl_ms
+        }
+    }
+
+    pub fn effective_generator_maintenance_cadence(&self) -> (u64, &'static str) {
+        let configured = self.generator_maintenance_interval_ms;
+        let horizon_cap = (self.pre_borrow_ms / 2).max(1);
+        let lease_ttl_cap = (self.effective_generator_lease_ttl_ms() / 2).max(1);
+        let effective = configured.min(horizon_cap).min(lease_ttl_cap);
+        let reason = if effective == configured {
+            "configured"
+        } else if effective == horizon_cap && effective == lease_ttl_cap {
+            "issued_horizon_and_lease_ttl_cap"
+        } else if effective == horizon_cap {
+            "issued_horizon_cap"
+        } else {
+            "lease_ttl_cap"
+        };
+        (effective, reason)
+    }
+
     pub fn effective_generator_ownership_remainders(&self) -> Vec<u32> {
         if self.generator_ownership_remainders.is_empty() {
             vec![self.generator_ownership_remainder]

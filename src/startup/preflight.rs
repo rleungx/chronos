@@ -1,7 +1,7 @@
 use std::error::Error;
 
 use chronos::{TsoConfig, TsoError, TsoSecurityMode};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::AppResult;
 
@@ -112,6 +112,9 @@ pub(crate) fn validate_startup_preflight(
 pub(crate) fn log_startup_preflight(plan: &ValidatedStartupPlan<'_>) {
     let startup = plan.startup();
     let config: &TsoConfig = &startup.config;
+    let (generator_maintenance_effective_ms, generator_maintenance_reason) =
+        config.effective_generator_maintenance_cadence();
+    let generator_lease_ttl_effective_ms = config.effective_generator_lease_ttl_ms();
     info!(
         component = "startup",
         event = "preflight_passed",
@@ -130,6 +133,25 @@ pub(crate) fn log_startup_preflight(plan: &ValidatedStartupPlan<'_>) {
         build_commit = chronos::build_commit(),
         tso_max_supported_unix_ms = chronos::MAX_UNIX_MS,
         safety_gap_ms = config.safety_gap_ms,
-        max_clock_skew_ms = config.max_clock_skew_ms
+        max_clock_skew_ms = config.max_clock_skew_ms,
+        generator_maintenance_interval_configured_ms =
+            config.generator_maintenance_interval_ms,
+        generator_maintenance_interval_effective_ms = generator_maintenance_effective_ms,
+        generator_lease_ttl_configured_ms = config.generator_lease_ttl_ms,
+        generator_lease_ttl_effective_ms,
+        generator_issued_horizon_ms = config.pre_borrow_ms,
+        generator_maintenance_cadence_reason = generator_maintenance_reason
     );
+    if generator_maintenance_effective_ms != config.generator_maintenance_interval_ms {
+        warn!(
+            component = "startup",
+            event = "generator_maintenance_cadence_capped",
+            result = "adjusted",
+            reason = generator_maintenance_reason,
+            configured_ms = config.generator_maintenance_interval_ms,
+            effective_ms = generator_maintenance_effective_ms,
+            generator_issued_horizon_ms = config.pre_borrow_ms,
+            generator_lease_ttl_effective_ms
+        );
+    }
 }
