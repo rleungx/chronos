@@ -139,10 +139,10 @@ start_chronos() {
   wait_for_http "http://${METRICS_ENDPOINT}/readyz" "chronos readyz" "${WAIT_ATTEMPTS}" "${WAIT_INTERVAL_SECS}"
 }
 run_probe() {
-  local output=$1
+  local output=$1 request_id=$2
   env CHRONOS_BENCH_ENDPOINT="http://${SERVICE_ENDPOINT}" \
     CHRONOS_BENCH_SCENARIO="${SCENARIO}.allocate_only" CHRONOS_BENCH_TIMELINES=1 \
-    CHRONOS_BENCH_BATCH=1 CHRONOS_BENCH_PROBE_ONLY=true \
+    CHRONOS_BENCH_BATCH=1 CHRONOS_BENCH_PROBE_ONLY=true CHRONOS_BENCH_IDEMPOTENCY=true CHRONOS_BENCH_PROBE_REQUEST_ID="${request_id}" \
     "${RELEASE_BIN_DIR}/chronos-bench" >"${output}"
 }
 wait_for_authority_loss() {
@@ -177,8 +177,8 @@ wait_for_identity_release() {
   return 1
 }
 if [[ "${CHRONOS_CHAOS_HELPER_SELF_TEST:-0}" == 1 ]]; then
-  process_state_running R; ! process_state_running Z
-  identity_get_released 0 ""; ! identity_get_released 1 ""; ! identity_get_released 0 key
+  process_state_running R; ! process_state_running Z; identity_get_released 0 ""; ! identity_get_released 1 ""; ! identity_get_released 0 key
+  probe_dir="$(mktemp -d)"; ln -s /usr/bin/env "${probe_dir}/chronos-bench"; RELEASE_BIN_DIR=${probe_dir}; pre_id="${SCENARIO}.pre-fault"; post_id="${SCENARIO}.post-recovery"; run_probe "${probe_dir}/pre" "${pre_id}"; run_probe "${probe_dir}/post" "${post_id}"; [[ -n "${pre_id}" && -n "${post_id}" && "${pre_id}" != "${post_id}" ]]; for output in pre post; do grep -qx 'CHRONOS_BENCH_PROBE_ONLY=true' "${probe_dir}/${output}"; grep -qx 'CHRONOS_BENCH_IDEMPOTENCY=true' "${probe_dir}/${output}"; done; grep -qx "CHRONOS_BENCH_PROBE_REQUEST_ID=${pre_id}" "${probe_dir}/pre"; grep -qx "CHRONOS_BENCH_PROBE_REQUEST_ID=${post_id}" "${probe_dir}/post"; rm -rf "${probe_dir}"
   echo "lease-loss producer helper self-test PASS"; exit 0
 fi
 make etcd-reset >/dev/null
@@ -189,7 +189,7 @@ start_chronos "${INITIAL_LOG}"
 INITIAL_BUILD_COMMIT="$(log_event_ns "${INITIAL_LOG}" event preflight_passed build_commit)"
 INITIAL_ACQUIRED_AT_NS="$(log_event_ns "${INITIAL_LOG}" event acquire_succeeded)"
 INITIAL_READY_AT_NS="$(log_event_ns "${INITIAL_LOG}" event ready_state_changed)"
-run_probe "${PRE_PROBE_LOG}"
+run_probe "${PRE_PROBE_LOG}" "${SCENARIO}.pre-fault"
 echo "pre_probe_finished_at_unix_ns=$(now_ns)" >>"${PRE_PROBE_LOG}"
 BENCH_STARTED_AT_NS="$(now_ns)"
 env CHRONOS_CONTROL_BENCH_ENDPOINT="http://${SERVICE_ENDPOINT}" \
@@ -240,7 +240,7 @@ if process_running "${BENCH_PID}"; then BENCH_ALIVE_AFTER_RECOVERY_READY=true; e
   echo "allocator did not span recovery ready" >&2; exit 1
 fi
 wait "${BENCH_PID}"; BENCH_PID=""; BENCH_FINISHED_AT_NS="$(now_ns)"
-run_probe "${POST_PROBE_LOG}"; POST_PROBE_FINISHED_AT_NS="$(now_ns)"
+run_probe "${POST_PROBE_LOG}" "${SCENARIO}.post-recovery"; POST_PROBE_FINISHED_AT_NS="$(now_ns)"
 echo "post_probe_finished_at_unix_ns=${POST_PROBE_FINISHED_AT_NS}" >>"${POST_PROBE_LOG}"
 env CHRONOS_BENCH_ENDPOINT="http://${SERVICE_ENDPOINT}" CHRONOS_BENCH_CONCURRENCY=8 \
   CHRONOS_BENCH_TIMELINES=8 CHRONOS_BENCH_BATCH=1 \
