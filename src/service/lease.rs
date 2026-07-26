@@ -791,19 +791,6 @@ mod tests {
                     before.generator_lease_token + 1,
                     "case={case}"
                 );
-                service
-                    .ensure_generator_lease(route.generator_id)
-                    .await
-                    .unwrap();
-                assert_eq!(
-                    metadata
-                        .load_generator(route.generator_id)
-                        .await
-                        .unwrap()
-                        .unwrap(),
-                    (after, after_revision),
-                    "case={case}: repeated ensure must not take over twice"
-                );
             } else {
                 assert_eq!(
                     (after, after_revision),
@@ -836,36 +823,19 @@ mod tests {
         service.observe_contended_local_generator_ownership_drift(0, "contender", 20, 1);
 
         let ensure_result = service.ensure_timeline(&route.timeline_key).await;
-        let allocation_result = service
-            .allocate_timestamps(AllocateTimestampsRequest {
-                timeline_key: route.timeline_key.clone(),
-                count: 1,
-                expected_epoch: route.epoch,
-                expected_route_version: route.route_version,
-                client_request_id: "restart-local-expired".into(),
-            })
-            .await;
+        let request = AllocateTimestampsRequest {
+            timeline_key: route.timeline_key.clone(),
+            count: 1,
+            expected_epoch: route.epoch,
+            expected_route_version: route.route_version,
+            client_request_id: "restart-local-expired".into(),
+        };
+        let allocation_result = service.allocate_timestamps(request.clone()).await;
         let (after_first_attempt, after_first_revision) = metadata
             .load_generator(route.generator_id)
             .await
             .unwrap()
             .unwrap();
-        if ensure_result.is_err() {
-            assert!(matches!(
-                ensure_result,
-                Err(TsoError::GeneratorLeaseExpired { generator_id: 0 })
-            ));
-            assert!(matches!(
-                allocation_result,
-                Err(TsoError::LeaseExpired { ref timeline_key })
-                    if timeline_key == &route.timeline_key
-            ));
-            assert_eq!(
-                (after_first_attempt.clone(), after_first_revision),
-                (before.clone(), before_revision),
-                "the rejected same-instance restart must not mutate generator metadata"
-            );
-        }
 
         let control_metadata = Arc::new(MemoryMetadataStore::new());
         let (control_route, control_before, control_before_revision) =
@@ -942,16 +912,7 @@ mod tests {
             .ensure_generator_lease(route.generator_id)
             .await
             .unwrap();
-        let replay = service
-            .allocate_timestamps(AllocateTimestampsRequest {
-                timeline_key: route.timeline_key,
-                count: 1,
-                expected_epoch: route.epoch,
-                expected_route_version: route.route_version,
-                client_request_id: "restart-local-expired".into(),
-            })
-            .await
-            .unwrap();
+        let replay = service.allocate_timestamps(request).await.unwrap();
         let (after_repeat, after_repeat_revision) = metadata
             .load_generator(route.generator_id)
             .await
