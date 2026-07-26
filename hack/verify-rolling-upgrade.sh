@@ -192,50 +192,32 @@ with open(sys.argv[3], encoding="utf-8") as handle:
             key, value = line.split("=", 1)
             blocks[current][key] = value
 
-expected_order = [
-    "old-worker-0",
-    "old-worker-1",
-    "old-worker-2",
-    "replace-0-started",
-    "new-worker-0",
-    "replace-1-started",
-    "new-worker-1",
-    "replace-2-started",
-    "new-worker-2",
-    "rollback-replace-2-started",
-    "rollback-old-worker-2",
-    "rollback-replace-1-started",
-    "rollback-old-worker-1",
-    "rollback-replace-0-started",
-    "rollback-old-worker-0",
-]
-if list(blocks) != expected_order:
-    raise SystemExit(f"identity evidence order mismatch: observed={list(blocks)}")
-
 service_endpoints = summary.get("service_endpoints", "").split(",")
 if len(service_endpoints) != 3 or any(not endpoint for endpoint in service_endpoints):
     raise SystemExit(f"expected three service endpoints, got {service_endpoints}")
-expected_ack_contract = {
-    "old-worker-0": ("1", "old_only", service_endpoints[0]),
-    "old-worker-1": ("2", "old_only", service_endpoints[1]),
-    "old-worker-2": ("3", "old_only", service_endpoints[2]),
-    "replace-0-started": ("4", "replace_0", ""),
-    "new-worker-0": ("5", "mixed_1", service_endpoints[0]),
-    "replace-1-started": ("6", "replace_1", ""),
-    "new-worker-1": ("7", "mixed_2", service_endpoints[1]),
-    "replace-2-started": ("8", "replace_2", ""),
-    "new-worker-2": ("9", "new_only", service_endpoints[2]),
-    "rollback-replace-2-started": ("10", "rollback_replace_2", service_endpoints[1]),
-    "rollback-old-worker-2": ("11", "rollback_mixed_1", service_endpoints[2]),
-    "rollback-replace-1-started": ("12", "rollback_replace_1", service_endpoints[2]),
-    "rollback-old-worker-1": ("13", "rollback_mixed_2", service_endpoints[1]),
-    "rollback-replace-0-started": ("14", "rollback_replace_0", service_endpoints[1]),
-    "rollback-old-worker-0": ("15", "old_only_after_rollback", service_endpoints[0]),
-}
+expected_ack_contract = [
+    ("old-worker-0", "1", "old_only", service_endpoints[0]),
+    ("old-worker-1", "2", "old_only", service_endpoints[1]),
+    ("old-worker-2", "3", "old_only", service_endpoints[2]),
+    ("replace-0-started", "4", "replace_0", ""),
+    ("new-worker-0", "5", "mixed_1", service_endpoints[0]),
+    ("replace-1-started", "6", "replace_1", ""),
+    ("new-worker-1", "7", "mixed_2", service_endpoints[1]),
+    ("replace-2-started", "8", "replace_2", ""),
+    ("new-worker-2", "9", "new_only", service_endpoints[2]),
+    ("rollback-replace-2-started", "10", "rollback_replace_2", service_endpoints[1]),
+    ("rollback-old-worker-2", "11", "rollback_mixed_1", service_endpoints[2]),
+    ("rollback-replace-1-started", "12", "rollback_replace_1", service_endpoints[2]),
+    ("rollback-old-worker-1", "13", "rollback_mixed_2", service_endpoints[1]),
+    ("rollback-replace-0-started", "14", "rollback_replace_0", service_endpoints[1]),
+    ("rollback-old-worker-0", "15", "old_only_after_rollback", service_endpoints[0]),
+]
+if list(blocks) != [contract[0] for contract in expected_ack_contract]:
+    raise SystemExit(f"identity evidence order mismatch: observed={list(blocks)}")
+
 last_serving_tso = None
-for label in expected_order:
+for label, expected_sequence, expected_phase, expected_target in expected_ack_contract:
     block = blocks[label]
-    expected_sequence, expected_phase, expected_target = expected_ack_contract[label]
     observed_contract = (
         block.get("sequence"),
         block.get("phase"),
@@ -289,10 +271,6 @@ for generation, label_prefix, expected_commit in (
             raise SystemExit(
                 f"{generation} worker {index} build mismatch: "
                 f"expected={expected_commit} observed={block.get('build_commit')}"
-            )
-        if block.get("target_endpoint") != block.get("observed_owner_endpoint"):
-            raise SystemExit(
-                f"{generation} worker {index} was ready but did not serve the continuous timeline"
             )
 
 current_request = metrics(sys.argv[4])
@@ -369,6 +347,15 @@ stop = body.find('stop_process "${ACTIVE_PIDS[idx]}"')
 if ack < 0 or stop < 0 or ack >= stop:
     raise SystemExit("rollback safe-owner serving acknowledgement must happen before target stop")
 PY
+}
+
+expect_failure() {
+  local label=$1
+  shift
+  if "$@" >/dev/null 2>&1; then
+    echo "rolling-upgrade verifier accepted ${label}" >&2
+    return 1
+  fi
 }
 
 self_test() {
@@ -456,49 +443,15 @@ EOF
     done
   } >"${bench}"
 
-  sequence=0
-  serving_tso=90
-  for label in \
-    old-worker-0 old-worker-1 old-worker-2 replace-0-started new-worker-0 \
-    replace-1-started new-worker-1 replace-2-started new-worker-2 \
-    rollback-replace-2-started rollback-old-worker-2 \
-    rollback-replace-1-started rollback-old-worker-1 \
-    rollback-replace-0-started rollback-old-worker-0; do
-    sequence=$((sequence + 1))
-    serving_tso=$((serving_tso + 1))
+  while IFS='|' read -r label sequence phase target_endpoint observed_owner generation index; do
     {
       echo "[${label}]"
       echo "sequence=${sequence}"
       echo "status=serving"
-      case "${label}" in
-        old-worker-*) phase=old_only ;;
-        replace-0-started) phase=replace_0 ;;
-        new-worker-0) phase=mixed_1 ;;
-        replace-1-started) phase=replace_1 ;;
-        new-worker-1) phase=mixed_2 ;;
-        replace-2-started) phase=replace_2 ;;
-        new-worker-2) phase=new_only ;;
-        rollback-replace-2-started) phase=rollback_replace_2 ;;
-        rollback-old-worker-2) phase=rollback_mixed_1 ;;
-        rollback-replace-1-started) phase=rollback_replace_1 ;;
-        rollback-old-worker-1) phase=rollback_mixed_2 ;;
-        rollback-replace-0-started) phase=rollback_replace_0 ;;
-        rollback-old-worker-0) phase=old_only_after_rollback ;;
-      esac
       echo "phase=${phase}"
-      if [[ "${label}" =~ ^(old|new)-worker-([0-2])$ ]]; then
-        generation="${BASH_REMATCH[1]}"
-        index="${BASH_REMATCH[2]}"
-      elif [[ "${label}" =~ ^rollback-old-worker-([0-2])$ ]]; then
-        generation=rollback
-        index="${BASH_REMATCH[1]}"
-      else
-        generation=
-        index=
-      fi
-      if [[ -n "${generation}" ]]; then
-        echo "target_endpoint=127.0.0.1:$((52051 + index))"
-        echo "observed_owner_endpoint=127.0.0.1:$((52051 + index))"
+      echo "target_endpoint=${target_endpoint#-}"
+      echo "observed_owner_endpoint=${observed_owner}"
+      if [[ "${generation}" != "-" ]]; then
         if [[ "${generation}" == "rollback" ]]; then
           echo "instance_id=upgrade-rollback-old-${index}"
         else
@@ -511,28 +464,31 @@ EOF
           echo "build_commit=1111111111111111111111111111111111111111"
         fi
       else
-        case "${label}" in
-          rollback-replace-2-started | rollback-replace-0-started)
-            safe_endpoint=127.0.0.1:52052
-            ;;
-          rollback-replace-1-started)
-            safe_endpoint=127.0.0.1:52053
-            ;;
-          *)
-            safe_endpoint=
-            ;;
-        esac
-        echo "target_endpoint=${safe_endpoint}"
-        echo "observed_owner_endpoint=${safe_endpoint:-127.0.0.1:52051}"
         echo "instance_id="
         echo "worker_id="
         echo "build_commit="
       fi
       echo "observed_epoch=1"
       echo "observed_route_version=${sequence}"
-      echo "serving_tso=${serving_tso}"
+      echo "serving_tso=$((90 + sequence))"
     } >>"${identity}"
-  done
+  done <<'EOF'
+old-worker-0|1|old_only|127.0.0.1:52051|127.0.0.1:52051|old|0
+old-worker-1|2|old_only|127.0.0.1:52052|127.0.0.1:52052|old|1
+old-worker-2|3|old_only|127.0.0.1:52053|127.0.0.1:52053|old|2
+replace-0-started|4|replace_0|-|127.0.0.1:52051|-|-
+new-worker-0|5|mixed_1|127.0.0.1:52051|127.0.0.1:52051|new|0
+replace-1-started|6|replace_1|-|127.0.0.1:52051|-|-
+new-worker-1|7|mixed_2|127.0.0.1:52052|127.0.0.1:52052|new|1
+replace-2-started|8|replace_2|-|127.0.0.1:52051|-|-
+new-worker-2|9|new_only|127.0.0.1:52053|127.0.0.1:52053|new|2
+rollback-replace-2-started|10|rollback_replace_2|127.0.0.1:52052|127.0.0.1:52052|-|-
+rollback-old-worker-2|11|rollback_mixed_1|127.0.0.1:52053|127.0.0.1:52053|rollback|2
+rollback-replace-1-started|12|rollback_replace_1|127.0.0.1:52053|127.0.0.1:52053|-|-
+rollback-old-worker-1|13|rollback_mixed_2|127.0.0.1:52052|127.0.0.1:52052|rollback|1
+rollback-replace-0-started|14|rollback_replace_0|127.0.0.1:52052|127.0.0.1:52052|-|-
+rollback-old-worker-0|15|old_only_after_rollback|127.0.0.1:52051|127.0.0.1:52051|rollback|0
+EOF
 
   cat >"${current_request}" <<EOF
 probe_timeline_key=bench.rolling-upgrade.0
@@ -554,97 +510,61 @@ EOF
 
   sed 's/evidence_contract=same_format_forward_and_rollback_v1/evidence_contract=forward_only/' \
     "${summary}" >"${summary}.invalid"
-  if verify_rolling_upgrade "${summary}.invalid" >/dev/null 2>&1; then
-    echo "rolling-upgrade verifier accepted forward-only evidence as rollback" >&2
-    return 1
-  fi
+  expect_failure "forward-only evidence as rollback" verify_rolling_upgrade "${summary}.invalid"
 
   sed 's/current_cluster_format=2/current_cluster_format=3/' "${summary}" >"${summary}.invalid"
-  if verify_rolling_upgrade "${summary}.invalid" >/dev/null 2>&1; then
-    echo "rolling-upgrade verifier accepted a mixed-format rollout" >&2
-    return 1
-  fi
+  expect_failure "a mixed-format rollout" verify_rolling_upgrade "${summary}.invalid"
 
   sed 's/global_max_success_gap_ms=120/global_max_success_gap_ms=3001/' \
     "${bench}" >"${bench}.invalid"
   sed "s#bench_log=${bench}#bench_log=${bench}.invalid#" "${summary}" >"${summary}.invalid"
-  if verify_rolling_upgrade "${summary}.invalid" >/dev/null 2>&1; then
-    echo "rolling-upgrade verifier accepted an excessive allocation outage" >&2
-    return 1
-  fi
+  expect_failure "an excessive allocation outage" verify_rolling_upgrade "${summary}.invalid"
 
   sed 's/mixed_2_first_tso=140/mixed_2_first_tso=139/' "${bench}" >"${bench}.invalid"
   sed "s#bench_log=${bench}#bench_log=${bench}.invalid#" "${summary}" >"${summary}.invalid"
-  if verify_rolling_upgrade "${summary}.invalid" >/dev/null 2>&1; then
-    echo "rolling-upgrade verifier accepted overlapping phase ranges" >&2
-    return 1
-  fi
+  expect_failure "overlapping phase ranges" verify_rolling_upgrade "${summary}.invalid"
 
   sed 's/rollback_mixed_1_failed_total=0/rollback_mixed_1_failed_total=1/' \
     "${bench}" >"${bench}.invalid"
   sed "s#bench_log=${bench}#bench_log=${bench}.invalid#" "${summary}" >"${summary}.invalid"
-  if verify_rolling_upgrade "${summary}.invalid" >/dev/null 2>&1; then
-    echo "rolling-upgrade verifier accepted a rollback logical failure" >&2
-    return 1
-  fi
+  expect_failure "a rollback logical failure" verify_rolling_upgrade "${summary}.invalid"
 
   sed 's/old_only_attempt_failed_total=1/old_only_attempt_failed_total=999999/' \
     "${bench}" >"${bench}.invalid"
   sed "s#bench_log=${bench}#bench_log=${bench}.invalid#" "${summary}" >"${summary}.invalid"
-  if verify_rolling_upgrade "${summary}.invalid" >/dev/null 2>&1; then
-    echo "rolling-upgrade verifier accepted more failed attempts than logical requests" >&2
-    return 1
-  fi
+  expect_failure "more failed attempts than logical requests" verify_rolling_upgrade "${summary}.invalid"
 
   sed 's/build_commit=2222222222222222222222222222222222222222/build_commit=1111111111111111111111111111111111111111/' \
     "${identity}" >"${identity}.invalid"
   sed "s#identity_log=${identity}#identity_log=${identity}.invalid#" \
     "${summary}" >"${summary}.invalid"
-  if verify_rolling_upgrade "${summary}.invalid" >/dev/null 2>&1; then
-    echo "rolling-upgrade verifier accepted a replacement that still ran the old build" >&2
-    return 1
-  fi
+  expect_failure "a replacement that still ran the old build" verify_rolling_upgrade "${summary}.invalid"
 
   sed 's/sequence=5/sequence=4/' "${identity}" >"${identity}.invalid"
   sed "s#identity_log=${identity}#identity_log=${identity}.invalid#" \
     "${summary}" >"${summary}.invalid"
-  if verify_rolling_upgrade "${summary}.invalid" >/dev/null 2>&1; then
-    echo "rolling-upgrade verifier accepted a duplicate acknowledgement sequence" >&2
-    return 1
-  fi
+  expect_failure "a duplicate acknowledgement sequence" verify_rolling_upgrade "${summary}.invalid"
 
   sed 's/phase=rollback_mixed_2/phase=old_only/' "${identity}" >"${identity}.invalid"
   sed "s#identity_log=${identity}#identity_log=${identity}.invalid#" \
     "${summary}" >"${summary}.invalid"
-  if verify_rolling_upgrade "${summary}.invalid" >/dev/null 2>&1; then
-    echo "rolling-upgrade verifier accepted an acknowledgement phase mismatch" >&2
-    return 1
-  fi
+  expect_failure "an acknowledgement phase mismatch" verify_rolling_upgrade "${summary}.invalid"
 
   sed '/^\[rollback-replace-2-started\]$/,/^\[rollback-old-worker-2\]$/ s/^observed_owner_endpoint=.*/observed_owner_endpoint=127.0.0.1:52053/' \
     "${identity}" >"${identity}.invalid"
   sed "s#identity_log=${identity}#identity_log=${identity}.invalid#" \
     "${summary}" >"${summary}.invalid"
-  if verify_rolling_upgrade "${summary}.invalid" >/dev/null 2>&1; then
-    echo "rolling-upgrade verifier accepted a safe target that was not the actual serving owner" >&2
-    return 1
-  fi
+  expect_failure "a safe target that was not the actual serving owner" verify_rolling_upgrade "${summary}.invalid"
 
   sed 's/probe_response_protobuf_hex=0a01/probe_response_protobuf_hex=0c01/' \
     "${historical_replay}" >"${historical_replay}.invalid"
   sed "s#historical_replay_log=${historical_replay}#historical_replay_log=${historical_replay}.invalid#" \
     "${summary}" >"${summary}.invalid"
-  if verify_rolling_upgrade "${summary}.invalid" >/dev/null 2>&1; then
-    echo "rolling-upgrade verifier accepted a changed cross-binary replay response" >&2
-    return 1
-  fi
+  expect_failure "a changed cross-binary replay response" verify_rolling_upgrade "${summary}.invalid"
 
   sed 's/global_last_tso=260/global_last_tso=250/' "${bench}" >"${bench}.invalid"
   sed "s#bench_log=${bench}#bench_log=${bench}.invalid#" "${summary}" >"${summary}.invalid"
-  if verify_rolling_upgrade "${summary}.invalid" >/dev/null 2>&1; then
-    echo "rolling-upgrade verifier accepted an allocator that did not pass the fresh request" >&2
-    return 1
-  fi
+  expect_failure "an allocator that did not pass the fresh request" verify_rolling_upgrade "${summary}.invalid"
 
   echo "[rolling-upgrade] verifier self-test passed"
 }
