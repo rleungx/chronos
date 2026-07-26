@@ -1,9 +1,14 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::error::Error;
+use std::fs::File;
+use std::io::{BufWriter, Write};
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::sync::Mutex as StdMutex;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;
+use serde_json::{json, Value};
 use tokio::sync::Barrier;
 use tonic::transport::Channel;
 use tonic::{Code, Request, Status};
@@ -92,6 +97,59 @@ struct BenchConfig {
     route_to_owners: bool,
     allocate_request_timeout_ms: u64,
     idempotency_enabled: bool,
+    allocate_retry_attempts: usize,
+    timeline_key: Option<String>,
+    request_interval_ms: u64,
+    trace_path: Option<PathBuf>,
+    trace_max_records: u64,
+}
+
+#[derive(Clone)]
+struct Trace {
+    output: Arc<StdMutex<BufWriter<File>>>,
+    origin: Instant,
+}
+
+impl Trace {
+    fn open(path: &PathBuf) -> AppResult<Self> {
+        Ok(Self {
+            output: Arc::new(StdMutex::new(BufWriter::new(File::create(path)?))),
+            origin: Instant::now(),
+        })
+    }
+
+    fn stamp(&self) -> (u128, u128) {
+        let wall = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        (wall, self.origin.elapsed().as_nanos())
+    }
+
+    fn emit(&self, value: Value) -> AppResult<()> {
+        let mut output = self.output.lock().map_err(|_| "trace lock poisoned")?;
+        serde_json::to_writer(&mut *output, &value)?;
+        output.write_all(b"\n")?;
+        output.flush()?;
+        Ok(())
+    }
+}
+
+fn trace_attempt_failures(attempts: &[Value], _refreshes: &[Value]) -> u64 {
+    attempts
+        .iter()
+        .filter(|attempt| attempt["connect"] == "failed" || attempt["rpc"] == "grpc_error")
+        .count() as u64
+}
+
+fn trace_attempt(
+    attempt: usize,
+    connect: &str,
+    rpc: &str,
+    started: Option<(u128, u128)>,
+    finished: Option<(u128, u128)>,
+) -> Value {
+    json!({"attempt":attempt+1,"connect":connect,"rpc":rpc,"started":started,"finished":finished})
 }
 
 #[derive(Default)]
@@ -116,6 +174,7 @@ struct RebalanceWorkerStats {
     first_tso: Option<u64>,
     last_tso: Option<u64>,
     error_counts: HashMap<String, u64>,
+    allocate_attempt_failed_total: u64,
 }
 
 #[derive(Default)]
@@ -138,6 +197,7 @@ struct RebalanceBenchStats {
     first_tso: Option<u64>,
     last_tso: Option<u64>,
     error_counts: HashMap<String, u64>,
+    allocate_attempt_failed_total: u64,
     transfer_attempts_total: u64,
     transfer_success_total: u64,
     transfer_failed_total: u64,
@@ -229,6 +289,27 @@ fn load_config() -> AppResult<BenchConfig> {
     );
     let idempotency_enabled =
         parse_boolish(&env_or_string("CHRONOS_CONTROL_BENCH_IDEMPOTENCY", "0"))?;
+    let allocate_retry_attempts = env_or(
+        "CHRONOS_CONTROL_BENCH_ALLOCATE_RETRY_ATTEMPTS",
+        REBALANCE_ALLOCATE_RETRY_ATTEMPTS,
+    );
+    let timeline_key = std::env::var("CHRONOS_CONTROL_BENCH_TIMELINE_KEY")
+        .ok()
+        .filter(|value| !value.is_empty());
+    let request_interval_ms = env_or("CHRONOS_CONTROL_BENCH_REQUEST_INTERVAL_MS", 0u64);
+    let trace_path = std::env::var("CHRONOS_CONTROL_BENCH_TRACE_FILE")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    let trace_max_records = env_or("CHRONOS_CONTROL_BENCH_TRACE_MAX_RECORDS", 2048u64);
+    if trace_path.is_some() && (concurrency != 1 || timeline_count != 1 || trace_max_records == 0) {
+        return Err(
+            "trace requires concurrency=1, timelines=1, and a positive record limit".into(),
+        );
+    }
+    if timeline_key.is_some() && timeline_count != 1 {
+        return Err("explicit timeline key requires timelines=1".into());
+    }
 
     Ok(BenchConfig {
         endpoint,
@@ -254,6 +335,11 @@ fn load_config() -> AppResult<BenchConfig> {
         route_to_owners,
         allocate_request_timeout_ms,
         idempotency_enabled,
+        allocate_retry_attempts,
+        timeline_key,
+        request_interval_ms,
+        trace_path,
+        trace_max_records,
     })
 }
 
@@ -274,12 +360,14 @@ async fn ensure_seed_routes(
     let mut client = TimelineRouteServiceClient::new(channel);
     let mut routes = Vec::with_capacity(config.timeline_count);
     for idx in 0..config.timeline_count {
-        let timeline_key = format!(
-            "{}.{}.{}",
-            config.timeline_namespace,
-            config.scenario.as_str(),
-            idx
-        );
+        let timeline_key = config.timeline_key.clone().unwrap_or_else(|| {
+            format!(
+                "{}.{}.{}",
+                config.timeline_namespace,
+                config.scenario.as_str(),
+                idx
+            )
+        });
         let route = client
             .ensure_timeline(Request::new(EnsureTimelineRequest {
                 timeline_key,
@@ -667,6 +755,7 @@ fn next_target_generator(current: u32, targets: &[u32]) -> Option<u32> {
 async fn run_allocation_bench(
     config: &BenchConfig,
     seeded_routes: &[RouteSnapshot],
+    trace: Option<Trace>,
 ) -> AppResult<RebalanceBenchStats> {
     if seeded_routes.is_empty() {
         return Err("allocation scenario requires seeded timelines".into());
@@ -705,6 +794,10 @@ async fn run_allocation_bench(
         let allocate_batch = config.allocate_batch;
         let allocate_request_timeout_ms = config.allocate_request_timeout_ms;
         let idempotency_enabled = config.idempotency_enabled;
+        let allocate_retry_attempts = config.allocate_retry_attempts;
+        let request_interval_ms = config.request_interval_ms;
+        let trace_max_records = config.trace_max_records;
+        let trace = trace.clone();
         let route_snapshots = route_snapshots.clone();
         let route_keys = route_keys.clone();
         worker_handles.push(tokio::spawn(async move {
@@ -724,6 +817,7 @@ async fn run_allocation_bench(
                 .collect::<Vec<_>>();
             let mut route_idx = 0usize;
             let mut request_ordinal = 0u64;
+            let mut trace_records = 0u64;
 
             barrier.wait().await;
             loop {
@@ -735,16 +829,27 @@ async fn run_allocation_bench(
                 let timeline_key = &worker_keys[route_idx % worker_keys.len()];
                 route_idx = (route_idx + 1) % worker_keys.len();
                 request_ordinal = request_ordinal.saturating_add(1);
+                if trace.as_ref().is_some_and(|_| trace_records >= trace_max_records) {
+                    trace.as_ref().unwrap().emit(json!({"record_type":"terminal",
+                        "trace_limit_exhausted":true,"logical_record_count":trace_records}))?;
+                    return Err("control bench trace record limit exhausted".into());
+                }
                 let route = route_snapshots
                     .get(timeline_key)
                     .ok_or("missing route snapshot")?
                     .clone();
+                let logical_started = trace.as_ref().map(Trace::stamp);
+                let mut attempts = Vec::new();
+                let mut refreshes = Vec::new();
+                let mut attempt_failures = 0;
+                let mut response_received_unix_ns = 0u128;
 
                 let logical_result: Result<chronos::proto::v1::AllocateTimestampsResponse, ()> =
                     async {
                         let mut current_route = route.clone();
 
-                        for attempt in 0..=REBALANCE_ALLOCATE_RETRY_ATTEMPTS {
+                        for attempt in 0..=allocate_retry_attempts {
+                            let attempt_started = trace.as_ref().map(Trace::stamp);
                             let request = AllocateTimestampsRequest {
                                 timeline_key: current_route.timeline_key.clone(),
                                 count: allocate_batch,
@@ -760,9 +865,20 @@ async fn run_allocation_bench(
                             };
                             let allocation_endpoint =
                                 allocation_endpoint(&current_route, &endpoint, route_to_owners);
-                            ensure_timestamp_client(&mut timestamp_clients, &allocation_endpoint)
-                                .await
-                                .map_err(|_| ())?;
+                            if ensure_timestamp_client(
+                                &mut timestamp_clients,
+                                &allocation_endpoint,
+                            )
+                            .await
+                            .is_err()
+                            {
+                                attempt_failures += 1;
+                                attempts.extend(trace.as_ref().map(|_| trace_attempt(attempt, "failed", "not_run", attempt_started, trace.as_ref().map(Trace::stamp))));
+                                if attempt == allocate_retry_attempts {
+                                    return Err(());
+                                }
+                                continue;
+                            }
                             let timestamp_client = timestamp_clients
                                 .get_mut(&allocation_endpoint)
                                 .ok_or(())
@@ -772,8 +888,15 @@ async fn run_allocation_bench(
                                 .allocate_timestamps(Request::new(request))
                                 .await
                             {
-                                Ok(response) => return Ok(response.into_inner()),
+                                Ok(response) => {
+                                    let finished = trace.as_ref().map(Trace::stamp);
+                                    response_received_unix_ns = finished.map_or(0, |stamp| stamp.0);
+                                    attempts.extend(trace.as_ref().map(|_| trace_attempt(attempt, "reused", "success", attempt_started, finished)));
+                                    return Ok(response.into_inner());
+                                }
                                 Err(status) => {
+                                    attempt_failures += 1;
+                                    attempts.extend(trace.as_ref().map(|_| trace_attempt(attempt, "reused", "grpc_error", attempt_started, trace.as_ref().map(Trace::stamp))));
                                     let detail = decode_error_detail(&status);
                                     record_error_count(
                                         &mut stats.error_counts,
@@ -781,7 +904,7 @@ async fn run_allocation_bench(
                                     );
 
                                     if !is_transient_rebalance_error(&status, detail.as_ref())
-                                        || attempt == REBALANCE_ALLOCATE_RETRY_ATTEMPTS
+                                        || attempt == allocate_retry_attempts
                                     {
                                         return Err(());
                                     }
@@ -791,6 +914,8 @@ async fn run_allocation_bench(
                                         detail.as_ref(),
                                     ) {
                                         let refresh_start = Instant::now();
+                                        let refresh_trace_started =
+                                            trace.as_ref().map(Trace::stamp);
                                         let refreshed = match refresh_route(
                                             &mut route_client,
                                             &current_route.timeline_key,
@@ -803,9 +928,11 @@ async fn run_allocation_bench(
                                                     &mut stats.error_counts,
                                                     "route_refresh_failed",
                                                 );
+                                                refreshes.extend(trace.as_ref().map(|_| json!({"outcome":"failed","started":refresh_trace_started,"finished":trace.as_ref().map(Trace::stamp)})));
                                                 return Err(());
                                             }
                                         };
+                                        refreshes.extend(trace.as_ref().map(|_| json!({"outcome":"success","started":refresh_trace_started,"finished":trace.as_ref().map(Trace::stamp)})));
                                         let refresh_elapsed =
                                             refresh_start.elapsed().as_micros() as u64;
                                         route_snapshots.insert(
@@ -830,8 +957,11 @@ async fn run_allocation_bench(
                         Err(())
                     }
                     .await;
+                debug_assert!(trace.is_none() || attempt_failures == trace_attempt_failures(&attempts, &refreshes));
+                stats.allocate_attempt_failed_total += attempt_failures;
 
                 let elapsed = request_start.elapsed().as_micros() as u64;
+                let logical_finished = trace.as_ref().map(Trace::stamp);
                 if request_start >= warmup_until {
                     stats.allocate_requests_total += 1;
                     stats.allocate_latencies_us.push(elapsed);
@@ -856,9 +986,31 @@ async fn run_allocation_bench(
                         route.route_version = response.route_version;
                         route.generator_id = response.generator_id;
                     }
+                    if let Some(trace) = &trace {
+                        trace.emit(json!({"record_type":"logical_request","ordinal":request_ordinal,
+                            "timeline_key":response.timeline_key,"started":logical_started,"finished":logical_finished,
+                            "attempts":attempts,"route_refreshes":refreshes,"logical_outcome":"success",
+                            "response_received_unix_ns":response_received_unix_ns,
+                            "range_start":response.ranges.first().map(|range|range.start_tso),
+                            "range_end":response.ranges.last().map(|range|range.end_tso)}))?;
+                        trace_records += 1;
+                    }
+                } else if let Some(trace) = &trace {
+                    trace.emit(json!({"record_type":"logical_request","ordinal":request_ordinal,
+                        "timeline_key":route.timeline_key,"started":logical_started,"finished":logical_finished,
+                        "attempts":attempts,"route_refreshes":refreshes,"logical_outcome":"failure",
+                        "response_received_unix_ns":0}))?;
+                    trace_records += 1;
+                }
+                if request_interval_ms > 0 {
+                    tokio::time::sleep(Duration::from_millis(request_interval_ms)).await;
                 }
             }
 
+            if let Some(trace) = &trace {
+                trace.emit(json!({"record_type":"terminal","trace_limit_exhausted":false,
+                    "logical_record_count":trace_records,"failed_allocation_attempt_count":stats.allocate_attempt_failed_total}))?;
+            }
             Ok::<RebalanceWorkerStats, Box<dyn Error + Send + Sync>>(stats)
         }));
     }
@@ -984,6 +1136,7 @@ async fn run_allocation_bench(
             .route_refresh_latencies_us
             .extend(stats.route_refresh_latencies_us);
         total.monotonicity_violations_total += stats.monotonicity_violations_total;
+        total.allocate_attempt_failed_total += stats.allocate_attempt_failed_total;
         if let Some(first_tso) = stats.first_tso {
             total.first_tso = Some(
                 total
@@ -1058,6 +1211,14 @@ fn print_allocation_summary(config: &BenchConfig, stats: RebalanceBenchStats) {
         stats
             .allocate_requests_total
             .saturating_sub(stats.allocate_success_total)
+    );
+    println!(
+        "allocate_attempt_failed_total={}",
+        stats.allocate_attempt_failed_total
+    );
+    println!(
+        "allocation_timeline_key={}",
+        config.timeline_key.as_deref().unwrap_or("")
     );
     println!("allocate_tsos_total={}", stats.allocate_tsos_total);
     println!("allocation_first_tso={}", stats.first_tso.unwrap_or(0));
@@ -1203,9 +1364,22 @@ fn print_status_summary(config: &BenchConfig, stats: StatusWorkerStats) {
 #[tokio::main]
 async fn main() -> AppResult<()> {
     let config = load_config()?;
-    let seed_channel = connect_channel(config.endpoint.clone()).await?;
+    let trace = config.trace_path.as_ref().map(Trace::open).transpose()?;
+    let started = trace.as_ref().map(Trace::stamp);
+    let connected = connect_channel(config.endpoint.clone()).await;
+    if let Some(trace) = &trace {
+        trace.emit(json!({"record_type":"setup_attempt","stage":"route_connect",
+            "outcome":if connected.is_ok(){"success"}else{"failure"},"started":started,"finished":trace.stamp()}))?;
+    }
+    let seed_channel = connected?;
+    let started = trace.as_ref().map(Trace::stamp);
     let seeded_routes = if config.seed_timelines {
-        ensure_seed_routes(&config, seed_channel.clone()).await?
+        let ensured = ensure_seed_routes(&config, seed_channel.clone()).await;
+        if let Some(trace) = &trace {
+            trace.emit(json!({"record_type":"setup_attempt","stage":"ensure_timeline",
+                "outcome":if ensured.is_ok(){"success"}else{"failure"},"started":started,"finished":trace.stamp()}))?;
+        }
+        ensured?
     } else {
         Vec::new()
     };
@@ -1215,7 +1389,7 @@ async fn main() -> AppResult<()> {
             print_status_summary(&config, stats);
         }
         Scenario::AllocateOnly | Scenario::AllocateDuringRebalance => {
-            let stats = run_allocation_bench(&config, &seeded_routes).await?;
+            let stats = run_allocation_bench(&config, &seeded_routes, trace).await?;
             print_allocation_summary(&config, stats);
         }
     }
@@ -1329,5 +1503,40 @@ mod tests {
         assert_eq!(next_target_generator(1, &[0, 1, 2]), Some(2));
         assert_eq!(next_target_generator(9, &[0, 1, 2]), Some(0));
         assert_eq!(next_target_generator(4, &[4]), Some(4));
+    }
+
+    #[test]
+    fn trace_attempt_accounting_separates_attempts_from_refreshes() {
+        let success = json!({"connect":"reused","rpc":"success"});
+        let failure = json!({"connect":"reused","rpc":"grpc_error"});
+        let refresh_failure = vec![json!({"outcome":"failed"})];
+        let cases = [
+            ("zero_failure", vec![success.clone()], vec![], 0),
+            (
+                "one_failure_retry_success",
+                vec![failure.clone(), success],
+                vec![],
+                1,
+            ),
+            (
+                "one_failure_refresh_failure",
+                vec![failure.clone()],
+                refresh_failure,
+                1,
+            ),
+            (
+                "two_failure_retry_exhaustion",
+                vec![failure.clone(), failure],
+                vec![],
+                2,
+            ),
+        ];
+        for (name, attempts, refreshes, expected) in cases {
+            assert_eq!(
+                trace_attempt_failures(&attempts, &refreshes),
+                expected,
+                "{name}"
+            );
+        }
     }
 }

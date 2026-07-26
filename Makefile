@@ -36,6 +36,7 @@ ETCD_ENDPOINTS ?= 127.0.0.1:2379
 	test-soak-quick \
 	test-chaos \
 	test-chaos-quick \
+	test-chaos-verifier \
 	test-dr-monotonicity-verifier \
 	test-cluster-leader-loss-verifier \
 	test-cluster-leader-loss \
@@ -295,6 +296,8 @@ test-chaos-quick:
 	CHRONOS_CHAOS_BENCH_DURATION_SECS=5 \
 	$(MAKE) test-chaos
 
+test-chaos-verifier: ; bash hack/verify-chaos-lease-loss.sh "" --self-test
+
 test-dr-monotonicity-verifier:
 	bash hack/verify-dr-monotonicity.sh --self-test
 
@@ -520,6 +523,7 @@ release-security-check: release-package
 release-check-core:
 	$(MAKE) test-layer-0
 	$(MAKE) test-release-core
+	$(MAKE) test-chaos-verifier
 	$(MAKE) test-dr-monotonicity-verifier
 	$(MAKE) test-cluster-leader-loss-verifier
 	$(MAKE) test-owner-etcd-partition-verifier
