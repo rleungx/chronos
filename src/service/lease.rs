@@ -92,7 +92,8 @@ impl TsoService {
                     let takeover_ready = lease_expire_at_ms.is_some_and(|exp| {
                         crate::lease_expired_with_safety_gap(exp, now_ms, self.config.safety_gap_ms)
                     });
-                    if self.is_local_generator_owner(&record) && !takeover_ready {
+                    let is_local_owner = self.is_local_generator_owner(&record);
+                    if is_local_owner && !takeover_ready {
                         let Some(lease_expire_at_ms) = lease_expire_at_ms else {
                             self.clear_generator_ownership_drift(generator_id);
                             return Err(TsoError::GeneratorLeaseExpired { generator_id });
@@ -124,19 +125,21 @@ impl TsoService {
                         return Err(TsoError::GeneratorLeaseExpired { generator_id });
                     }
 
-                    if let Some(exp) = lease_expire_at_ms.filter(|exp| *exp > now_ms) {
-                        if self.is_local_endpoint(&record.owner_worker_endpoint) {
-                            self.observe_contended_local_generator_ownership_drift(
-                                generator_id,
-                                &record.owner_instance_id,
-                                exp,
-                                now_ms,
-                            );
+                    if !is_local_owner {
+                        if let Some(exp) = lease_expire_at_ms.filter(|exp| *exp > now_ms) {
+                            if self.is_local_endpoint(&record.owner_worker_endpoint) {
+                                self.observe_contended_local_generator_ownership_drift(
+                                    generator_id,
+                                    &record.owner_instance_id,
+                                    exp,
+                                    now_ms,
+                                );
+                            } else {
+                                self.clear_generator_ownership_drift(generator_id);
+                            }
                         } else {
                             self.clear_generator_ownership_drift(generator_id);
                         }
-                    } else {
-                        self.clear_generator_ownership_drift(generator_id);
                     }
 
                     if takeover_ready {
@@ -827,6 +830,10 @@ mod tests {
         let service = TsoService::new(config.clone(), clock.clone(), metadata.clone()).unwrap();
         service.background.begin_shutdown();
         service.background.drain_tasks().await;
+        let sink = Arc::new(TestReadinessSink::default());
+        service.set_worker_readiness_sink(sink.clone());
+        service.observe_contended_local_generator_ownership_drift(0, "contender", 10, 0);
+        service.observe_contended_local_generator_ownership_drift(0, "contender", 20, 1);
 
         let ensure_result = service.ensure_timeline(&route.timeline_key).await;
         let allocation_result = service
@@ -928,6 +935,8 @@ mod tests {
         assert!(after_first_attempt.last_issued_tso >= before.issued_upper_bound);
         assert!(after_first_attempt.issued_upper_bound >= before.issued_upper_bound);
         assert!(response.ranges[0].start_tso > before.issued_upper_bound.unwrap());
+        assert!(!service.ownership_drift.is_active(0));
+        assert_eq!(sink.cleared.load(Ordering::Acquire), 1);
 
         service
             .ensure_generator_lease(route.generator_id)
@@ -1010,7 +1019,7 @@ mod tests {
                 GeneratorRecord {
                     schema_version: 1,
                     generator_id,
-                    owner_worker_endpoint: "remote-endpoint".into(),
+                    owner_worker_endpoint: "remote-endpoint:50051".into(),
                     owner_instance_id: "remote-instance".into(),
                     generator_lease_token: 1,
                     lease_expire_at_ms: Some(0),
@@ -1429,6 +1438,44 @@ mod tests {
         .expect("ensure_generator_lease should stop retrying within the request budget")
         .expect_err("contention exhaustion should surface as CasFailed");
         assert!(matches!(result, TsoError::CasFailed));
+    }
+
+    #[tokio::test]
+    async fn local_takeover_failure_keeps_active_drift() {
+        let mut failure_config = required_test_config(TsoConfig::default());
+        failure_config.advertise_endpoint = "remote-endpoint:50051".into();
+        failure_config.instance_id = "remote-instance".into();
+        let failed_service = TsoService::new(
+            failure_config,
+            Arc::new(ManualClock::new(50_000)),
+            Arc::new(AlwaysCasFailLeaseStore),
+        )
+        .unwrap();
+        failed_service.background.begin_shutdown();
+        failed_service.background.drain_tasks().await;
+        let failed_sink = Arc::new(TestReadinessSink::default());
+        failed_service.set_worker_readiness_sink(failed_sink.clone());
+        failed_service.observe_contended_local_generator_ownership_drift(0, "contender", 10, 0);
+        failed_service.observe_contended_local_generator_ownership_drift(0, "contender", 20, 1);
+        assert!(failed_service.ownership_drift.is_active(0));
+
+        let cancellation = crate::plane::RequestCancellation::new();
+        cancellation.cancel();
+        assert!(matches!(
+            failed_service
+                .ensure_generator_lease_with_cancellation(0, Some(cancellation))
+                .await,
+            Err(TsoError::RequestCancelled)
+        ));
+        assert!(failed_service.ownership_drift.is_active(0));
+        let error = failed_service.ensure_generator_lease(0).await.unwrap_err();
+        assert!(matches!(error, TsoError::CasFailed));
+        assert!(failed_service.ownership_drift.is_active(0));
+        assert_eq!(failed_sink.cleared.load(Ordering::Acquire), 0);
+        assert_eq!(
+            failed_service.next_generator_with_ownership_drift(50_000),
+            Some(0)
+        );
     }
 
     #[tokio::test]
