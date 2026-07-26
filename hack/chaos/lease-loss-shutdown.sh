@@ -58,14 +58,14 @@ process_running() {
 }
 identity_get_released() { [[ "$1" -eq 0 && -z "$2" ]]; }
 log_event_ns() {
-  python3 - "$1" "$2" "$3" "${4:-}" <<'PY'
-import calendar,datetime,json,re,sys
-path,key,value,*field=sys.argv[1:]
+  python3 - "$1" "$2" "$3" "${4:-}" "${5:-}" "${6:-}" "${7:-}" <<'PY'
+import calendar,datetime,json,re,sys; path,key,value,field,required,worker,instance=sys.argv[1:]
 for line in open(path, encoding="utf-8"):
     try: row=json.loads(line)
     except json.JSONDecodeError: continue
     if str(row.get(key,"")) == value:
-        if field[0]: print(row.get(field[0],"")); break
+        if required and (not row.get(required) or row.get("result")!="failure" or row.get("worker_id")!=worker or row.get("instance_id")!=instance): continue
+        if field: print(row.get(field,"")); break
         match=re.fullmatch(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d{1,9}))?Z",row["timestamp"])
         if not match: continue
         seconds=calendar.timegm(datetime.datetime.strptime(match.group(1),"%Y-%m-%dT%H:%M:%S").timetuple())
@@ -151,7 +151,7 @@ wait_for_authority_loss() {
       PROCESS_EXIT_AT_NS="$(now_ns)"
       set +e; wait "${CHRONOS_PID}"; PROCESS_EXIT_STATUS=$?; set -e; CHRONOS_PID=""
     fi
-    IDENTITY_LOST_AT_NS="$(log_event_ns "${INITIAL_LOG}" event keepalive_lost)"
+    IDENTITY_LOST_AT_NS="$(log_event_ns "${INITIAL_LOG}" event keepalive_lost "" lease_id "${WORKER_ID}" "${INSTANCE_ID}")"
     SHUTDOWN_AT_NS="$(log_event_ns "${INITIAL_LOG}" shutdown_trigger identity_lease_lost)"
     if [[ -n "${IDENTITY_LOST_AT_NS}" && -n "${SHUTDOWN_AT_NS}" ]]; then
       AUTHORITY_BARRIER_AT_NS="$(now_ns)"; return 0
