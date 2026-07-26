@@ -395,7 +395,15 @@ run_request_probe "${CURRENT_REQUEST_ID}" "${CURRENT_REQUEST_LOG}"
 
 for idx in 2 1 0; do
   echo "[rolling-upgrade] rolling worker ${idx} back to historical"
-  issue_serving_command "rollback_replace_${idx}" - "rollback-replace-${idx}-started"
+  if [[ "${idx}" -eq 2 ]]; then
+    safe_endpoint="${SERVICE_ENDPOINTS[1]}"
+  elif [[ "${idx}" -eq 1 ]]; then
+    safe_endpoint="${SERVICE_ENDPOINTS[2]}"
+  else
+    safe_endpoint="${SERVICE_ENDPOINTS[1]}"
+  fi
+  issue_serving_command \
+    "rollback_replace_${idx}" "${safe_endpoint}" "rollback-replace-${idx}-started"
   stop_process "${ACTIVE_PIDS[idx]}"
   ACTIVE_PIDS[idx]=""
   rollback_log="${ARTIFACT_DIR}/worker-${idx}-rollback-old.log"

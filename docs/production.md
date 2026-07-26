@@ -408,8 +408,10 @@ the same timeline onto every old and replacement instance, records health-report
 identity, and requires non-empty strictly increasing ranges in old-only, every replacement window,
 both mixed-binary windows, and new-only. It then keeps the same etcd prefix and allocator while
 replacing workers `2,1,0` with fresh historical instances and applying the same checks through
-historical-only-after-rollback. Failed RPC attempts remain visible, while only one same-request-ID
-retry is allowed after an actual route refresh and logical failures remain forbidden. A
+historical-only-after-rollback. Before each stop, the timeline is acknowledged on a surviving
+owner; it stays there until the fresh replacement can actually accept the transfer. Failed RPC
+attempts remain visible, while only one same-request-ID retry is allowed after an actual route
+refresh and logical failures remain forbidden. A
 current-created request must replay with its complete protobuf response under historical workers;
 a fresh historical request and the continuous allocator must then advance beyond it. The 1500ms
 identity setting deliberately exercises historical 1s floor versus current 2s ceil request

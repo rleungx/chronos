@@ -222,11 +222,11 @@ expected_ack_contract = {
     "new-worker-1": ("7", "mixed_2", service_endpoints[1]),
     "replace-2-started": ("8", "replace_2", ""),
     "new-worker-2": ("9", "new_only", service_endpoints[2]),
-    "rollback-replace-2-started": ("10", "rollback_replace_2", ""),
+    "rollback-replace-2-started": ("10", "rollback_replace_2", service_endpoints[1]),
     "rollback-old-worker-2": ("11", "rollback_mixed_1", service_endpoints[2]),
-    "rollback-replace-1-started": ("12", "rollback_replace_1", ""),
+    "rollback-replace-1-started": ("12", "rollback_replace_1", service_endpoints[2]),
     "rollback-old-worker-1": ("13", "rollback_mixed_2", service_endpoints[1]),
-    "rollback-replace-0-started": ("14", "rollback_replace_0", ""),
+    "rollback-replace-0-started": ("14", "rollback_replace_0", service_endpoints[1]),
     "rollback-old-worker-0": ("15", "old_only_after_rollback", service_endpoints[0]),
 }
 last_serving_tso = None
@@ -474,8 +474,19 @@ EOF
           echo "build_commit=1111111111111111111111111111111111111111"
         fi
       else
-        echo "target_endpoint="
-        echo "observed_owner_endpoint=127.0.0.1:52051"
+        case "${label}" in
+          rollback-replace-2-started | rollback-replace-0-started)
+            safe_endpoint=127.0.0.1:52052
+            ;;
+          rollback-replace-1-started)
+            safe_endpoint=127.0.0.1:52053
+            ;;
+          *)
+            safe_endpoint=
+            ;;
+        esac
+        echo "target_endpoint=${safe_endpoint}"
+        echo "observed_owner_endpoint=${safe_endpoint:-127.0.0.1:52051}"
         echo "instance_id="
         echo "worker_id="
         echo "build_commit="
