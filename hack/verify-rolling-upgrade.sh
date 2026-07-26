@@ -335,6 +335,34 @@ if number(bench, "global_last_tso") <= fresh_last:
 PY
 }
 
+verify_rollback_choreography_source() {
+  python3 - "${REPO_ROOT}/hack/upgrade/rolling-same-format.sh" <<'PY'
+import re
+import sys
+
+source = open(sys.argv[1], encoding="utf-8").read()
+match = re.search(r"for idx in 2 1 0; do\n(?P<body>.*?)\ndone", source, re.DOTALL)
+if not match:
+    raise SystemExit("missing rollback 2,1,0 choreography")
+body = match.group("body")
+mapping = re.search(
+    r'if \[\[ "\$\{idx\}" -eq 2 \]\]; then\s+'
+    r'safe_endpoint="\$\{SERVICE_ENDPOINTS\[1\]\}".*?'
+    r'elif \[\[ "\$\{idx\}" -eq 1 \]\]; then\s+'
+    r'safe_endpoint="\$\{SERVICE_ENDPOINTS\[2\]\}".*?'
+    r'else\s+safe_endpoint="\$\{SERVICE_ENDPOINTS\[1\]\}"',
+    body,
+    re.DOTALL,
+)
+if not mapping:
+    raise SystemExit("rollback safe-owner mapping must remain 2->1, 1->2, 0->1")
+ack = body.find("issue_serving_command")
+stop = body.find('stop_process "${ACTIVE_PIDS[idx]}"')
+if ack < 0 or stop < 0 or ack >= stop:
+    raise SystemExit("rollback safe-owner serving acknowledgement must happen before target stop")
+PY
+}
+
 self_test() {
   local test_dir summary bench identity current_request historical_replay historical_fresh
   test_dir="$(mktemp -d)"
@@ -345,6 +373,7 @@ self_test() {
   historical_replay="${test_dir}/historical-replay.txt"
   historical_fresh="${test_dir}/historical-fresh.txt"
   trap 'rm -rf "${test_dir}"' RETURN
+  verify_rollback_choreography_source
 
   cat >"${summary}" <<EOF
 result=success
