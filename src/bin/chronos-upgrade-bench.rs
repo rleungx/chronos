@@ -985,10 +985,12 @@ mod tests {
 
         allocator.step().await.expect("allocator step");
 
-        let calls = calls.lock().expect("fake call lock");
+        let calls = {
+            let calls = calls.lock().expect("fake call lock");
+            calls.clone()
+        };
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].request_id, calls[1].request_id);
-        drop(calls);
         let stats = stats.lock().await;
         let stage = stats
             .stages
