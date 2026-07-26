@@ -1,7 +1,7 @@
 use super::*;
 
 #[tokio::test]
-async fn expired_lease_requires_failover_before_issuing_more_tsos() {
+async fn expired_local_lease_recovers_before_explicit_transfer() {
     let base = TsoConfig {
         lease_ttl_ms: 5,
         generator_maintenance_interval_ms: 1,
@@ -31,13 +31,12 @@ async fn expired_lease_requires_failover_before_issuing_more_tsos() {
     let first_last = first.ranges.last().unwrap().end_tso;
 
     clock.advance(10); // Definitely past 5ms lease
-    let expired = service_a
-        .allocate_timestamps(request(&route_a, "after-expire".to_owned(), 1))
-        .await;
-    match expired {
-        Err(TsoError::LeaseExpired { .. }) => {}
-        other => panic!("unexpected expired lease result: {:?}", other),
-    }
+    let recovered = service_a
+        .allocate_timestamps(request(&route_a, "after-local-recovery".to_owned(), 1))
+        .await
+        .unwrap();
+    assert!(first_last < recovered.ranges[0].start_tso);
+    let recovered_last = recovered.ranges.last().unwrap().end_tso;
 
     let target_generator_id = (route_a.generator_id + 1) % shared_generators;
     let transferred = service_b
@@ -58,12 +57,12 @@ async fn expired_lease_requires_failover_before_issuing_more_tsos() {
         .allocate_timestamps(request(&transferred, "after-failover".to_owned(), 1))
         .await
         .unwrap();
-    assert!(first_last < second.ranges[0].start_tso);
+    assert!(recovered_last < second.ranges[0].start_tso);
 }
 
 #[tokio::test]
 #[ignore = "requires a reachable etcd; set CHRONOS_TEST_ETCD_ENDPOINTS or run one on 127.0.0.1:2379"]
-async fn etcd_expired_lease_requires_failover_before_issuing_more_tsos() {
+async fn etcd_expired_local_lease_recovers_before_explicit_transfer() {
     let base = TsoConfig {
         lease_ttl_ms: 5,
         generator_maintenance_interval_ms: 1,
@@ -97,13 +96,12 @@ async fn etcd_expired_lease_requires_failover_before_issuing_more_tsos() {
     let first_last = first.ranges.last().unwrap().end_tso;
 
     clock.advance(10);
-    let expired = service_a
-        .allocate_timestamps(request(&route_a, "after-expire".to_owned(), 1))
-        .await;
-    match expired {
-        Err(TsoError::LeaseExpired { .. }) => {}
-        other => panic!("unexpected expired lease result: {:?}", other),
-    }
+    let recovered = service_a
+        .allocate_timestamps(request(&route_a, "after-local-recovery".to_owned(), 1))
+        .await
+        .unwrap();
+    assert!(first_last < recovered.ranges[0].start_tso);
+    let recovered_last = recovered.ranges.last().unwrap().end_tso;
 
     let target_generator_id = (route_a.generator_id + 1) % shared_generators;
     let transferred = service_b
@@ -124,7 +122,7 @@ async fn etcd_expired_lease_requires_failover_before_issuing_more_tsos() {
         .allocate_timestamps(request(&transferred, "after-failover".to_owned(), 1))
         .await
         .unwrap();
-    assert!(first_last < second.ranges[0].start_tso);
+    assert!(recovered_last < second.ranges[0].start_tso);
 }
 
 #[tokio::test]
