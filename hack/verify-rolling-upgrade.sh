@@ -165,8 +165,11 @@ for phase in PHASES:
         )
     if failed != 0:
         raise SystemExit(f"{phase} must have zero logical failures, got {failed}")
-    if attempt_failed < 0:
-        raise SystemExit(f"{phase} attempt_failed_total must be non-negative")
+    if attempt_failed < 0 or attempt_failed > requests:
+        raise SystemExit(
+            f"{phase} attempt_failed_total must be between zero and logical requests: "
+            f"attempt_failed={attempt_failed} requests={requests}"
+        )
     if success <= 0 or first <= 0 or first > last:
         raise SystemExit(
             f"{phase} must contain a non-empty acknowledged range: success={success} range={first}-{last}"
@@ -247,6 +250,11 @@ for label in expected_order:
             f"{label} acknowledgement contract mismatch: "
             f"expected=serving/{expected_sequence}/{expected_phase}/{expected_target} "
             f"observed={block.get('status')}/{observed_contract}"
+        )
+    if expected_target and block.get("observed_owner_endpoint") != expected_target:
+        raise SystemExit(
+            f"{label} acknowledged target {expected_target} but actual serving owner was "
+            f"{block.get('observed_owner_endpoint')}"
         )
     serving_tso = number(block, "serving_tso")
     if number(block, "observed_epoch") <= 0 or number(block, "observed_route_version") <= 0:
@@ -580,6 +588,14 @@ EOF
     return 1
   fi
 
+  sed 's/old_only_attempt_failed_total=1/old_only_attempt_failed_total=999999/' \
+    "${bench}" >"${bench}.invalid"
+  sed "s#bench_log=${bench}#bench_log=${bench}.invalid#" "${summary}" >"${summary}.invalid"
+  if verify_rolling_upgrade "${summary}.invalid" >/dev/null 2>&1; then
+    echo "rolling-upgrade verifier accepted more failed attempts than logical requests" >&2
+    return 1
+  fi
+
   sed 's/build_commit=2222222222222222222222222222222222222222/build_commit=1111111111111111111111111111111111111111/' \
     "${identity}" >"${identity}.invalid"
   sed "s#identity_log=${identity}#identity_log=${identity}.invalid#" \
@@ -602,6 +618,15 @@ EOF
     "${summary}" >"${summary}.invalid"
   if verify_rolling_upgrade "${summary}.invalid" >/dev/null 2>&1; then
     echo "rolling-upgrade verifier accepted an acknowledgement phase mismatch" >&2
+    return 1
+  fi
+
+  sed '/^\[rollback-replace-2-started\]$/,/^\[rollback-old-worker-2\]$/ s/^observed_owner_endpoint=.*/observed_owner_endpoint=127.0.0.1:52053/' \
+    "${identity}" >"${identity}.invalid"
+  sed "s#identity_log=${identity}#identity_log=${identity}.invalid#" \
+    "${summary}" >"${summary}.invalid"
+  if verify_rolling_upgrade "${summary}.invalid" >/dev/null 2>&1; then
+    echo "rolling-upgrade verifier accepted a safe target that was not the actual serving owner" >&2
     return 1
   fi
 
