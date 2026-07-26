@@ -39,7 +39,6 @@ SUMMARY_LOG="${ARTIFACT_DIR}/summary.txt"
 INDEX_LOG="${ARTIFACT_DIR}/artifact-index.txt"
 RESULT=failure
 CHRONOS_PID=""; BENCH_PID=""
-READYZ_LOST_AT_NS=0; READYZ_HTTP_STATUS=0; READYZ_CURL_STATUS=0; READYZ_BODY=""
 PROCESS_EXIT_AT_NS=0; PROCESS_EXIT_STATUS=""
 IDENTITY_LOST_AT_NS=0; SHUTDOWN_AT_NS=0; AUTHORITY_BARRIER_AT_NS=0
 IDENTITY_RELEASED_AT_NS=0
@@ -49,7 +48,12 @@ FAULT_INJECTED_AT_NS=0; RESTORE_STARTED_AT_NS=0; ETCD_HEALTHY_AT_NS=0; RECOVERY_
 BENCH_STARTED_AT_NS=0; BENCH_FINISHED_AT_NS=0; POST_PROBE_FINISHED_AT_NS=0; SMOKE_FINISHED_AT_NS=0
 BENCH_ACTIVE_BEFORE_FAULT=false; BENCH_ALIVE_AFTER_RECOVERY_READY=false
 now_ns() { python3 -c 'import time; print(time.time_ns())'; }
-process_running() { [[ -n "${1:-}" ]] && kill -0 "$1" 2>/dev/null; }
+process_state_running() { [[ -n "$1" && "$1" != Z ]]; }
+process_running() {
+  local state; [[ -n "${1:-}" ]] || return 1
+  state="$(ps -o state= -p "$1" 2>/dev/null | tr -d '[:space:]')" || return 1; process_state_running "${state}"
+}
+identity_get_released() { [[ "$1" -eq 0 && -z "$2" ]]; }
 log_event_ns() {
   python3 - "$1" "$2" "$3" <<'PY'
 import calendar,datetime,json,re,sys
@@ -68,9 +72,6 @@ PY
 metric_or_zero() { [[ -f "$2" ]] && extract_metric "$1" "$2" || echo 0; }
 write_observation() {
   cat >"${OBSERVATION_LOG}" <<EOF
-readyz_loss_observed_at_unix_ns=${READYZ_LOST_AT_NS}
-readyz_http_status=${READYZ_HTTP_STATUS}
-readyz_body=${READYZ_BODY//$'\n'/\\n}
 process_exit_observed_at_unix_ns=${PROCESS_EXIT_AT_NS}
 process_exit_status=${PROCESS_EXIT_STATUS}
 identity_lease_lost_at_unix_ns=${IDENTITY_LOST_AT_NS}
@@ -107,15 +108,11 @@ EOF
 }
 cleanup() {
   local exit_code=$?
-  process_running "${BENCH_PID}" && kill "${BENCH_PID}" 2>/dev/null || true
-  [[ -n "${BENCH_PID}" ]] && wait "${BENCH_PID}" 2>/dev/null || true
-  process_running "${CHRONOS_PID}" && kill "${CHRONOS_PID}" 2>/dev/null || true
-  [[ -n "${CHRONOS_PID}" ]] && wait "${CHRONOS_PID}" 2>/dev/null || true
+  process_running "${BENCH_PID}" && kill "${BENCH_PID}" 2>/dev/null || true; [[ -n "${BENCH_PID}" ]] && wait "${BENCH_PID}" 2>/dev/null || true
+  process_running "${CHRONOS_PID}" && kill "${CHRONOS_PID}" 2>/dev/null || true; [[ -n "${CHRONOS_PID}" ]] && wait "${CHRONOS_PID}" 2>/dev/null || true
   make etcd-reset >/dev/null 2>&1 || true
   RESULT=$([[ ${exit_code} -eq 0 ]] && echo success || echo failure)
-  write_observation
-  write_summary
-  write_artifact_index "${ARTIFACT_DIR}" "${INDEX_LOG}"
+  write_observation; write_summary; write_artifact_index "${ARTIFACT_DIR}" "${INDEX_LOG}"
 }
 trap cleanup EXIT
 start_chronos() {
@@ -138,29 +135,15 @@ run_probe() {
     "${RELEASE_BIN_DIR}/chronos-bench" >"${output}"
 }
 wait_for_authority_loss() {
-  local body_file="${ARTIFACT_DIR}/.readyz-body"
   for attempt in $(seq 1 "${WAIT_ATTEMPTS}"); do
     if [[ "${PROCESS_EXIT_AT_NS}" -eq 0 ]] && ! process_running "${CHRONOS_PID}"; then
       PROCESS_EXIT_AT_NS="$(now_ns)"
       set +e; wait "${CHRONOS_PID}"; PROCESS_EXIT_STATUS=$?; set -e; CHRONOS_PID=""
     fi
-    if [[ "${READYZ_LOST_AT_NS}" -eq 0 ]]; then
-      set +e
-      status="$(curl --max-time 2 -sS -o "${body_file}" -w '%{http_code}' "http://${METRICS_ENDPOINT}/readyz")"
-      curl_status=$?
-      set -e
-      body="$(tr '\n' ' ' <"${body_file}" 2>/dev/null || true)"
-      if [[ "${curl_status}" -eq 0 && "${status}" != 200 && "${status}" != 000 && "${body}" != ready ]]; then
-        READYZ_LOST_AT_NS="$(now_ns)"
-        READYZ_HTTP_STATUS="${status}"; READYZ_CURL_STATUS="${curl_status}"; READYZ_BODY="${body}"
-      fi
-    fi
     IDENTITY_LOST_AT_NS="$(log_event_ns "${INITIAL_LOG}" event keepalive_lost)"
     SHUTDOWN_AT_NS="$(log_event_ns "${INITIAL_LOG}" shutdown_trigger identity_lease_lost)"
     if [[ -n "${IDENTITY_LOST_AT_NS}" && -n "${SHUTDOWN_AT_NS}" ]]; then
-      AUTHORITY_BARRIER_AT_NS="$(now_ns)"
-      rm -f "${body_file}"
-      return 0
+      AUTHORITY_BARRIER_AT_NS="$(now_ns)"; return 0
     fi
     sleep "${WAIT_INTERVAL_SECS}"
   done
@@ -168,18 +151,24 @@ wait_for_authority_loss() {
   return 1
 }
 wait_for_identity_release() {
-  local key="${ETCD_PREFIX}/identity/instances/${INSTANCE_ID}"
+  local key="${ETCD_PREFIX}/identity/instances/${INSTANCE_ID}" output status last_error=""
   for attempt in $(seq 1 "${IDENTITY_WAIT_ATTEMPTS}"); do
+    set +e
     output="$(docker exec -e ETCDCTL_API=3 chronos-etcd etcdctl \
-      --endpoints="http://${ETCD_ENDPOINTS}" get "${key}" --keys-only 2>/dev/null || true)"
-    if [[ -z "${output}" ]]; then
-      IDENTITY_RELEASED_AT_NS="$(now_ns)"; return 0
-    fi
+      --endpoints="http://${ETCD_ENDPOINTS}" get "${key}" --keys-only 2>&1)"
+    status=$?; set -e
+    if identity_get_released "${status}" "${output}"; then IDENTITY_RELEASED_AT_NS="$(now_ns)"; return 0; fi
+    [[ "${status}" -eq 0 ]] || last_error="${output}"
     sleep "${IDENTITY_WAIT_SECS}"
   done
-  echo "identity key did not expire: ${key}" >&2
+  echo "identity key did not expire: ${key}; last_error=${last_error}" >&2
   return 1
 }
+if [[ "${CHRONOS_CHAOS_HELPER_SELF_TEST:-0}" == 1 ]]; then
+  process_state_running R; ! process_state_running Z
+  identity_get_released 0 ""; ! identity_get_released 1 ""; ! identity_get_released 0 key
+  echo "lease-loss producer helper self-test PASS"; exit 0
+fi
 make etcd-reset >/dev/null
 make etcd-up >/dev/null
 wait_for_etcd "${WAIT_ATTEMPTS}" "${WAIT_INTERVAL_SECS}"
@@ -246,9 +235,9 @@ env CHRONOS_BENCH_ENDPOINT="http://${SERVICE_ENDPOINT}" CHRONOS_BENCH_CONCURRENC
 SMOKE_FINISHED_AT_NS="$(now_ns)"
 assert_zero_metric allocation_failed_total "${SMOKE_LOG}"
 assert_zero_metric allocation_measured_failed_total "${SMOKE_LOG}"
-assert_metric_at_least allocation_requests_per_sec "${SMOKE_LOG}" "${RECOVERY_REQ_PER_SEC_MIN}"
-assert_metric_at_most allocation_latency_p95_us "${SMOKE_LOG}" "${RECOVERY_P95_US_MAX}"
-assert_metric_at_most allocation_latency_p999_us "${SMOKE_LOG}" "${RECOVERY_P999_US_MAX}"
+assert_metric_at_least req_per_sec "${SMOKE_LOG}" "${RECOVERY_REQ_PER_SEC_MIN}"
+assert_metric_at_most latency_p95_us "${SMOKE_LOG}" "${RECOVERY_P95_US_MAX}"
+assert_metric_at_most latency_p999_us "${SMOKE_LOG}" "${RECOVERY_P999_US_MAX}"
 RESULT=success
 write_observation
 write_summary

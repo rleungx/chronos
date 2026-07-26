@@ -135,21 +135,51 @@ impl Trace {
     }
 }
 
-fn trace_attempt_failures(attempts: &[Value], _refreshes: &[Value]) -> u64 {
+fn trace_attempt_failures(attempts: &[Value]) -> u64 {
     attempts
         .iter()
         .filter(|attempt| attempt["connect"] == "failed" || attempt["rpc"] == "grpc_error")
         .count() as u64
 }
 
-fn trace_attempt(
-    attempt: usize,
-    connect: &str,
-    rpc: &str,
-    started: Option<(u128, u128)>,
-    finished: Option<(u128, u128)>,
-) -> Value {
+fn retry_failed_connect(trace_enabled: bool, attempt: usize, limit: usize) -> bool {
+    trace_enabled && attempt < limit
+}
+
+#[derive(Default)]
+struct TraceTotals([u64; 6]);
+
+impl TraceTotals {
+    #[rustfmt::skip]
+    fn observe(&mut self, attempts: &[Value], refreshes: &[Value], success: bool) {
+        self.0[0] += 1; self.0[1] += u64::from(success); self.0[2] += u64::from(!success);
+        self.0[3] += trace_attempt_failures(attempts);
+        self.0[4] += attempts.len().saturating_sub(1) as u64; self.0[5] += refreshes.len() as u64;
+    }
+
+    fn terminal(&self, exhausted: bool, finished: Option<(u128, u128)>) -> Value {
+        json!({"record_type":"terminal","trace_limit_exhausted":exhausted,
+            "logical_record_count":self.0[0],"logical_success_count":self.0[1],
+            "logical_failure_count":self.0[2],"failed_allocation_attempt_count":self.0[3],
+            "retry_count":self.0[4],"route_refresh_count":self.0[5],"finished":finished})
+    }
+}
+
+#[rustfmt::skip]
+fn trace_attempt(attempt: usize, connect: &str, rpc: &str,
+    started: Option<(u128, u128)>, finished: Option<(u128, u128)>) -> Value {
     json!({"attempt":attempt+1,"connect":connect,"rpc":rpc,"started":started,"finished":finished})
+}
+
+#[allow(clippy::too_many_arguments)]
+#[rustfmt::skip]
+fn trace_logical(ordinal: u64, timeline: &str, started: Option<(u128, u128)>,
+    finished: Option<(u128, u128)>, attempts: Vec<Value>, refreshes: Vec<Value>,
+    outcome: &str, response_received_unix_ns: u128, range: Option<(u64, u64)>) -> Value {
+    json!({"record_type":"logical_request","ordinal":ordinal,"timeline_key":timeline,
+        "started":started,"finished":finished,"attempts":attempts,"route_refreshes":refreshes,
+        "logical_outcome":outcome,"response_received_unix_ns":response_received_unix_ns,
+        "range_start":range.map(|value|value.0),"range_end":range.map(|value|value.1)})
 }
 
 #[derive(Default)]
@@ -817,7 +847,7 @@ async fn run_allocation_bench(
                 .collect::<Vec<_>>();
             let mut route_idx = 0usize;
             let mut request_ordinal = 0u64;
-            let mut trace_records = 0u64;
+            let mut trace_totals = TraceTotals::default();
 
             barrier.wait().await;
             loop {
@@ -829,9 +859,8 @@ async fn run_allocation_bench(
                 let timeline_key = &worker_keys[route_idx % worker_keys.len()];
                 route_idx = (route_idx + 1) % worker_keys.len();
                 request_ordinal = request_ordinal.saturating_add(1);
-                if trace.as_ref().is_some_and(|_| trace_records >= trace_max_records) {
-                    trace.as_ref().unwrap().emit(json!({"record_type":"terminal",
-                        "trace_limit_exhausted":true,"logical_record_count":trace_records}))?;
+                if trace.as_ref().is_some_and(|_| trace_totals.0[0] >= trace_max_records) {
+                    trace.as_ref().unwrap().emit(trace_totals.terminal(true, trace.as_ref().map(Trace::stamp)))?;
                     return Err("control bench trace record limit exhausted".into());
                 }
                 let route = route_snapshots
@@ -865,6 +894,11 @@ async fn run_allocation_bench(
                             };
                             let allocation_endpoint =
                                 allocation_endpoint(&current_route, &endpoint, route_to_owners);
+                            let connect = if timestamp_clients.contains_key(&allocation_endpoint) {
+                                "reused"
+                            } else {
+                                "connected"
+                            };
                             if ensure_timestamp_client(
                                 &mut timestamp_clients,
                                 &allocation_endpoint,
@@ -874,7 +908,7 @@ async fn run_allocation_bench(
                             {
                                 attempt_failures += 1;
                                 attempts.extend(trace.as_ref().map(|_| trace_attempt(attempt, "failed", "not_run", attempt_started, trace.as_ref().map(Trace::stamp))));
-                                if attempt == allocate_retry_attempts {
+                                if !retry_failed_connect(trace.is_some(), attempt, allocate_retry_attempts) {
                                     return Err(());
                                 }
                                 continue;
@@ -891,12 +925,12 @@ async fn run_allocation_bench(
                                 Ok(response) => {
                                     let finished = trace.as_ref().map(Trace::stamp);
                                     response_received_unix_ns = finished.map_or(0, |stamp| stamp.0);
-                                    attempts.extend(trace.as_ref().map(|_| trace_attempt(attempt, "reused", "success", attempt_started, finished)));
+                                    attempts.extend(trace.as_ref().map(|_| trace_attempt(attempt, connect, "success", attempt_started, finished)));
                                     return Ok(response.into_inner());
                                 }
                                 Err(status) => {
                                     attempt_failures += 1;
-                                    attempts.extend(trace.as_ref().map(|_| trace_attempt(attempt, "reused", "grpc_error", attempt_started, trace.as_ref().map(Trace::stamp))));
+                                    attempts.extend(trace.as_ref().map(|_| trace_attempt(attempt, connect, "grpc_error", attempt_started, trace.as_ref().map(Trace::stamp))));
                                     let detail = decode_error_detail(&status);
                                     record_error_count(
                                         &mut stats.error_counts,
@@ -957,7 +991,7 @@ async fn run_allocation_bench(
                         Err(())
                     }
                     .await;
-                debug_assert!(trace.is_none() || attempt_failures == trace_attempt_failures(&attempts, &refreshes));
+                debug_assert!(trace.is_none() || attempt_failures == trace_attempt_failures(&attempts));
                 stats.allocate_attempt_failed_total += attempt_failures;
 
                 let elapsed = request_start.elapsed().as_micros() as u64;
@@ -987,20 +1021,16 @@ async fn run_allocation_bench(
                         route.generator_id = response.generator_id;
                     }
                     if let Some(trace) = &trace {
-                        trace.emit(json!({"record_type":"logical_request","ordinal":request_ordinal,
-                            "timeline_key":response.timeline_key,"started":logical_started,"finished":logical_finished,
-                            "attempts":attempts,"route_refreshes":refreshes,"logical_outcome":"success",
-                            "response_received_unix_ns":response_received_unix_ns,
-                            "range_start":response.ranges.first().map(|range|range.start_tso),
-                            "range_end":response.ranges.last().map(|range|range.end_tso)}))?;
-                        trace_records += 1;
+                        trace_totals.observe(&attempts, &refreshes, true);
+                        trace.emit(trace_logical(request_ordinal, &response.timeline_key,
+                            logical_started, logical_finished, attempts, refreshes, "success",
+                            response_received_unix_ns, response.ranges.first().zip(response.ranges.last())
+                                .map(|(first,last)|(first.start_tso,last.end_tso))))?;
                     }
                 } else if let Some(trace) = &trace {
-                    trace.emit(json!({"record_type":"logical_request","ordinal":request_ordinal,
-                        "timeline_key":route.timeline_key,"started":logical_started,"finished":logical_finished,
-                        "attempts":attempts,"route_refreshes":refreshes,"logical_outcome":"failure",
-                        "response_received_unix_ns":0}))?;
-                    trace_records += 1;
+                    trace_totals.observe(&attempts, &refreshes, false);
+                    trace.emit(trace_logical(request_ordinal, &route.timeline_key, logical_started,
+                        logical_finished, attempts, refreshes, "failure", 0, None))?;
                 }
                 if request_interval_ms > 0 {
                     tokio::time::sleep(Duration::from_millis(request_interval_ms)).await;
@@ -1008,8 +1038,7 @@ async fn run_allocation_bench(
             }
 
             if let Some(trace) = &trace {
-                trace.emit(json!({"record_type":"terminal","trace_limit_exhausted":false,
-                    "logical_record_count":trace_records,"failed_allocation_attempt_count":stats.allocate_attempt_failed_total}))?;
+                trace.emit(trace_totals.terminal(false, Some(trace.stamp())))?;
             }
             Ok::<RebalanceWorkerStats, Box<dyn Error + Send + Sync>>(stats)
         }));
@@ -1506,37 +1535,35 @@ mod tests {
     }
 
     #[test]
-    fn trace_attempt_accounting_separates_attempts_from_refreshes() {
+    #[rustfmt::skip]
+    fn trace_state_builds_attempt_paths_and_terminal_counters() {
         let success = json!({"connect":"reused","rpc":"success"});
         let failure = json!({"connect":"reused","rpc":"grpc_error"});
-        let refresh_failure = vec![json!({"outcome":"failed"})];
-        let cases = [
-            ("zero_failure", vec![success.clone()], vec![], 0),
-            (
-                "one_failure_retry_success",
-                vec![failure.clone(), success],
-                vec![],
-                1,
-            ),
-            (
-                "one_failure_refresh_failure",
-                vec![failure.clone()],
-                refresh_failure,
-                1,
-            ),
-            (
-                "two_failure_retry_exhaustion",
-                vec![failure.clone(), failure],
-                vec![],
-                2,
-            ),
-        ];
-        for (name, attempts, refreshes, expected) in cases {
-            assert_eq!(
-                trace_attempt_failures(&attempts, &refreshes),
-                expected,
-                "{name}"
-            );
-        }
+        let check = |attempts: Vec<Value>, refreshes: Vec<Value>, outcome, expected| {
+            let record = trace_logical(1, "timeline", None, None, attempts.clone(), refreshes.clone(),
+                if outcome { "success" } else { "failure" }, 0, None);
+            let mut totals = TraceTotals::default();
+            totals.observe(&attempts, &refreshes, outcome);
+            let terminal = totals.terminal(false, None);
+            assert_eq!(record["logical_outcome"], if outcome { "success" } else { "failure" });
+            assert_eq!((terminal["failed_allocation_attempt_count"].as_u64().unwrap(),
+                terminal["retry_count"].as_u64().unwrap()), expected);
+        };
+        check(vec![success.clone()], vec![], true, (0, 0));
+        check(vec![failure.clone(), success], vec![], true, (1, 1));
+        check(vec![failure.clone()], vec![json!({"outcome":"failed"})], false, (1, 0));
+        check(vec![failure.clone(), failure], vec![], false, (2, 1));
+        assert!(!retry_failed_connect(false, 0, 1) && retry_failed_connect(true, 0, 1)
+            && !retry_failed_connect(true, 1, 1));
+    }
+
+    #[test]
+    #[rustfmt::skip]
+    fn trace_emit_flushes_complete_jsonl_row() {
+        let path = std::env::temp_dir().join(format!("chronos-trace-{}", std::process::id()));
+        let trace = Trace::open(&path).unwrap();
+        trace.emit(json!({"record_type":"terminal"})).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"record_type\":\"terminal\"}\n");
+        std::fs::remove_file(path).unwrap();
     }
 }
