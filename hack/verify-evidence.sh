@@ -162,6 +162,7 @@ for target in "$@"; do
       ;;
     chaos)
       verify_dir chaos summary.txt artifact-index.txt fault-span-trace.jsonl initial-chronos.log recovery-chronos.log
+      [[ "$(extract_metric build_commit "${ARTIFACT_ROOT%/}/chaos/summary.txt")" == "${expected_commit}" ]] || { echo "chaos build commit mismatch" >&2; exit 1; }
       bash "${SCRIPT_DIR}/verify-chaos-lease-loss.sh" "${ARTIFACT_ROOT%/}/chaos"
       ;;
     failover)

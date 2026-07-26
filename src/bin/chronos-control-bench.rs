@@ -167,8 +167,9 @@ impl TraceTotals {
 
 #[rustfmt::skip]
 fn trace_attempt(attempt: usize, connect: &str, rpc: &str,
-    started: Option<(u128, u128)>, finished: Option<(u128, u128)>) -> Value {
-    json!({"attempt":attempt+1,"connect":connect,"rpc":rpc,"started":started,"finished":finished})
+    started: Option<(u128, u128)>, finished: Option<(u128, u128)>, grpc_code: Option<&str>) -> Value {
+    let mut row=json!({"attempt":attempt+1,"connect":connect,"rpc":rpc,"started":started,"finished":finished});
+    if let Some(code)=grpc_code { row["grpc_code"]=json!(code); } row
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -907,7 +908,7 @@ async fn run_allocation_bench(
                             .is_err()
                             {
                                 attempt_failures += 1;
-                                attempts.extend(trace.as_ref().map(|_| trace_attempt(attempt, "failed", "not_run", attempt_started, trace.as_ref().map(Trace::stamp))));
+                                attempts.extend(trace.as_ref().map(|_| trace_attempt(attempt, "failed", "not_run", attempt_started, trace.as_ref().map(Trace::stamp), None)));
                                 if !retry_failed_connect(trace.is_some(), attempt, allocate_retry_attempts) {
                                     return Err(());
                                 }
@@ -925,12 +926,13 @@ async fn run_allocation_bench(
                                 Ok(response) => {
                                     let finished = trace.as_ref().map(Trace::stamp);
                                     response_received_unix_ns = finished.map_or(0, |stamp| stamp.0);
-                                    attempts.extend(trace.as_ref().map(|_| trace_attempt(attempt, connect, "success", attempt_started, finished)));
+                                    attempts.extend(trace.as_ref().map(|_| trace_attempt(attempt, connect, "success", attempt_started, finished, None)));
                                     return Ok(response.into_inner());
                                 }
                                 Err(status) => {
                                     attempt_failures += 1;
-                                    attempts.extend(trace.as_ref().map(|_| trace_attempt(attempt, connect, "grpc_error", attempt_started, trace.as_ref().map(Trace::stamp))));
+                                    let grpc_code=format!("{:?}",status.code());
+                                    attempts.extend(trace.as_ref().map(|_| trace_attempt(attempt, connect, "grpc_error", attempt_started, trace.as_ref().map(Trace::stamp), Some(&grpc_code))));
                                     let detail = decode_error_detail(&status);
                                     record_error_count(
                                         &mut stats.error_counts,
@@ -1538,7 +1540,7 @@ mod tests {
     #[rustfmt::skip]
     fn trace_state_builds_attempt_paths_and_terminal_counters() {
         let success = json!({"connect":"reused","rpc":"success"});
-        let failure = json!({"connect":"reused","rpc":"grpc_error"});
+        let failure = json!({"connect":"reused","rpc":"grpc_error","grpc_code":"Unavailable"});
         let check = |attempts: Vec<Value>, refreshes: Vec<Value>, outcome, expected| {
             let record = trace_logical(1, "timeline", None, None, attempts.clone(), refreshes.clone(),
                 if outcome { "success" } else { "failure" }, 0, None);

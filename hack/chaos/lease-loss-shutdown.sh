@@ -42,6 +42,9 @@ CHRONOS_PID=""; BENCH_PID=""
 PROCESS_EXIT_AT_NS=0; PROCESS_EXIT_STATUS=""
 IDENTITY_LOST_AT_NS=0; SHUTDOWN_AT_NS=0; AUTHORITY_BARRIER_AT_NS=0
 IDENTITY_RELEASED_AT_NS=0
+IDENTITY_KEY="${ETCD_PREFIX}/identity/instances/${INSTANCE_ID}"
+IDENTITY_RELEASE_ATTEMPT=0; IDENTITY_RELEASE_STATUS=""; IDENTITY_RELEASE_OUTPUT=""
+INITIAL_BUILD_COMMIT=""; RECOVERY_BUILD_COMMIT=""
 INITIAL_ACQUIRED_AT_NS=0; INITIAL_READY_AT_NS=0
 RECOVERY_ACQUIRED_AT_NS=0; RECOVERY_READY_AT_NS=0
 FAULT_INJECTED_AT_NS=0; RESTORE_STARTED_AT_NS=0; ETCD_HEALTHY_AT_NS=0; RECOVERY_STARTED_AT_NS=0
@@ -55,13 +58,14 @@ process_running() {
 }
 identity_get_released() { [[ "$1" -eq 0 && -z "$2" ]]; }
 log_event_ns() {
-  python3 - "$1" "$2" "$3" <<'PY'
+  python3 - "$1" "$2" "$3" "${4:-}" <<'PY'
 import calendar,datetime,json,re,sys
-path,key,value=sys.argv[1:]
+path,key,value,*field=sys.argv[1:]
 for line in open(path, encoding="utf-8"):
     try: row=json.loads(line)
     except json.JSONDecodeError: continue
     if str(row.get(key,"")) == value:
+        if field[0]: print(row.get(field[0],"")); break
         match=re.fullmatch(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d{1,9}))?Z",row["timestamp"])
         if not match: continue
         seconds=calendar.timegm(datetime.datetime.strptime(match.group(1),"%Y-%m-%dT%H:%M:%S").timetuple())
@@ -76,6 +80,11 @@ process_exit_observed_at_unix_ns=${PROCESS_EXIT_AT_NS}
 process_exit_status=${PROCESS_EXIT_STATUS}
 identity_lease_lost_at_unix_ns=${IDENTITY_LOST_AT_NS}
 shutdown_triggered_at_unix_ns=${SHUTDOWN_AT_NS}
+identity_key=${IDENTITY_KEY}
+identity_release_attempt=${IDENTITY_RELEASE_ATTEMPT}
+identity_release_command_status=${IDENTITY_RELEASE_STATUS}
+identity_release_output=${IDENTITY_RELEASE_OUTPUT}
+identity_released_at_unix_ns=${IDENTITY_RELEASED_AT_NS}
 EOF
 }
 write_summary() {
@@ -85,6 +94,8 @@ evidence_contract_version=2
 worker_id=${WORKER_ID}
 instance_id=${INSTANCE_ID}
 timeline_key=${TIMELINE_KEY}
+build_commit=${INITIAL_BUILD_COMMIT}
+identity_key=${IDENTITY_KEY}
 initial_identity_acquired_at_unix_ns=${INITIAL_ACQUIRED_AT_NS}
 initial_ready_at_unix_ns=${INITIAL_READY_AT_NS}
 pre_probe_finished_at_unix_ns=$(metric_or_zero pre_probe_finished_at_unix_ns "${PRE_PROBE_LOG}")
@@ -151,17 +162,18 @@ wait_for_authority_loss() {
   return 1
 }
 wait_for_identity_release() {
-  local key="${ETCD_PREFIX}/identity/instances/${INSTANCE_ID}" output status last_error=""
+  local output status last_error=""
   for attempt in $(seq 1 "${IDENTITY_WAIT_ATTEMPTS}"); do
     set +e
     output="$(docker exec -e ETCDCTL_API=3 chronos-etcd etcdctl \
-      --endpoints="http://${ETCD_ENDPOINTS}" get "${key}" --keys-only 2>&1)"
+      --endpoints="http://${ETCD_ENDPOINTS}" get "${IDENTITY_KEY}" --keys-only 2>&1)"
     status=$?; set -e
+    IDENTITY_RELEASE_ATTEMPT=${attempt}; IDENTITY_RELEASE_STATUS=${status}; IDENTITY_RELEASE_OUTPUT=${output}
     if identity_get_released "${status}" "${output}"; then IDENTITY_RELEASED_AT_NS="$(now_ns)"; return 0; fi
     [[ "${status}" -eq 0 ]] || last_error="${output}"
     sleep "${IDENTITY_WAIT_SECS}"
   done
-  echo "identity key did not expire: ${key}; last_error=${last_error}" >&2
+  echo "identity key did not expire: ${IDENTITY_KEY}; last_error=${last_error}" >&2
   return 1
 }
 if [[ "${CHRONOS_CHAOS_HELPER_SELF_TEST:-0}" == 1 ]]; then
@@ -174,6 +186,7 @@ make etcd-up >/dev/null
 wait_for_etcd "${WAIT_ATTEMPTS}" "${WAIT_INTERVAL_SECS}"
 ensure_release_binaries "${RELEASE_BIN_DIR}" chronos chronos-bench chronos-control-bench
 start_chronos "${INITIAL_LOG}"
+INITIAL_BUILD_COMMIT="$(log_event_ns "${INITIAL_LOG}" event preflight_passed build_commit)"
 INITIAL_ACQUIRED_AT_NS="$(log_event_ns "${INITIAL_LOG}" event acquire_succeeded)"
 INITIAL_READY_AT_NS="$(log_event_ns "${INITIAL_LOG}" event ready_state_changed)"
 run_probe "${PRE_PROBE_LOG}"
@@ -220,6 +233,7 @@ ETCD_HEALTHY_AT_NS="$(now_ns)"
 wait_for_identity_release
 RECOVERY_STARTED_AT_NS="$(now_ns)"
 start_chronos "${RECOVERY_LOG}"
+RECOVERY_BUILD_COMMIT="$(log_event_ns "${RECOVERY_LOG}" event preflight_passed build_commit)"
 RECOVERY_ACQUIRED_AT_NS="$(log_event_ns "${RECOVERY_LOG}" event acquire_succeeded)"
 RECOVERY_READY_AT_NS="$(log_event_ns "${RECOVERY_LOG}" event ready_state_changed)"
 if process_running "${BENCH_PID}"; then BENCH_ALIVE_AFTER_RECOVERY_READY=true; else

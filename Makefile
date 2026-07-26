@@ -293,7 +293,7 @@ test-chaos:
 	bash hack/chaos/lease-loss-shutdown.sh
 
 test-chaos-quick:
-	CHRONOS_CHAOS_BENCH_DURATION_SECS=5 \
+	CHRONOS_CHAOS_BENCH_DURATION_SECS=5 CHRONOS_CHAOS_FAULT_DURATION_SECS=5 \
 	$(MAKE) test-chaos
 
 test-chaos-verifier: ; bash hack/verify-chaos-lease-loss.sh "" --self-test && CHRONOS_CHAOS_HELPER_SELF_TEST=1 bash hack/chaos/lease-loss-shutdown.sh
