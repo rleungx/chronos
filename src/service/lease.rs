@@ -89,7 +89,10 @@ impl TsoService {
                     let now_ms = self.clock.now_ms();
                     let lease_expire_at_ms = record.lease_expire_at_ms;
                     let generator_floor_tso = generator_recovery_floor_tso(&record);
-                    if self.is_local_generator_owner(&record) {
+                    let takeover_ready = lease_expire_at_ms.is_some_and(|exp| {
+                        crate::lease_expired_with_safety_gap(exp, now_ms, self.config.safety_gap_ms)
+                    });
+                    if self.is_local_generator_owner(&record) && !takeover_ready {
                         let Some(lease_expire_at_ms) = lease_expire_at_ms else {
                             self.clear_generator_ownership_drift(generator_id);
                             return Err(TsoError::GeneratorLeaseExpired { generator_id });
@@ -136,9 +139,7 @@ impl TsoService {
                         self.clear_generator_ownership_drift(generator_id);
                     }
 
-                    if lease_expire_at_ms.is_some_and(|exp| {
-                        crate::lease_expired_with_safety_gap(exp, now_ms, self.config.safety_gap_ms)
-                    }) {
+                    if takeover_ready {
                         let mut record = record;
                         let new_lease_expire_at_ms = now_ms + self.config.generator_lease_ttl_ms;
                         if let Some(generator_floor_tso) = generator_floor_tso {
@@ -747,6 +748,67 @@ mod tests {
             .await
             .unwrap();
         (route, generator, revision)
+    }
+
+    #[tokio::test]
+    async fn local_generator_restart_obeys_inclusive_takeover_boundary() {
+        for (case, now_ms, expected_ok, expected_takeover) in [
+            ("valid", 799, true, false),
+            ("pre-gap", 899, false, false),
+            ("exact-boundary", 900, true, true),
+        ] {
+            let metadata = Arc::new(MemoryMetadataStore::new());
+            let (route, before, before_revision) =
+                persist_expired_restart_fixture(&metadata, case, "lease-instance").await;
+            let service = TsoService::new(
+                required_test_config(TsoConfig {
+                    generator_lease_ttl_ms: 500,
+                    lease_ttl_ms: 500,
+                    safety_gap_ms: 100,
+                    ..TsoConfig::default()
+                }),
+                Arc::new(ManualClock::new(now_ms)),
+                metadata.clone(),
+            )
+            .unwrap();
+            service.background.begin_shutdown();
+            service.background.drain_tasks().await;
+
+            let result = service.ensure_generator_lease(route.generator_id).await;
+            assert_eq!(result.is_ok(), expected_ok, "case={case}: {result:?}");
+            let (after, after_revision) = metadata
+                .load_generator(route.generator_id)
+                .await
+                .unwrap()
+                .unwrap();
+            if expected_takeover {
+                assert!(after_revision > before_revision, "case={case}");
+                assert_eq!(
+                    after.generator_lease_token,
+                    before.generator_lease_token + 1,
+                    "case={case}"
+                );
+                service
+                    .ensure_generator_lease(route.generator_id)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    metadata
+                        .load_generator(route.generator_id)
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    (after, after_revision),
+                    "case={case}: repeated ensure must not take over twice"
+                );
+            } else {
+                assert_eq!(
+                    (after, after_revision),
+                    (before, before_revision),
+                    "case={case}: valid reuse and pre-gap rejection must not mutate metadata"
+                );
+            }
+        }
     }
 
     #[tokio::test]

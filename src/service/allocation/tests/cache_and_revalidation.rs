@@ -521,6 +521,7 @@ async fn allocation_refreshes_now_ms_before_lease_validation_after_timeline_load
         required_test_config(TsoConfig {
             generator_lease_ttl_ms: 250,
             lease_ttl_ms: 250,
+            safety_gap_ms: 100,
             ..TsoConfig::default()
         }),
         clock.clone(),
@@ -664,6 +665,7 @@ async fn allocation_rechecks_generator_lease_time_after_slow_generator_load() {
         required_test_config(TsoConfig {
             generator_lease_ttl_ms: 250,
             lease_ttl_ms: 250,
+            safety_gap_ms: 100,
             ..TsoConfig::default()
         }),
         clock.clone(),
