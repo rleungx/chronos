@@ -702,6 +702,201 @@ mod tests {
         }
     }
 
+    async fn persist_expired_restart_fixture(
+        metadata: &MemoryMetadataStore,
+        timeline_key: &str,
+        owner_instance_id: &str,
+    ) -> (crate::TimelineRoute, GeneratorRecord, u64) {
+        let route = crate::TimelineRoute {
+            timeline_key: timeline_key.into(),
+            generator_id: 0,
+            epoch: 1,
+            route_version: 1,
+            resource_tier: crate::ResourceTier::Shared,
+            owner_worker_endpoint: "127.0.0.1:50051".into(),
+        };
+        metadata
+            .create_timeline(
+                timeline_key,
+                &TimelineRecord {
+                    schema_version: 1,
+                    route: route.clone(),
+                    state: crate::TimelineLifecycleState::Recovering,
+                    recovery_floor_tso: None,
+                    issued_upper_bound: None,
+                    last_graceful_issued: None,
+                    lease_expire_at_ms: None,
+                    updated_at_ms: 700,
+                },
+            )
+            .await
+            .unwrap();
+        let generator = GeneratorRecord {
+            schema_version: 1,
+            generator_id: route.generator_id,
+            owner_worker_endpoint: "127.0.0.1:50051".into(),
+            owner_instance_id: owner_instance_id.into(),
+            generator_lease_token: 7,
+            lease_expire_at_ms: Some(800),
+            last_issued_tso: Some(encode_tso(900, route.generator_id, 0).unwrap()),
+            issued_upper_bound: Some(encode_tso(950, route.generator_id, 0).unwrap()),
+            updated_at_ms: 700,
+        };
+        let revision = metadata
+            .create_generator(route.generator_id, &generator)
+            .await
+            .unwrap();
+        (route, generator, revision)
+    }
+
+    #[tokio::test]
+    async fn same_instance_restart_recovers_expired_local_generator_lease() {
+        let config = required_test_config(TsoConfig {
+            generator_lease_ttl_ms: 500,
+            lease_ttl_ms: 500,
+            safety_gap_ms: 100,
+            ..TsoConfig::default()
+        });
+        let clock = Arc::new(ManualClock::new(1_000));
+        let metadata = Arc::new(MemoryMetadataStore::new());
+        let (route, before, before_revision) =
+            persist_expired_restart_fixture(&metadata, "restart.local-expired", "lease-instance")
+                .await;
+        let service = TsoService::new(config.clone(), clock.clone(), metadata.clone()).unwrap();
+        service.background.begin_shutdown();
+        service.background.drain_tasks().await;
+
+        let ensure_result = service.ensure_timeline(&route.timeline_key).await;
+        let allocation_result = service
+            .allocate_timestamps(AllocateTimestampsRequest {
+                timeline_key: route.timeline_key.clone(),
+                count: 1,
+                expected_epoch: route.epoch,
+                expected_route_version: route.route_version,
+                client_request_id: "restart-local-expired".into(),
+            })
+            .await;
+        let (after_first_attempt, after_first_revision) = metadata
+            .load_generator(route.generator_id)
+            .await
+            .unwrap()
+            .unwrap();
+        if ensure_result.is_err() {
+            assert!(matches!(
+                ensure_result,
+                Err(TsoError::GeneratorLeaseExpired { generator_id: 0 })
+            ));
+            assert!(matches!(
+                allocation_result,
+                Err(TsoError::LeaseExpired { ref timeline_key })
+                    if timeline_key == &route.timeline_key
+            ));
+            assert_eq!(
+                (after_first_attempt.clone(), after_first_revision),
+                (before.clone(), before_revision),
+                "the rejected same-instance restart must not mutate generator metadata"
+            );
+        }
+
+        let control_metadata = Arc::new(MemoryMetadataStore::new());
+        let (control_route, control_before, control_before_revision) =
+            persist_expired_restart_fixture(
+                &control_metadata,
+                "restart.remote-expired",
+                "previous-instance",
+            )
+            .await;
+        let control =
+            TsoService::new(config, clock, control_metadata.clone()).expect("control service");
+        control.background.begin_shutdown();
+        control.background.drain_tasks().await;
+        assert_eq!(
+            control
+                .ensure_timeline(&control_route.timeline_key)
+                .await
+                .unwrap(),
+            control_route
+        );
+        let control_response = control
+            .allocate_timestamps(AllocateTimestampsRequest {
+                timeline_key: control_route.timeline_key.clone(),
+                count: 1,
+                expected_epoch: control_route.epoch,
+                expected_route_version: control_route.route_version,
+                client_request_id: "restart-remote-expired".into(),
+            })
+            .await
+            .unwrap();
+        let (control_after, control_after_revision) = control_metadata
+            .load_generator(control_route.generator_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(control_after_revision > control_before_revision);
+        assert_eq!(
+            control_after.generator_lease_token,
+            control_before.generator_lease_token + 1
+        );
+        assert_eq!(
+            control_after.owner_worker_endpoint,
+            before.owner_worker_endpoint
+        );
+        assert_eq!(control_after.owner_instance_id, "lease-instance");
+        assert!(control_response.ranges[0].start_tso > control_before.issued_upper_bound.unwrap());
+
+        assert!(
+            ensure_result.is_ok(),
+            "same-instance restart must recover after expiry+safety; ensure={ensure_result:?} \
+             allocation={allocation_result:?}"
+        );
+        let response = allocation_result.unwrap();
+        assert!(after_first_revision > before_revision);
+        assert_eq!(
+            after_first_attempt.generator_lease_token,
+            before.generator_lease_token + 1
+        );
+        assert_eq!(
+            after_first_attempt.owner_worker_endpoint,
+            before.owner_worker_endpoint
+        );
+        assert_eq!(
+            after_first_attempt.owner_instance_id,
+            before.owner_instance_id
+        );
+        assert!(after_first_attempt.last_issued_tso >= before.issued_upper_bound);
+        assert!(after_first_attempt.issued_upper_bound >= before.issued_upper_bound);
+        assert!(response.ranges[0].start_tso > before.issued_upper_bound.unwrap());
+
+        service
+            .ensure_generator_lease(route.generator_id)
+            .await
+            .unwrap();
+        let replay = service
+            .allocate_timestamps(AllocateTimestampsRequest {
+                timeline_key: route.timeline_key,
+                count: 1,
+                expected_epoch: route.epoch,
+                expected_route_version: route.route_version,
+                client_request_id: "restart-local-expired".into(),
+            })
+            .await
+            .unwrap();
+        let (after_repeat, after_repeat_revision) = metadata
+            .load_generator(route.generator_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(replay, response);
+        assert_eq!(
+            (after_repeat.generator_lease_token, after_repeat_revision),
+            (
+                after_first_attempt.generator_lease_token,
+                after_first_revision
+            ),
+            "repeated ensure and idempotent allocation must not take over twice"
+        );
+    }
+
     #[derive(Clone)]
     struct AlwaysCasFailLeaseStore;
 
