@@ -16,8 +16,8 @@ use chronos::proto::v1::{
     timeline_control_service_client::TimelineControlServiceClient,
     timeline_route_service_client::TimelineRouteServiceClient,
     timestamp_service_client::TimestampServiceClient, AllocateTimestampsRequest,
-    EnsureTimelineRequest, GetTimelineRouteRequest, HealthResponse, ResourceTier,
-    TimelineTransferReason, TransferTimelineRequest,
+    AllocateTimestampsResponse, EnsureTimelineRequest, GetTimelineRouteRequest, HealthResponse,
+    ResourceTier, TimelineTransferReason, TransferTimelineRequest,
 };
 
 #[path = "support/env.rs"]
@@ -27,7 +27,7 @@ use support_env::{env_or, env_or_string};
 
 type AppResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
-const PHASES: [&str; 7] = [
+const PHASES: [&str; 13] = [
     "old_only",
     "replace_0",
     "mixed_1",
@@ -35,6 +35,12 @@ const PHASES: [&str; 7] = [
     "mixed_2",
     "replace_2",
     "new_only",
+    "rollback_replace_2",
+    "rollback_mixed_1",
+    "rollback_replace_1",
+    "rollback_mixed_2",
+    "rollback_replace_0",
+    "old_only_after_rollback",
 ];
 
 #[derive(Clone, Debug)]
@@ -74,6 +80,7 @@ struct PhaseStats {
     requests: u64,
     success: u64,
     failed: u64,
+    attempt_failed: u64,
     first_tso: Option<u64>,
     last_tso: Option<u64>,
     max_success_gap_ms: u64,
@@ -90,7 +97,7 @@ struct RoutePhase {
 struct ServingObservation {
     ordinal: u64,
     phase: String,
-    owner_worker_endpoint: String,
+    route: Route,
     last_tso: u64,
 }
 
@@ -223,12 +230,15 @@ fn write_ack(path: &Path, pending: &PendingAck, route: &Route, serving_tso: u64)
         &temp,
         format!(
             "sequence={}\nstatus=serving\nphase={}\ntarget_endpoint={}\n\
-             observed_owner_endpoint={}\ninstance_id={}\nworker_id={}\n\
+             observed_owner_endpoint={}\nobserved_epoch={}\nobserved_route_version={}\n\
+             instance_id={}\nworker_id={}\n\
              build_version={}\nbuild_commit={}\nserving_tso={}\nacknowledged_at_ms={}\n",
             pending.command.sequence,
             pending.command.phase,
             pending.command.target_endpoint.as_deref().unwrap_or(""),
             route.owner_worker_endpoint,
+            route.epoch,
+            route.route_version,
             instance_id,
             worker_id,
             build_version,
@@ -332,50 +342,109 @@ async fn try_transfer_to(config: &Config, route: &Route, target_endpoint: &str) 
         .unwrap_or_else(|_| route.clone())
 }
 
-async fn allocate(
-    clients: &mut BTreeMap<String, TimestampServiceClient<Channel>>,
-    route: &Route,
-    ordinal: u64,
-    request_timeout_ms: u64,
-) -> AppResult<chronos::proto::v1::AllocateTimestampsResponse> {
-    if !clients.contains_key(&route.owner_worker_endpoint) {
-        clients.insert(
-            route.owner_worker_endpoint.clone(),
-            TimestampServiceClient::new(connect_channel(&route.owner_worker_endpoint).await?),
-        );
-    }
-    let client = clients
-        .get_mut(&route.owner_worker_endpoint)
-        .ok_or("timestamp client was not initialized")?;
-    Ok(timeout(
-        Duration::from_millis(request_timeout_ms.max(1) + 250),
-        client.allocate_timestamps(Request::new(AllocateTimestampsRequest {
-            timeline_key: route.timeline_key.clone(),
-            count: 1,
-            expected_epoch: route.epoch,
-            expected_route_version: route.route_version,
-            client_request_id: format!("rolling-upgrade-{ordinal}"),
-            request_timeout_ms: request_timeout_ms.min(u32::MAX as u64) as u32,
-        })),
-    )
-    .await??
-    .into_inner())
-}
-
 #[async_trait]
-trait AllocationStep: Send {
-    async fn step(&mut self) -> AppResult<()>;
+trait AllocationBackend: Send + Sync {
+    async fn allocate(
+        &mut self,
+        route: &Route,
+        request_id: &str,
+        request_timeout_ms: u64,
+    ) -> AppResult<AllocateTimestampsResponse>;
+
+    async fn refresh_route(&mut self, endpoints: &[String], timeline_key: &str)
+        -> AppResult<Route>;
 }
 
-struct NetworkAllocator {
-    config: Config,
-    route_phase: Arc<RwLock<RoutePhase>>,
-    stats: Arc<Mutex<BenchStats>>,
+struct GrpcAllocationBackend {
     clients: BTreeMap<String, TimestampServiceClient<Channel>>,
 }
 
 #[async_trait]
-impl AllocationStep for NetworkAllocator {
+impl AllocationBackend for GrpcAllocationBackend {
+    async fn allocate(
+        &mut self,
+        route: &Route,
+        request_id: &str,
+        request_timeout_ms: u64,
+    ) -> AppResult<AllocateTimestampsResponse> {
+        if !self.clients.contains_key(&route.owner_worker_endpoint) {
+            self.clients.insert(
+                route.owner_worker_endpoint.clone(),
+                TimestampServiceClient::new(connect_channel(&route.owner_worker_endpoint).await?),
+            );
+        }
+        let client = self
+            .clients
+            .get_mut(&route.owner_worker_endpoint)
+            .ok_or("timestamp client was not initialized")?;
+        Ok(timeout(
+            Duration::from_millis(request_timeout_ms.max(1) + 250),
+            client.allocate_timestamps(Request::new(AllocateTimestampsRequest {
+                timeline_key: route.timeline_key.clone(),
+                count: 1,
+                expected_epoch: route.epoch,
+                expected_route_version: route.route_version,
+                client_request_id: request_id.to_owned(),
+                request_timeout_ms: request_timeout_ms.min(u32::MAX as u64) as u32,
+            })),
+        )
+        .await??
+        .into_inner())
+    }
+
+    async fn refresh_route(
+        &mut self,
+        endpoints: &[String],
+        timeline_key: &str,
+    ) -> AppResult<Route> {
+        refresh_route(endpoints, timeline_key).await
+    }
+}
+
+/*
+ * One allocator step is one logical request. A failed first RPC is retained as
+ * attempt evidence, then the route is refreshed and the exact request ID is
+ * retried once. Only an exhausted retry (or failed refresh) is a logical
+ * failure.
+ */
+struct NetworkAllocator<B: AllocationBackend> {
+    config: Config,
+    route_phase: Arc<RwLock<RoutePhase>>,
+    stats: Arc<Mutex<BenchStats>>,
+    backend: B,
+}
+
+impl<B: AllocationBackend> NetworkAllocator<B> {
+    async fn record_attempt_failure(&self, phase: &str) -> AppResult<()> {
+        let mut stats = self.stats.lock().await;
+        let stage = stats
+            .stages
+            .get_mut(phase)
+            .ok_or_else(|| format!("missing stats for phase {phase}"))?;
+        stage.attempt_failed = stage.attempt_failed.saturating_add(1);
+        Ok(())
+    }
+
+    async fn record_logical_failure(&self, phase: &str) -> AppResult<()> {
+        let mut stats = self.stats.lock().await;
+        let stage = stats
+            .stages
+            .get_mut(phase)
+            .ok_or_else(|| format!("missing stats for phase {phase}"))?;
+        stage.failed = stage.failed.saturating_add(1);
+        Ok(())
+    }
+
+    async fn publish_actual_route(&self, actual_route: &Route) {
+        let mut shared = self.route_phase.write().await;
+        if actual_route.route_version >= shared.route.route_version {
+            shared.route = actual_route.clone();
+        }
+    }
+}
+
+#[async_trait]
+impl<B: AllocationBackend> AllocationStep for NetworkAllocator<B> {
     async fn step(&mut self) -> AppResult<()> {
         let snapshot = self.route_phase.read().await.clone();
         let Some(phase) = snapshot.phase else {
@@ -392,79 +461,95 @@ impl AllocationStep for NetworkAllocator {
             stage.requests = stage.requests.saturating_add(1);
             stats.ordinal
         };
-        match allocate(
-            &mut self.clients,
-            &snapshot.route,
-            ordinal,
-            self.config.request_timeout_ms,
-        )
-        .await
+        let request_id = format!("rolling-upgrade-{ordinal}");
+        let mut actual_route = snapshot.route;
+        let response = match self
+            .backend
+            .allocate(&actual_route, &request_id, self.config.request_timeout_ms)
+            .await
         {
-            Ok(response) => {
-                let first = response
-                    .ranges
-                    .first()
-                    .ok_or("allocation response has no ranges")?
-                    .start_tso;
-                let last = response
-                    .ranges
-                    .last()
-                    .ok_or("allocation response has no ranges")?
-                    .end_tso;
-                let success_at = Instant::now();
-                {
-                    let mut stats = self.stats.lock().await;
-                    if first > last || stats.last_tso.is_some_and(|previous| first <= previous) {
-                        stats.monotonicity_violations =
-                            stats.monotonicity_violations.saturating_add(1);
-                    }
-                    stats.last_tso =
-                        Some(stats.last_tso.map_or(last, |previous| previous.max(last)));
-                    if let Some(previous) = stats.last_success_at {
-                        stats.global_max_success_gap_ms = stats
-                            .global_max_success_gap_ms
-                            .max(success_at.duration_since(previous).as_millis() as u64);
-                    }
-                    stats.last_success_at = Some(success_at);
-                    stats.latest_serving = Some(ServingObservation {
-                        ordinal,
-                        phase: phase.clone(),
-                        owner_worker_endpoint: snapshot.route.owner_worker_endpoint.clone(),
-                        last_tso: last,
-                    });
-                    let stage = stats
-                        .stages
-                        .get_mut(&phase)
-                        .ok_or_else(|| format!("missing stats for phase {phase}"))?;
-                    stage.success = stage.success.saturating_add(1);
-                    stage.first_tso.get_or_insert(first);
-                    stage.last_tso = Some(stage.last_tso.map_or(last, |value| value.max(last)));
-                    if let Some(previous) = stage.last_success_at {
-                        stage.max_success_gap_ms = stage
-                            .max_success_gap_ms
-                            .max(success_at.duration_since(previous).as_millis() as u64);
-                    }
-                    stage.last_success_at = Some(success_at);
-                }
-                let mut shared = self.route_phase.write().await;
-                if shared.route.owner_worker_endpoint == snapshot.route.owner_worker_endpoint
-                    && response.route_version >= shared.route.route_version
-                {
-                    shared.route.epoch = response.epoch;
-                    shared.route.route_version = response.route_version;
-                }
-            }
+            Ok(response) => Some(response),
             Err(_) => {
-                let mut stats = self.stats.lock().await;
-                let stage = stats
-                    .stages
-                    .get_mut(&phase)
-                    .ok_or_else(|| format!("missing stats for phase {phase}"))?;
-                stage.failed = stage.failed.saturating_add(1);
+                self.record_attempt_failure(&phase).await?;
+                match self
+                    .backend
+                    .refresh_route(&self.config.endpoints, &actual_route.timeline_key)
+                    .await
+                {
+                    Ok(refreshed) => {
+                        actual_route = refreshed;
+                        match self
+                            .backend
+                            .allocate(&actual_route, &request_id, self.config.request_timeout_ms)
+                            .await
+                        {
+                            Ok(response) => Some(response),
+                            Err(_) => {
+                                self.record_attempt_failure(&phase).await?;
+                                None
+                            }
+                        }
+                    }
+                    Err(_) => None,
+                }
             }
+        };
+        let Some(response) = response else {
+            self.record_logical_failure(&phase).await?;
+            return Ok(());
+        };
+
+        let first = response
+            .ranges
+            .first()
+            .ok_or("allocation response has no ranges")?
+            .start_tso;
+        let last = response
+            .ranges
+            .last()
+            .ok_or("allocation response has no ranges")?
+            .end_tso;
+        let success_at = Instant::now();
+        {
+            let mut stats = self.stats.lock().await;
+            if first > last || stats.last_tso.is_some_and(|previous| first <= previous) {
+                stats.monotonicity_violations = stats.monotonicity_violations.saturating_add(1);
+            }
+            stats.last_tso = Some(stats.last_tso.map_or(last, |previous| previous.max(last)));
+            if let Some(previous) = stats.last_success_at {
+                stats.global_max_success_gap_ms = stats
+                    .global_max_success_gap_ms
+                    .max(success_at.duration_since(previous).as_millis() as u64);
+            }
+            stats.last_success_at = Some(success_at);
+            stats.latest_serving = Some(ServingObservation {
+                ordinal,
+                phase: phase.clone(),
+                route: actual_route.clone(),
+                last_tso: last,
+            });
+            let stage = stats
+                .stages
+                .get_mut(&phase)
+                .ok_or_else(|| format!("missing stats for phase {phase}"))?;
+            stage.success = stage.success.saturating_add(1);
+            stage.first_tso.get_or_insert(first);
+            stage.last_tso = Some(stage.last_tso.map_or(last, |value| value.max(last)));
+            if let Some(previous) = stage.last_success_at {
+                stage.max_success_gap_ms = stage
+                    .max_success_gap_ms
+                    .max(success_at.duration_since(previous).as_millis() as u64);
+            }
+            stage.last_success_at = Some(success_at);
         }
+        self.publish_actual_route(&actual_route).await;
         Ok(())
     }
+}
+
+#[async_trait]
+trait AllocationStep: Send {
+    async fn step(&mut self) -> AppResult<()>;
 }
 
 async fn run_allocation_loop<S: AllocationStep>(
@@ -495,7 +580,8 @@ async fn wait_for_serving_observation(
         if let Some(observation) = stats.lock().await.latest_serving.clone() {
             if observation.ordinal > minimum_ordinal
                 && observation.phase == expected_phase
-                && target_endpoint.is_none_or(|target| target == observation.owner_worker_endpoint)
+                && target_endpoint
+                    .is_none_or(|target| target == observation.route.owner_worker_endpoint)
             {
                 return Ok(observation);
             }
@@ -530,6 +616,29 @@ async fn run_command_driver(
             continue;
         }
         if command.phase == "stop" {
+            if let Some(minimum) = command.target_endpoint.as_deref() {
+                let minimum = minimum.parse::<u64>().map_err(|error| {
+                    format!("stop command high-water target must be an integer: {error}")
+                })?;
+                let deadline = Instant::now() + Duration::from_secs(20);
+                loop {
+                    if stats
+                        .lock()
+                        .await
+                        .last_tso
+                        .is_some_and(|last| last > minimum)
+                    {
+                        break;
+                    }
+                    if Instant::now() >= deadline {
+                        return Err(format!(
+                            "continuous allocator did not advance beyond external high water {minimum} within 20s"
+                        )
+                        .into());
+                    }
+                    sleep(Duration::from_millis(10)).await;
+                }
+            }
             stop.store(true, Ordering::Release);
             return Ok(command_count);
         }
@@ -575,14 +684,13 @@ async fn run_command_driver(
             deadline,
         )
         .await?;
-        let route = route_phase.read().await.route.clone();
         write_ack(
             &config.ack_file,
             &PendingAck {
                 command: command.clone(),
                 health: observed_health,
             },
-            &route,
+            &observation.route,
             observation.last_tso,
         )?;
         current_sequence = command.sequence;
@@ -614,7 +722,9 @@ async fn main() -> AppResult<()> {
             config: config.clone(),
             route_phase: route_phase.clone(),
             stats: stats.clone(),
-            clients: BTreeMap::new(),
+            backend: GrpcAllocationBackend {
+                clients: BTreeMap::new(),
+            },
         },
         stop.clone(),
     ));
@@ -654,6 +764,10 @@ async fn main() -> AppResult<()> {
         println!("{phase}_requests_total={}", phase_stats.requests);
         println!("{phase}_success_total={}", phase_stats.success);
         println!("{phase}_failed_total={}", phase_stats.failed);
+        println!(
+            "{phase}_attempt_failed_total={}",
+            phase_stats.attempt_failed
+        );
         println!("{phase}_first_tso={}", phase_stats.first_tso.unwrap_or(0));
         println!("{phase}_last_tso={}", phase_stats.last_tso.unwrap_or(0));
         println!(
@@ -667,10 +781,58 @@ async fn main() -> AppResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
     use std::sync::atomic::AtomicU64;
+    use std::sync::Mutex as StdMutex;
 
     struct CountingAllocator {
         progress: Arc<AtomicU64>,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct AllocationCall {
+        owner: String,
+        epoch: u64,
+        route_version: u64,
+        request_id: String,
+    }
+
+    struct FakeAllocationBackend {
+        outcomes: VecDeque<Result<AllocateTimestampsResponse, &'static str>>,
+        refreshed_route: Route,
+        calls: Arc<StdMutex<Vec<AllocationCall>>>,
+    }
+
+    #[async_trait]
+    impl AllocationBackend for FakeAllocationBackend {
+        async fn allocate(
+            &mut self,
+            route: &Route,
+            request_id: &str,
+            _request_timeout_ms: u64,
+        ) -> AppResult<AllocateTimestampsResponse> {
+            self.calls
+                .lock()
+                .expect("fake call lock")
+                .push(AllocationCall {
+                    owner: route.owner_worker_endpoint.clone(),
+                    epoch: route.epoch,
+                    route_version: route.route_version,
+                    request_id: request_id.to_owned(),
+                });
+            self.outcomes
+                .pop_front()
+                .expect("fake outcome")
+                .map_err(Into::into)
+        }
+
+        async fn refresh_route(
+            &mut self,
+            _endpoints: &[String],
+            _timeline_key: &str,
+        ) -> AppResult<Route> {
+            Ok(self.refreshed_route.clone())
+        }
     }
 
     #[async_trait]
@@ -690,6 +852,160 @@ mod tests {
         ))
     }
 
+    fn test_route(owner: &str, epoch: u64, route_version: u64) -> Route {
+        Route {
+            timeline_key: "upgrade.timeline".to_owned(),
+            epoch,
+            route_version,
+            owner_worker_endpoint: owner.to_owned(),
+        }
+    }
+
+    fn test_response(epoch: u64, route_version: u64, tso: u64) -> AllocateTimestampsResponse {
+        AllocateTimestampsResponse {
+            timeline_key: "upgrade.timeline".to_owned(),
+            generator_id: 1,
+            epoch,
+            route_version,
+            ranges: vec![chronos::proto::v1::TimestampRange {
+                start_tso: tso,
+                end_tso: tso,
+            }],
+        }
+    }
+
+    fn test_config() -> Config {
+        Config {
+            endpoints: vec![
+                "old-owner".to_owned(),
+                "new-owner".to_owned(),
+                "third-owner".to_owned(),
+            ],
+            command_file: PathBuf::new(),
+            ack_file: PathBuf::new(),
+            timeline_key: "upgrade.timeline".to_owned(),
+            request_timeout_ms: 500,
+            poll_interval_ms: 1,
+            max_runtime_secs: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn allocation_retry_uses_refreshed_route_and_the_same_logical_request() {
+        let initial = test_route("old-owner", 1, 1);
+        let refreshed = test_route("new-owner", 2, 2);
+        let route_phase = Arc::new(RwLock::new(RoutePhase {
+            route: initial,
+            phase: Some("rollback_mixed_1".to_owned()),
+        }));
+        let stats = Arc::new(Mutex::new(BenchStats::default()));
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        let mut allocator = NetworkAllocator {
+            config: test_config(),
+            route_phase: route_phase.clone(),
+            stats: stats.clone(),
+            backend: FakeAllocationBackend {
+                outcomes: VecDeque::from([
+                    Err("first attempt failed"),
+                    Ok(test_response(99, 99, 100)),
+                ]),
+                refreshed_route: refreshed.clone(),
+                calls: calls.clone(),
+            },
+        };
+
+        allocator.step().await.expect("allocator step");
+
+        assert_eq!(
+            *calls.lock().expect("fake call lock"),
+            vec![
+                AllocationCall {
+                    owner: "old-owner".to_owned(),
+                    epoch: 1,
+                    route_version: 1,
+                    request_id: "rolling-upgrade-1".to_owned(),
+                },
+                AllocationCall {
+                    owner: "new-owner".to_owned(),
+                    epoch: 2,
+                    route_version: 2,
+                    request_id: "rolling-upgrade-1".to_owned(),
+                },
+            ]
+        );
+        let stats = stats.lock().await;
+        let stage = stats
+            .stages
+            .get("rollback_mixed_1")
+            .expect("rollback stage");
+        assert_eq!(
+            (
+                stage.requests,
+                stage.success,
+                stage.failed,
+                stage.attempt_failed
+            ),
+            (1, 1, 0, 1)
+        );
+        let observation = stats.latest_serving.as_ref().expect("serving observation");
+        assert_eq!(observation.ordinal, 1);
+        assert_eq!(observation.route.owner_worker_endpoint, "new-owner");
+        assert_eq!(
+            (observation.route.epoch, observation.route.route_version),
+            (2, 2)
+        );
+        drop(stats);
+        assert_eq!(
+            route_phase.read().await.route.owner_worker_endpoint,
+            refreshed.owner_worker_endpoint
+        );
+    }
+
+    #[tokio::test]
+    async fn exhausted_allocation_retry_is_one_logical_failure() {
+        let route_phase = Arc::new(RwLock::new(RoutePhase {
+            route: test_route("old-owner", 1, 1),
+            phase: Some("rollback_mixed_1".to_owned()),
+        }));
+        let stats = Arc::new(Mutex::new(BenchStats::default()));
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        let mut allocator = NetworkAllocator {
+            config: test_config(),
+            route_phase,
+            stats: stats.clone(),
+            backend: FakeAllocationBackend {
+                outcomes: VecDeque::from([
+                    Err("first attempt failed"),
+                    Err("second attempt failed"),
+                ]),
+                refreshed_route: test_route("new-owner", 2, 2),
+                calls: calls.clone(),
+            },
+        };
+
+        allocator.step().await.expect("allocator step");
+
+        let calls = calls.lock().expect("fake call lock");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].request_id, calls[1].request_id);
+        drop(calls);
+        let stats = stats.lock().await;
+        let stage = stats
+            .stages
+            .get("rollback_mixed_1")
+            .expect("rollback stage");
+        assert_eq!(
+            (
+                stage.requests,
+                stage.success,
+                stage.failed,
+                stage.attempt_failed
+            ),
+            (1, 0, 1, 2)
+        );
+        assert!(stats.latest_serving.is_none());
+    }
+
     #[test]
     fn command_parser_accepts_known_phase_and_optional_target() {
         let command = command_path("valid");
@@ -707,6 +1023,16 @@ mod tests {
             .expect("command should exist")
             .target_endpoint
             .is_none());
+
+        fs::write(&command, "9|rollback_mixed_2|127.0.0.1:52052\n")
+            .expect("write rollback command");
+        assert_eq!(
+            parse_command(&command)
+                .expect("parse rollback command")
+                .expect("rollback command should exist")
+                .phase,
+            "rollback_mixed_2"
+        );
         fs::remove_file(command).expect("remove command");
     }
 

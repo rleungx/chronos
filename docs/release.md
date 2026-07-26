@@ -106,7 +106,11 @@ snapshot to a separate prefix when a format-level rollback is required.
 
 `make test-rolling-upgrade` is narrower than a version-support promise: it builds the exact
 historical SHA pinned in `hack/upgrade/baseline.env` and the current exact SHA, verifies that package
-version, metadata schema, and cluster format are unchanged, then exercises a forward three-worker
-rolling replacement. It does not prove N+1-to-N rollback or compatibility across a format change.
+version, metadata schema, and cluster format are unchanged, then exercises forward replacement
+`0,1,2` and rollback replacement `2,1,0` without restarting etcd or the continuous allocator. It
+also requires a current-created request to replay with the complete same protobuf response under
+the historical binary before a fresh historical request and the allocator advance again. This is
+evidence only for the two pinned same-format commits—even when both package versions are `0.1.0`.
+It is not a SemVer downgrade promise and does not cover compatibility across a format change.
 
 For the full rollback procedure, see `docs/rollback.md`.

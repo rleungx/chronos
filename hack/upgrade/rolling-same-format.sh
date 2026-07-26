@@ -24,7 +24,9 @@ ETCD_ENDPOINTS="${CHRONOS_UPGRADE_ETCD_ENDPOINTS:-127.0.0.1:2379,127.0.0.1:22379
 MAX_SUCCESS_GAP_MS="${CHRONOS_UPGRADE_MAX_SUCCESS_GAP_MS:-3000}"
 UNIQUE_SUFFIX="$(date +%s)-$$"
 ETCD_PREFIX="${CHRONOS_UPGRADE_ETCD_PREFIX:-/chronos-rolling-upgrade-${UNIQUE_SUFFIX}}"
-TIMELINE_KEY="${CHRONOS_UPGRADE_TIMELINE_KEY:-rolling-upgrade-${UNIQUE_SUFFIX}.timeline}"
+TIMELINE_KEY="${CHRONOS_UPGRADE_TIMELINE_KEY:-bench.rolling-upgrade-${UNIQUE_SUFFIX}.0}"
+PROBE_SCENARIO="${TIMELINE_KEY#bench.}"
+PROBE_SCENARIO="${PROBE_SCENARIO%.0}"
 PLAN_ID="${CHRONOS_UPGRADE_PLAN_ID:-rolling-upgrade-${UNIQUE_SUFFIX}-workers-3}"
 STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 BASE_TARGET_DIR="${CHRONOS_UPGRADE_BASE_TARGET_DIR:-${REPO_ROOT}/target/upgrade-baseline-${BASE_SHA:0:12}}"
@@ -32,14 +34,17 @@ CURRENT_BIN_DIR="${CHRONOS_RELEASE_BIN_DIR:-${REPO_ROOT}/target/release}"
 BASE_BIN="${BASE_TARGET_DIR}/release/chronos"
 CURRENT_BIN="${CURRENT_BIN_DIR}/chronos"
 BENCH_BIN="${CURRENT_BIN_DIR}/chronos-upgrade-bench"
+PROBE_BIN="${CURRENT_BIN_DIR}/chronos-bench"
 
 SERVICE_ENDPOINTS=(127.0.0.1:52051 127.0.0.1:52052 127.0.0.1:52053)
 METRICS_ENDPOINTS=(127.0.0.1:9991 127.0.0.1:9992 127.0.0.1:9993)
 WORKER_IDS=(upgrade-worker-0 upgrade-worker-1 upgrade-worker-2)
 OLD_INSTANCE_IDS=(upgrade-old-0 upgrade-old-1 upgrade-old-2)
 NEW_INSTANCE_IDS=(upgrade-new-0 upgrade-new-1 upgrade-new-2)
+ROLLBACK_INSTANCE_IDS=(upgrade-rollback-old-0 upgrade-rollback-old-1 upgrade-rollback-old-2)
 OLD_PIDS=("" "" "")
 NEW_PIDS=("" "" "")
+ROLLBACK_PIDS=("" "" "")
 ACTIVE_PIDS=("" "" "")
 WORKER_LOGS=(
   "${ARTIFACT_DIR}/worker-0-old.log"
@@ -54,6 +59,11 @@ SUMMARY_LOG="${ARTIFACT_DIR}/summary.txt"
 INDEX_LOG="${ARTIFACT_DIR}/artifact-index.txt"
 BASE_BUILD_LOG="${ARTIFACT_DIR}/base-build.log"
 CURRENT_BUILD_LOG="${ARTIFACT_DIR}/current-build.log"
+CURRENT_REQUEST_LOG="${ARTIFACT_DIR}/current-only-request.txt"
+ROLLBACK_REPLAY_LOG="${ARTIFACT_DIR}/historical-replay-request.txt"
+ROLLBACK_FRESH_LOG="${ARTIFACT_DIR}/historical-fresh-request.txt"
+CURRENT_REQUEST_ID="rolling-upgrade-cross-binary-${UNIQUE_SUFFIX}"
+ROLLBACK_FRESH_REQUEST_ID="rolling-upgrade-historical-fresh-${UNIQUE_SUFFIX}"
 RESULT="failure"
 BENCH_PID=""
 COMMAND_SEQUENCE=0
@@ -115,22 +125,34 @@ base_cluster_format=${BASE_CLUSTER_FORMAT}
 current_cluster_format=${CURRENT_CLUSTER_FORMAT}
 base_metadata_schema=${BASE_METADATA_SCHEMA}
 current_metadata_schema=${CURRENT_METADATA_SCHEMA}
-forward_upgrade_only=true
-rollback_covered=false
+evidence_contract=same_format_forward_and_rollback_v1
+forward_upgrade_covered=true
+rollback_covered=true
+semver_downgrade_covered=false
 worker_count=3
 replacement_order=0,1,2
+rollback_replacement_order=2,1,0
+identity_lease_ttl_ms=1500
+base_identity_requested_ttl_seconds=1
+current_identity_requested_ttl_seconds=2
 old_pid_0=${OLD_PIDS[0]}
 old_pid_1=${OLD_PIDS[1]}
 old_pid_2=${OLD_PIDS[2]}
 new_pid_0=${NEW_PIDS[0]}
 new_pid_1=${NEW_PIDS[1]}
 new_pid_2=${NEW_PIDS[2]}
+rollback_pid_0=${ROLLBACK_PIDS[0]}
+rollback_pid_1=${ROLLBACK_PIDS[1]}
+rollback_pid_2=${ROLLBACK_PIDS[2]}
 old_instance_0=${OLD_INSTANCE_IDS[0]}
 old_instance_1=${OLD_INSTANCE_IDS[1]}
 old_instance_2=${OLD_INSTANCE_IDS[2]}
 new_instance_0=${NEW_INSTANCE_IDS[0]}
 new_instance_1=${NEW_INSTANCE_IDS[1]}
 new_instance_2=${NEW_INSTANCE_IDS[2]}
+rollback_instance_0=${ROLLBACK_INSTANCE_IDS[0]}
+rollback_instance_1=${ROLLBACK_INSTANCE_IDS[1]}
+rollback_instance_2=${ROLLBACK_INSTANCE_IDS[2]}
 etcd_endpoints=${ETCD_ENDPOINTS}
 etcd_prefix=${ETCD_PREFIX}
 service_endpoints=$(join_by_comma "${SERVICE_ENDPOINTS[@]}")
@@ -142,6 +164,9 @@ bench_log=${BENCH_LOG}
 identity_log=${IDENTITY_LOG}
 base_build_log=${BASE_BUILD_LOG}
 current_build_log=${CURRENT_BUILD_LOG}
+current_request_log=${CURRENT_REQUEST_LOG}
+historical_replay_log=${ROLLBACK_REPLAY_LOG}
+historical_fresh_log=${ROLLBACK_FRESH_LOG}
 EOF
 }
 
@@ -198,6 +223,10 @@ if [[ "${BASE_VERSION}" != "${CURRENT_VERSION}" ||
   echo "rolling gate only supports same-version, same-format history: base=${BASE_VERSION}/format-${BASE_CLUSTER_FORMAT}/schema-${BASE_METADATA_SCHEMA} current=${CURRENT_VERSION}/format-${CURRENT_CLUSTER_FORMAT}/schema-${CURRENT_METADATA_SCHEMA}" >&2
   exit 1
 fi
+if [[ "bench.${PROBE_SCENARIO}.0" != "${TIMELINE_KEY}" ]]; then
+  echo "rolling timeline key must use the probe-compatible bench.<scenario>.0 form: ${TIMELINE_KEY}" >&2
+  exit 1
+fi
 
 BASE_SOURCE="$(mktemp -d "${TMPDIR:-/tmp}/chronos-upgrade-base.XXXXXX")"
 git archive "${BASE_SHA}" | tar -x -C "${BASE_SOURCE}"
@@ -209,14 +238,14 @@ env \
   >"${BASE_BUILD_LOG}" 2>&1
 echo "[rolling-upgrade] building current ${CURRENT_SHA}"
 if [[ "${CHRONOS_SKIP_RELEASE_BUILD:-0}" == "1" ]]; then
-  [[ -x "${CURRENT_BIN}" && -x "${BENCH_BIN}" ]] || {
-    echo "missing packaged current chronos/chronos-upgrade-bench binaries in ${CURRENT_BIN_DIR}" >&2
+  [[ -x "${CURRENT_BIN}" && -x "${BENCH_BIN}" && -x "${PROBE_BIN}" ]] || {
+    echo "missing packaged current chronos/chronos-upgrade-bench/chronos-bench binaries in ${CURRENT_BIN_DIR}" >&2
     exit 1
   }
   printf 'reused_release_binaries=true\ncurrent_sha=%s\n' "${CURRENT_SHA}" >"${CURRENT_BUILD_LOG}"
 else
   env CHRONOS_BUILD_COMMIT="${CURRENT_SHA}" \
-    cargo build --locked --release --bin chronos --bin chronos-upgrade-bench \
+    cargo build --locked --release --bin chronos --bin chronos-upgrade-bench --bin chronos-bench \
     >"${CURRENT_BUILD_LOG}" 2>&1
 fi
 
@@ -288,6 +317,22 @@ issue_serving_command() {
   cp "${ACK_FILE}" "${ARTIFACT_DIR}/ack-${COMMAND_SEQUENCE}-${label}.txt"
 }
 
+run_request_probe() {
+  local request_id=$1
+  local output_log=$2
+  env \
+    CHRONOS_BENCH_ENDPOINT="http://${SERVICE_ENDPOINTS[0]}" \
+    CHRONOS_BENCH_CONTROL_ENDPOINTS="http://${SERVICE_ENDPOINTS[0]},http://${SERVICE_ENDPOINTS[1]},http://${SERVICE_ENDPOINTS[2]}" \
+    CHRONOS_BENCH_SCENARIO="${PROBE_SCENARIO}" \
+    CHRONOS_BENCH_TIMELINES=1 \
+    CHRONOS_BENCH_BATCH=1 \
+    CHRONOS_BENCH_IDEMPOTENCY=true \
+    CHRONOS_BENCH_PROBE_ONLY=true \
+    CHRONOS_BENCH_ROUTE_TO_OWNERS=true \
+    CHRONOS_BENCH_PROBE_REQUEST_ID="${request_id}" \
+    "${PROBE_BIN}" >"${output_log}"
+}
+
 echo "[rolling-upgrade] resetting clustered etcd"
 make etcd-cluster-reset >/dev/null
 make etcd-cluster-up >/dev/null
@@ -345,11 +390,46 @@ for idx in 0 1 2; do
   sleep 0.5
 done
 
-set_command stop -
+echo "[rolling-upgrade] recording current-only cross-binary request"
+run_request_probe "${CURRENT_REQUEST_ID}" "${CURRENT_REQUEST_LOG}"
+
+for idx in 2 1 0; do
+  echo "[rolling-upgrade] rolling worker ${idx} back to historical"
+  issue_serving_command "rollback_replace_${idx}" - "rollback-replace-${idx}-started"
+  stop_process "${ACTIVE_PIDS[idx]}"
+  ACTIVE_PIDS[idx]=""
+  rollback_log="${ARTIFACT_DIR}/worker-${idx}-rollback-old.log"
+  WORKER_LOGS[idx]="${rollback_log}"
+  start_worker "${BASE_BIN}" "${idx}" "${ROLLBACK_INSTANCE_IDS[idx]}" "${rollback_log}"
+  ROLLBACK_PIDS[idx]="${ACTIVE_PIDS[idx]}"
+  wait_for_http "http://${METRICS_ENDPOINTS[idx]}/readyz" "rollback historical worker ${idx}" 100 0.1
+
+  if [[ "${idx}" -eq 2 ]]; then
+    next_phase=rollback_mixed_1
+  elif [[ "${idx}" -eq 1 ]]; then
+    next_phase=rollback_mixed_2
+  else
+    next_phase=old_only_after_rollback
+  fi
+  issue_serving_command "${next_phase}" "${SERVICE_ENDPOINTS[idx]}" "rollback-old-worker-${idx}"
+  sleep 0.5
+done
+
+echo "[rolling-upgrade] replaying current request under historical workers"
+run_request_probe "${CURRENT_REQUEST_ID}" "${ROLLBACK_REPLAY_LOG}"
+echo "[rolling-upgrade] recording fresh historical request"
+run_request_probe "${ROLLBACK_FRESH_REQUEST_ID}" "${ROLLBACK_FRESH_LOG}"
+FRESH_TSO="$(extract_metric probe_last_tso "${ROLLBACK_FRESH_LOG}")"
+[[ "${FRESH_TSO}" =~ ^[0-9]+$ ]] || {
+  echo "historical fresh probe did not emit a valid final TSO" >&2
+  exit 1
+}
+
+set_command stop "${FRESH_TSO}"
 wait "${BENCH_PID}"
 BENCH_PID=""
 
 RESULT="success"
 write_summary
 bash "${REPO_ROOT}/hack/verify-rolling-upgrade.sh" "${SUMMARY_LOG}"
-echo "[rolling-upgrade] passed ${BASE_SHA} -> ${CURRENT_SHA}"
+echo "[rolling-upgrade] passed ${BASE_SHA} -> ${CURRENT_SHA} -> ${BASE_SHA}"

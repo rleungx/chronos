@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use prost::Message;
 use tokio::sync::Barrier;
 use tokio::time::sleep;
 use tonic::transport::Channel;
@@ -115,6 +116,7 @@ struct ProbeResult {
     generator_id: u32,
     first_tso: u64,
     last_tso: u64,
+    response_protobuf_hex: String,
     idempotency_replay_verified: bool,
 }
 
@@ -475,6 +477,14 @@ fn verify_idempotent_replay(
     Ok(())
 }
 
+fn protobuf_hex(message: &impl Message) -> String {
+    message
+        .encode_to_vec()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 async fn allocate_timestamps_with_timeout(
     client: &mut TimestampServiceClient<Channel>,
     request: Request<AllocateTimestampsRequest>,
@@ -611,12 +621,14 @@ async fn run_probe(
     .map_err(|reason| format!("probe idempotency replay failed: {reason}"))?
     .into_inner();
     verify_idempotent_replay(&response, &replay)?;
+    let response_protobuf_hex = protobuf_hex(&response);
 
     Ok(ProbeResult {
         timeline_key: response.timeline_key,
         generator_id: response.generator_id,
         first_tso,
         last_tso,
+        response_protobuf_hex,
         idempotency_replay_verified: true,
     })
 }
@@ -738,6 +750,10 @@ async fn run() -> AppResult<()> {
         println!("probe_generator_id={}", probe.generator_id);
         println!("probe_first_tso={}", probe.first_tso);
         println!("probe_last_tso={}", probe.last_tso);
+        println!(
+            "probe_response_protobuf_hex={}",
+            probe.response_protobuf_hex
+        );
         println!(
             "probe_idempotency_replay_verified={}",
             probe.idempotency_replay_verified
@@ -977,7 +993,6 @@ async fn run() -> AppResult<()> {
 #[cfg(test)]
 mod tests {
     use prost::bytes::Bytes;
-    use prost::Message;
 
     use super::*;
 
@@ -1043,6 +1058,34 @@ mod tests {
         replay.ranges[0].start_tso = 101;
         replay.ranges[0].end_tso = 101;
         assert!(verify_idempotent_replay(&original, &replay).is_err());
+    }
+
+    #[test]
+    fn probe_response_hex_covers_the_complete_protobuf_response() {
+        let response = AllocateTimestampsResponse {
+            timeline_key: "timeline-a".to_owned(),
+            generator_id: 7,
+            epoch: 9,
+            route_version: 11,
+            ranges: vec![chronos::proto::v1::TimestampRange {
+                start_tso: 100,
+                end_tso: 101,
+            }],
+        };
+        let encoded = protobuf_hex(&response);
+        assert!(!encoded.is_empty());
+
+        let bytes = encoded
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|digits| {
+                u8::from_str_radix(std::str::from_utf8(digits).expect("hex must be UTF-8"), 16)
+                    .expect("hex byte")
+            })
+            .collect::<Vec<_>>();
+        let decoded =
+            AllocateTimestampsResponse::decode(bytes.as_slice()).expect("decode probe response");
+        assert_eq!(decoded, response);
     }
 
     #[test]

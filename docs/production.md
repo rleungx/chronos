@@ -406,7 +406,12 @@ metadata-schema, or cluster-format difference. It then starts three historical w
 single-timeline allocation client alive while each worker is replaced in order. The client moves
 the same timeline onto every old and replacement instance, records health-reported instance/build
 identity, and requires non-empty strictly increasing ranges in old-only, every replacement window,
-both mixed-binary windows, and new-only. A bounded maximum success gap prevents readiness-only
-evidence from hiding a prolonged allocation outage. This proves only that pinned historical
-commit-to-current-head forward rollout; it is not a SemVer compatibility promise and does not cover
-N+1-to-N rollback or any rollout that changes `CURRENT_CLUSTER_FORMAT_VERSION`.
+both mixed-binary windows, and new-only. It then keeps the same etcd prefix and allocator while
+replacing workers `2,1,0` with fresh historical instances and applying the same checks through
+historical-only-after-rollback. Failed RPC attempts remain visible, while only one same-request-ID
+retry is allowed after an actual route refresh and logical failures remain forbidden. A
+current-created request must replay with its complete protobuf response under historical workers;
+a fresh historical request and the continuous allocator must then advance beyond it. The 1500ms
+identity setting deliberately exercises historical 1s floor versus current 2s ceil request
+semantics. This proves only the pinned same-format commit pair; it is not SemVer downgrade evidence
+and does not cover a rollout that changes `CURRENT_CLUSTER_FORMAT_VERSION`.
