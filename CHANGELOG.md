@@ -8,6 +8,9 @@ tagged.
 
 ## [Unreleased]
 
+- Add a backpressure-aware bidirectional timestamp allocation stream while preserving the unary
+  client contract.
+- Update `h2` to 0.4.16 to reject unbounded empty DATA frames on long-lived HTTP/2 connections.
 - Round identity lease grant requests up to whole seconds, use the server-selected grant TTL for
   the initial keepalive deadline, and expose configured versus requested identity TTL values.
 - Recover client routes after owner transport failures.

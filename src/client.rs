@@ -698,6 +698,14 @@ mod tests {
 
     #[tonic::async_trait]
     impl crate::proto::v1::timestamp_service_server::TimestampService for FakeTimestampService {
+        type AllocateTimestampsStreamStream = std::pin::Pin<
+            Box<
+                dyn futures::Stream<Item = Result<AllocateTimestampsResponse, Status>>
+                    + Send
+                    + 'static,
+            >,
+        >;
+
         async fn allocate_timestamps(
             &self,
             request: Request<AllocateTimestampsRequest>,
@@ -735,6 +743,15 @@ mod tests {
                     end_tso: 100 + request.count as u64 - 1,
                 }],
             }))
+        }
+
+        async fn allocate_timestamps_stream(
+            &self,
+            _request: Request<tonic::Streaming<AllocateTimestampsRequest>>,
+        ) -> Result<Response<Self::AllocateTimestampsStreamStream>, Status> {
+            Err(Status::unimplemented(
+                "streaming is not implemented by the test double",
+            ))
         }
     }
 

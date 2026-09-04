@@ -1,3 +1,6 @@
+use std::pin::Pin;
+
+use futures::Stream;
 use tonic::{Request, Response, Status};
 
 use crate::authz::PeerCertAuthorizer;
@@ -130,6 +133,9 @@ impl TsoTimestampService {
 
 #[tonic::async_trait]
 impl TimestampService for TsoTimestampService {
+    type AllocateTimestampsStreamStream =
+        Pin<Box<dyn Stream<Item = Result<AllocateTimestampsResponse, Status>> + Send + 'static>>;
+
     async fn allocate_timestamps(
         &self,
         request: Request<AllocateTimestampsRequest>,
@@ -138,6 +144,25 @@ impl TimestampService for TsoTimestampService {
         Ok(Response::new(
             allocate_timestamps_response(&self.allocator, request.into_inner()).await?,
         ))
+    }
+
+    async fn allocate_timestamps_stream(
+        &self,
+        request: Request<tonic::Streaming<AllocateTimestampsRequest>>,
+    ) -> Result<Response<Self::AllocateTimestampsStreamStream>, Status> {
+        self.authorize(&request)?;
+        let allocator = self.allocator.clone();
+        let responses = futures::stream::try_unfold(
+            (request.into_inner(), allocator),
+            |(mut requests, allocator)| async move {
+                let Some(request) = requests.message().await? else {
+                    return Ok(None);
+                };
+                let response = allocate_timestamps_response(&allocator, request).await?;
+                Ok(Some((response, (requests, allocator))))
+            },
+        );
+        Ok(Response::new(Box::pin(responses)))
     }
 }
 

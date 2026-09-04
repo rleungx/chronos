@@ -12,6 +12,9 @@ use std::sync::Arc;
 use common_config::required_test_config;
 use common_etcd_prefix::unique_test_etcd_prefix;
 use common_etcd_store::test_etcd_store;
+use tokio::net::TcpListener;
+use tokio_stream::wrappers::TcpListenerStream;
+use tonic::transport::Server;
 use tonic::{Code, Request};
 
 use chronos::lifecycle::TimelineLifecycleContract;
@@ -23,10 +26,12 @@ use chronos::proto::v1::{
     timeline_control_service_server::TimelineControlService,
     timeline_route_service_server::TimelineRouteService,
     timeline_status_service_server::TimelineStatusService,
-    timestamp_service_server::TimestampService, AllocateTimestampsRequest as ProtoAllocateRequest,
-    EnsureTimelineRequest, ErrorCode, GetTimelineRouteRequest, GetTimelineStatusRequest,
-    ListTimelineStatusesRequest, OperatorActionBlocker, OperatorActionNextStep, TimelineState,
-    TimelineTransferReason, TransferTimelineRequest, WorkerReadinessReason, WorkerReadinessState,
+    timestamp_service_client::TimestampServiceClient,
+    timestamp_service_server::{TimestampService, TimestampServiceServer},
+    AllocateTimestampsRequest as ProtoAllocateRequest, EnsureTimelineRequest, ErrorCode,
+    GetTimelineRouteRequest, GetTimelineStatusRequest, ListTimelineStatusesRequest,
+    OperatorActionBlocker, OperatorActionNextStep, TimelineState, TimelineTransferReason,
+    TransferTimelineRequest, WorkerReadinessReason, WorkerReadinessState,
 };
 use chronos::rpc::{
     HealthStatusHandle, TsoControlService, TsoRouteService, TsoTimelineStatusService,
@@ -409,6 +414,93 @@ async fn timestamp_rpc_returns_structured_error_details() {
     assert_eq!(detail.code, ErrorCode::RouteVersionMismatch as i32);
     assert_eq!(detail.current_route_version, route.route_version);
     assert!(detail.message.contains("route version mismatch"));
+}
+
+#[tokio::test]
+async fn timestamp_stream_preserves_order_and_propagates_structured_errors() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let clock = Arc::new(ManualClock::new(3_050));
+    let metadata = Arc::new(MemoryMetadataStore::new());
+    let service = service_with_metadata(
+        TsoConfig {
+            advertise_endpoint: addr.to_string(),
+            ..TsoConfig::default()
+        },
+        clock,
+        metadata,
+    );
+    let route = service
+        .ensure_timeline("rpc.streaming.timeline")
+        .await
+        .unwrap();
+    let timestamp_service = TsoTimestampService::new(service.data_plane());
+    let server_handle = tokio::spawn(
+        Server::builder()
+            .add_service(TimestampServiceServer::new(timestamp_service))
+            .serve_with_incoming(TcpListenerStream::new(listener)),
+    );
+    let mut client = TimestampServiceClient::connect(format!("http://{addr}"))
+        .await
+        .unwrap();
+    let request = |count, client_request_id: &str, route_version| ProtoAllocateRequest {
+        timeline_key: route.timeline_key.clone(),
+        count,
+        expected_epoch: route.epoch,
+        expected_route_version: route_version,
+        client_request_id: client_request_id.to_string(),
+        request_timeout_ms: 0,
+    };
+
+    let mut responses = client
+        .allocate_timestamps_stream(tokio_stream::iter([
+            request(2, "stream-first", route.route_version),
+            request(3, "stream-second", route.route_version),
+        ]))
+        .await
+        .unwrap()
+        .into_inner();
+    let first = responses.message().await.unwrap().unwrap();
+    let second = responses.message().await.unwrap().unwrap();
+
+    assert_eq!(allocated_count(&first), 2);
+    assert_eq!(allocated_count(&second), 3);
+    assert_eq!(first.timeline_key, route.timeline_key);
+    assert_eq!(second.timeline_key, route.timeline_key);
+    assert!(second.ranges[0].start_tso > first.ranges.last().unwrap().end_tso);
+    assert!(responses.message().await.unwrap().is_none());
+
+    let mut responses = client
+        .allocate_timestamps_stream(tokio_stream::iter([
+            request(1, "stream-before-error", route.route_version),
+            request(1, "stream-stale-route", route.route_version + 1),
+            request(1, "stream-after-error", route.route_version),
+        ]))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(responses.message().await.unwrap().is_some());
+    let error = responses
+        .message()
+        .await
+        .expect_err("a request error should terminate the stream");
+    assert_eq!(error.code(), Code::FailedPrecondition);
+    let detail = chronos::rpc::decode_error_detail_from_status_details(error.details())
+        .expect("stream error detail should decode");
+    assert_eq!(detail.code, ErrorCode::RouteVersionMismatch as i32);
+    assert_eq!(detail.current_route_version, route.route_version);
+
+    server_handle.abort();
+    let _ = server_handle.await;
+    service.shutdown().await;
+}
+
+fn allocated_count(response: &chronos::proto::v1::AllocateTimestampsResponse) -> u64 {
+    response
+        .ranges
+        .iter()
+        .map(|range| range.end_tso - range.start_tso + 1)
+        .sum()
 }
 
 #[tokio::test]

@@ -168,7 +168,8 @@ var TimelineRouteService_ServiceDesc = grpc.ServiceDesc{
 }
 
 const (
-	TimestampService_AllocateTimestamps_FullMethodName = "/chronos.tso.v1.TimestampService/AllocateTimestamps"
+	TimestampService_AllocateTimestamps_FullMethodName       = "/chronos.tso.v1.TimestampService/AllocateTimestamps"
+	TimestampService_AllocateTimestampsStream_FullMethodName = "/chronos.tso.v1.TimestampService/AllocateTimestampsStream"
 )
 
 // TimestampServiceClient is the client API for TimestampService service.
@@ -178,6 +179,10 @@ const (
 // Timestamp allocation is the primary application-facing operation.
 type TimestampServiceClient interface {
 	AllocateTimestamps(ctx context.Context, in *AllocateTimestampsRequest, opts ...grpc.CallOption) (*AllocateTimestampsResponse, error)
+	// The bidirectional stream preserves request order and applies backpressure: each response
+	// corresponds to the next request received on the stream. Any request error terminates the
+	// stream with the same gRPC status and structured error details as AllocateTimestamps.
+	AllocateTimestampsStream(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[AllocateTimestampsRequest, AllocateTimestampsResponse], error)
 }
 
 type timestampServiceClient struct {
@@ -198,6 +203,19 @@ func (c *timestampServiceClient) AllocateTimestamps(ctx context.Context, in *All
 	return out, nil
 }
 
+func (c *timestampServiceClient) AllocateTimestampsStream(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[AllocateTimestampsRequest, AllocateTimestampsResponse], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &TimestampService_ServiceDesc.Streams[0], TimestampService_AllocateTimestampsStream_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[AllocateTimestampsRequest, AllocateTimestampsResponse]{ClientStream: stream}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type TimestampService_AllocateTimestampsStreamClient = grpc.BidiStreamingClient[AllocateTimestampsRequest, AllocateTimestampsResponse]
+
 // TimestampServiceServer is the server API for TimestampService service.
 // All implementations must embed UnimplementedTimestampServiceServer
 // for forward compatibility.
@@ -205,6 +223,10 @@ func (c *timestampServiceClient) AllocateTimestamps(ctx context.Context, in *All
 // Timestamp allocation is the primary application-facing operation.
 type TimestampServiceServer interface {
 	AllocateTimestamps(context.Context, *AllocateTimestampsRequest) (*AllocateTimestampsResponse, error)
+	// The bidirectional stream preserves request order and applies backpressure: each response
+	// corresponds to the next request received on the stream. Any request error terminates the
+	// stream with the same gRPC status and structured error details as AllocateTimestamps.
+	AllocateTimestampsStream(grpc.BidiStreamingServer[AllocateTimestampsRequest, AllocateTimestampsResponse]) error
 	mustEmbedUnimplementedTimestampServiceServer()
 }
 
@@ -217,6 +239,9 @@ type UnimplementedTimestampServiceServer struct{}
 
 func (UnimplementedTimestampServiceServer) AllocateTimestamps(context.Context, *AllocateTimestampsRequest) (*AllocateTimestampsResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method AllocateTimestamps not implemented")
+}
+func (UnimplementedTimestampServiceServer) AllocateTimestampsStream(grpc.BidiStreamingServer[AllocateTimestampsRequest, AllocateTimestampsResponse]) error {
+	return status.Errorf(codes.Unimplemented, "method AllocateTimestampsStream not implemented")
 }
 func (UnimplementedTimestampServiceServer) mustEmbedUnimplementedTimestampServiceServer() {}
 func (UnimplementedTimestampServiceServer) testEmbeddedByValue()                          {}
@@ -257,6 +282,13 @@ func _TimestampService_AllocateTimestamps_Handler(srv interface{}, ctx context.C
 	return interceptor(ctx, in, info, handler)
 }
 
+func _TimestampService_AllocateTimestampsStream_Handler(srv interface{}, stream grpc.ServerStream) error {
+	return srv.(TimestampServiceServer).AllocateTimestampsStream(&grpc.GenericServerStream[AllocateTimestampsRequest, AllocateTimestampsResponse]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type TimestampService_AllocateTimestampsStreamServer = grpc.BidiStreamingServer[AllocateTimestampsRequest, AllocateTimestampsResponse]
+
 // TimestampService_ServiceDesc is the grpc.ServiceDesc for TimestampService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -269,7 +301,14 @@ var TimestampService_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _TimestampService_AllocateTimestamps_Handler,
 		},
 	},
-	Streams:  []grpc.StreamDesc{},
+	Streams: []grpc.StreamDesc{
+		{
+			StreamName:    "AllocateTimestampsStream",
+			Handler:       _TimestampService_AllocateTimestampsStream_Handler,
+			ServerStreams: true,
+			ClientStreams: true,
+		},
+	},
 	Metadata: "tso.proto",
 }
 

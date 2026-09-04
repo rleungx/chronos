@@ -22,6 +22,11 @@ service TimelineRouteService {
 // Timestamp allocation is the primary application-facing operation.
 service TimestampService {
   rpc AllocateTimestamps(AllocateTimestampsRequest) returns (AllocateTimestampsResponse);
+  // The bidirectional stream preserves request order and applies backpressure: each response
+  // corresponds to the next request received on the stream. Any request error terminates the
+  // stream with the same gRPC status and structured error details as AllocateTimestamps.
+  rpc AllocateTimestampsStream(stream AllocateTimestampsRequest)
+      returns (stream AllocateTimestampsResponse);
 }
 
 // Control and health RPCs are intended for operators, control planes, and diagnostics.

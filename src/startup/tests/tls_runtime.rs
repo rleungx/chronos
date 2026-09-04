@@ -11,6 +11,15 @@ struct GlobalConcurrencyProbeService {
 impl chronos::proto::v1::timestamp_service_server::TimestampService
     for GlobalConcurrencyProbeService
 {
+    type AllocateTimestampsStreamStream = std::pin::Pin<
+        Box<
+            dyn futures::Stream<
+                    Item = Result<chronos::proto::v1::AllocateTimestampsResponse, tonic::Status>,
+                > + Send
+                + 'static,
+        >,
+    >;
+
     async fn allocate_timestamps(
         &self,
         _request: tonic::Request<ProtoAllocateTimestampsRequest>,
@@ -23,6 +32,15 @@ impl chronos::proto::v1::timestamp_service_server::TimestampService
         }
         Ok(tonic::Response::new(
             chronos::proto::v1::AllocateTimestampsResponse::default(),
+        ))
+    }
+
+    async fn allocate_timestamps_stream(
+        &self,
+        _request: tonic::Request<tonic::Streaming<ProtoAllocateTimestampsRequest>>,
+    ) -> Result<tonic::Response<Self::AllocateTimestampsStreamStream>, tonic::Status> {
+        Err(tonic::Status::unimplemented(
+            "streaming is not implemented by the concurrency test double",
         ))
     }
 }
@@ -546,6 +564,22 @@ async fn grpc_runtime_authorizes_all_services_by_peer_certificate() {
         .into_inner();
     assert_eq!(allocation.timeline_key, route.timeline_key);
 
+    let mut allocation_stream = authorized_timestamp
+        .allocate_timestamps_stream(tokio_stream::iter([ProtoAllocateTimestampsRequest {
+            timeline_key: route.timeline_key.clone(),
+            count: 1,
+            expected_epoch: route.epoch,
+            expected_route_version: route.route_version,
+            client_request_id: "grpc-auth-stream-allocate".to_string(),
+            request_timeout_ms: 0,
+        }]))
+        .await
+        .unwrap()
+        .into_inner();
+    let streamed_allocation = allocation_stream.message().await.unwrap().unwrap();
+    assert_eq!(streamed_allocation.timeline_key, route.timeline_key);
+    assert!(allocation_stream.message().await.unwrap().is_none());
+
     let mut denied_timestamp = connect_timestamp_client(
         addr,
         fixture,
@@ -562,6 +596,19 @@ async fn grpc_runtime_authorizes_all_services_by_peer_certificate() {
             client_request_id: "grpc-auth-denied-allocate".to_string(),
             request_timeout_ms: 0,
         })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::PermissionDenied);
+
+    let error = denied_timestamp
+        .allocate_timestamps_stream(tokio_stream::iter([ProtoAllocateTimestampsRequest {
+            timeline_key: route.timeline_key.clone(),
+            count: 1,
+            expected_epoch: route.epoch,
+            expected_route_version: route.route_version,
+            client_request_id: "grpc-auth-denied-stream-allocate".to_string(),
+            request_timeout_ms: 0,
+        }]))
         .await
         .unwrap_err();
     assert_eq!(error.code(), tonic::Code::PermissionDenied);

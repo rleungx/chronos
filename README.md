@@ -16,6 +16,12 @@ The application path is intentionally small:
 The client handles timeline creation, route lookup, owner reconnects, stale-route refresh, and
 failover recovery.
 
+The `TimestampService` wire API also provides the bidirectional `AllocateTimestampsStream` RPC for
+pipelined allocation traffic. Stream responses preserve request order and use the same routing,
+timeout, idempotency, authorization, and structured-error semantics as the unary RPC. The
+application-facing clients continue to use the unary API so their route-recovery contract remains
+unchanged.
+
 In production, construct clients with a stable control-plane address (for example, a Kubernetes
 Service). Advertised owner endpoints may change or disappear during failover; the control-plane
 address must remain reachable so clients can refresh their cached route.
