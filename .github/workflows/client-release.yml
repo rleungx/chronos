@@ -112,7 +112,7 @@ jobs:
         with:
           distribution: temurin
           java-version: '21'
-      - uses: gradle/actions/setup-gradle@39fdf500b386709a9a4a769f717dad447ac345b9
+      - uses: gradle/actions/setup-gradle@748248ddd2a24f49513d8f472f81c3a07d4d50e1
         with:
           gradle-version: '9.4.0'
       - name: Test and stage Java client
@@ -130,7 +130,7 @@ jobs:
         working-directory: clients/java/build/libs
         run: sha256sum *.jar > SHA256SUMS
       - name: Attest Java client release assets
-        uses: actions/attest-build-provenance@b3e506e8c389afc651c5bacf2b8f2a1ea0557215
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8
         with:
           subject-path: |
             clients/java/build/libs/*.jar
@@ -182,7 +182,7 @@ jobs:
         if: needs.verify-compatibility.outputs.source-compat-required == 'true'
         run: bash hack/verify-client-api-compat.sh cpp "${{ needs.verify-compatibility.outputs.previous-tag }}"
       - name: Attest C++ client release assets
-        uses: actions/attest-build-provenance@b3e506e8c389afc651c5bacf2b8f2a1ea0557215
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8
         with:
           subject-path: |
             clients/cpp/build/chronos-cpp-client-*.tar.gz

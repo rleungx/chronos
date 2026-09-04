@@ -11,18 +11,34 @@ permissions:
 
 env:
   CHRONOS_ARTIFACT_RETENTION_DAYS: 14
+  CHRONOS_IMAGE_REPOSITORY: ghcr.io/rleungx/chronos
   DOCKER_BUILDKIT: 1
 
 jobs:
   release-version:
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    outputs:
+      version: ${{ steps.version.outputs.value }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
       - name: Validate root release version surfaces and tag
+        id: version
         env:
           CHRONOS_RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
-        run: make release-version-check
+        run: |
+          make release-version-check
+          version=$(awk '
+            $0 == "[package]" { in_package = 1; next }
+            /^\[/ { in_package = 0 }
+            in_package && $1 == "version" {
+              value = $3
+              gsub(/^"|"$/, "", value)
+              print value
+            }
+          ' Cargo.toml)
+          test -n "$version"
+          echo "value=$version" >> "$GITHUB_OUTPUT"
 
   release-check:
     runs-on: ubuntu-latest
@@ -47,7 +63,7 @@ jobs:
         with:
           distribution: temurin
           java-version: '21'
-      - uses: gradle/actions/setup-gradle@39fdf500b386709a9a4a769f717dad447ac345b9
+      - uses: gradle/actions/setup-gradle@748248ddd2a24f49513d8f472f81c3a07d4d50e1
         with:
           gradle-version: '9.4.0'
       - name: Install CI prerequisites
@@ -507,13 +523,17 @@ jobs:
         run: make CONTAINER_CHECK_IMAGE=chronos:rc CONTAINER_CHECK_FORCE_BUILD=1 container-image-check
       - name: Save container image
         run: docker save chronos:rc -o chronos-rc-image.tar
+      - name: Create container image checksum
+        run: sha256sum chronos-rc-image.tar > chronos-rc-image.tar.sha256
       - name: Upload container image
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
         with:
           name: chronos-rc-image
-          path: chronos-rc-image.tar
+          path: |
+            chronos-rc-image.tar
+            chronos-rc-image.tar.sha256
           if-no-files-found: error
-          retention-days: 1
+          retention-days: ${{ env.CHRONOS_ARTIFACT_RETENTION_DAYS }}
 
   container-runtime-check:
     runs-on: ubuntu-latest
@@ -529,6 +549,8 @@ jobs:
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: chronos-rc-image
+      - name: Verify container image checksum
+        run: sha256sum -c chronos-rc-image.tar.sha256
       - name: Load container image
         run: docker load -i chronos-rc-image.tar
       - name: Validate container runtime asset
@@ -548,6 +570,8 @@ jobs:
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: chronos-rc-image
+      - name: Verify container image checksum
+        run: sha256sum -c chronos-rc-image.tar.sha256
       - name: Load container image
         run: docker load -i chronos-rc-image.tar
       - name: Scan container image vulnerabilities
@@ -557,7 +581,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
-      contents: write
+      contents: read
       attestations: write
       id-token: write
     needs:
@@ -586,7 +610,7 @@ jobs:
       - name: Restore release executable bits
         run: chmod +x artifacts/release/chronos artifacts/release/chronos-bench artifacts/release/chronos-control-bench artifacts/release/chronos-failover-bench artifacts/release/chronos-upgrade-bench
       - name: Attest release artifacts
-        uses: actions/attest-build-provenance@b3e506e8c389afc651c5bacf2b8f2a1ea0557215
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8
         with:
           subject-path: artifacts/release/*
       - name: Upload release candidate artifacts
@@ -596,8 +620,108 @@ jobs:
           path: artifacts/release/
           if-no-files-found: error
           retention-days: 14
+
+  publish-server-release:
+    if: github.event_name == 'push' && github.ref_type == 'tag' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    concurrency:
+      group: publish-server-release-${{ github.ref }}
+      cancel-in-progress: false
+    env:
+      VERSION: ${{ needs.release-version.outputs.version }}
+      COMMIT: ${{ github.sha }}
+      GH_TOKEN: ${{ github.token }}
+      REGISTRY_API: https://ghcr.io/v2/rleungx/chronos/manifests
+      REGISTRY_USERNAME: ${{ github.actor }}
+      REGISTRY_PASSWORD: ${{ github.token }}
+    permissions:
+      contents: write
+      packages: write
+      attestations: write
+      id-token: write
+    needs:
+      - release-version
+      - container-image
+      - package-release-artifacts
+    steps:
+      - name: Check out publication verifier
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+      - name: Download release candidate
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: chronos-release-candidate
+          path: artifacts/release
+      - name: Download container image
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: chronos-rc-image
+      - name: Verify container image checksum
+        run: sha256sum -c chronos-rc-image.tar.sha256
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Load container image
+        id: load
+        run: |
+          docker load -i chronos-rc-image.tar
+          candidate_config=$(docker image inspect chronos:rc --format '{{.Id}}')
+          python3 hack/verify-server-image-publication.py alias-verify 200 "$candidate_config" "$candidate_config"
+          echo "candidate_config=$candidate_config" >> "$GITHUB_OUTPUT"
+      - name: Preflight mutable discovery aliases
+        id: preflight
+        run: |
+          candidate_config=${{ steps.load.outputs.candidate_config }}
+          registry_token=$(curl --retry 3 -fsS -u "$REGISTRY_USERNAME:$REGISTRY_PASSWORD" "https://ghcr.io/token?scope=repository:rleungx/chronos:pull,push" | jq -er .token)
+          version_status=$(curl --retry 3 -sS -H "Authorization: Bearer $registry_token" -H "Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json" -w '%{http_code}' "$REGISTRY_API/$VERSION" -o version.json)
+          version_observed=$(if [[ "$version_status" == 200 ]]; then jq -er '.config.digest' version.json; fi)
+          commit_status=$(curl --retry 3 -sS -H "Authorization: Bearer $registry_token" -H "Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json" -w '%{http_code}' "$REGISTRY_API/$COMMIT" -o commit.json)
+          commit_observed=$(if [[ "$commit_status" == 200 ]]; then jq -er '.config.digest' commit.json; fi)
+          version_decision=$(python3 hack/verify-server-image-publication.py alias-decision "$version_status" "$version_observed" "$candidate_config")
+          commit_decision=$(python3 hack/verify-server-image-publication.py alias-decision "$commit_status" "$commit_observed" "$candidate_config")
+          echo "version_decision=$version_decision" >> "$GITHUB_OUTPUT"
+          echo "commit_decision=$commit_decision" >> "$GITHUB_OUTPUT"
+      - name: Publish exact container image aliases
+        id: publish
+        run: |
+          docker tag chronos:rc "$CHRONOS_IMAGE_REPOSITORY:$VERSION"
+          docker tag chronos:rc "$CHRONOS_IMAGE_REPOSITORY:$COMMIT"
+          test "${{ steps.preflight.outputs.version_decision }}" != publish || docker push "$CHRONOS_IMAGE_REPOSITORY:$VERSION"
+          test "${{ steps.preflight.outputs.commit_decision }}" != publish || docker push "$CHRONOS_IMAGE_REPOSITORY:$COMMIT"
+          registry_token=$(curl --retry 3 -fsS -u "$REGISTRY_USERNAME:$REGISTRY_PASSWORD" "https://ghcr.io/token?scope=repository:rleungx/chronos:pull" | jq -er .token)
+          curl --retry 3 -fsS -H "Authorization: Bearer $registry_token" -H "Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json" "$REGISTRY_API/$VERSION" -D canonical.headers -o /dev/null
+          canonical_digest=$(awk 'tolower($1) == tolower("Docker-Content-Digest:") { gsub(/\r/, "", $2); print $2 }' canonical.headers)
+          python3 hack/verify-server-image-publication.py alias-verify 200 "$canonical_digest" "$canonical_digest"
+          echo "digest=$canonical_digest" >> "$GITHUB_OUTPUT"
+      - name: Verify aliases and create release authority
+        run: |
+          canonical_digest=${{ steps.publish.outputs.digest }}
+          candidate_config=${{ steps.load.outputs.candidate_config }}
+          registry_token=$(curl --retry 3 -fsS -u "$REGISTRY_USERNAME:$REGISTRY_PASSWORD" "https://ghcr.io/token?scope=repository:rleungx/chronos:pull" | jq -er .token)
+          version_status=$(curl --retry 3 -sS -H "Authorization: Bearer $registry_token" -H "Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json" -w '%{http_code}' "$REGISTRY_API/$VERSION" -D version.headers -o version.json)
+          version_observed=$(awk 'tolower($1) == tolower("Docker-Content-Digest:") { gsub(/\r/, "", $2); print $2 }' version.headers)
+          commit_status=$(curl --retry 3 -sS -H "Authorization: Bearer $registry_token" -H "Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json" -w '%{http_code}' "$REGISTRY_API/$COMMIT" -D commit.headers -o commit.json)
+          commit_observed=$(awk 'tolower($1) == tolower("Docker-Content-Digest:") { gsub(/\r/, "", $2); print $2 }' commit.headers)
+          python3 hack/verify-server-image-publication.py alias-verify "$version_status" "$version_observed" "$canonical_digest"
+          python3 hack/verify-server-image-publication.py alias-verify "$commit_status" "$commit_observed" "$canonical_digest"
+          test "$(jq -er '.config.digest' version.json)" = "$candidate_config"
+          test "$(jq -er '.config.digest' commit.json)" = "$candidate_config"
+          tar_sha="sha256:$(cut -d' ' -f1 chronos-rc-image.tar.sha256)"
+          python3 hack/verify-server-image-publication.py release-json chronos-server-image.json "$CHRONOS_IMAGE_REPOSITORY" "$VERSION" "$COMMIT" "$tar_sha" "$candidate_config" "$canonical_digest"
+      - name: Attest server image
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8
+        with:
+          subject-name: ${{ env.CHRONOS_IMAGE_REPOSITORY }}
+          subject-digest: ${{ steps.publish.outputs.digest }}
+          push-to-registry: true
+          create-storage-record: false
       - name: Publish GitHub release
-        if: startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" artifacts/release/* --verify-tag --generate-notes
+        run: |
+          release_status=$(curl --retry 3 -sS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" -w '%{http_code}' "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" -o release.json)
+          release_decision=$(python3 hack/verify-server-image-publication.py release-asset-decision "$release_status" chronos-server-image.json)
+          test "$release_decision" != publish || gh release create "$GITHUB_REF_NAME" artifacts/release/* chronos-server-image.json --verify-tag --generate-notes

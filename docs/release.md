@@ -76,10 +76,14 @@ Before publishing or deploying, ensure you have:
 8. Kubernetes manifests validated for static partitioned ownership via `make kubernetes-manifest-check`
 9. release-shape and container delivery checks validated via `make release-check`
 10. `BUILD_INFO`, SBOM/hash artifacts, and container vulnerability scanning validated via `make release-security-check`
+11. server image publication wiring validated via `make server-image-publication-check`
 
 After the gate passes on the exact release commit, create an annotated root tag such as `v0.1.0`.
 The tag-triggered Release Candidate workflow reruns the authoritative gates, attests the artifacts,
-and publishes the GitHub release only after every required job succeeds. The release checks reject
+publishes the exact scanned image to GHCR under both the stable version and full commit tags, records
+the immutable registry digest in `chronos-server-image.json`, attests that digest, and only then
+publishes the GitHub release. Existing aliases must already resolve to the candidate image; the
+publisher fails closed instead of overwriting a conflicting tag. The release checks reject
 a root tag that is not `v` plus stable SemVer (prerelease and build metadata are not
 supported) or does not exactly match the root Cargo package, lockfile, Helm chart/app/image versions,
 and Docker OCI version label. Normal source checks require an `[Unreleased]` changelog section; a
