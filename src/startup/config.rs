@@ -1,4 +1,4 @@
-use chronos::{TsoConfig, TsoSecurityMode, DEFAULT_METADATA_KIND};
+use chronos::{TimestampLayout, TsoConfig, TsoSecurityMode, DEFAULT_METADATA_KIND};
 use std::env;
 use std::error::Error;
 
@@ -364,6 +364,21 @@ fn apply_capacity_env(config: &mut TsoConfig) -> AppResult<()> {
     Ok(())
 }
 
+fn apply_timestamp_layout_env(config: &mut TsoConfig) -> AppResult<()> {
+    let mut epoch_unix_ms = config.timestamp_layout.epoch_unix_ms();
+    let mut physical_bits = config.timestamp_layout.physical_bits();
+    let mut generator_bits = config.timestamp_layout.generator_bits();
+    let mut sequence_bits = config.timestamp_layout.sequence_bits();
+    apply_parsed_env("CHRONOS_TSO_EPOCH_UNIX_MS", &mut epoch_unix_ms)?;
+    apply_parsed_env("CHRONOS_TSO_PHYSICAL_BITS", &mut physical_bits)?;
+    apply_parsed_env("CHRONOS_TSO_GENERATOR_BITS", &mut generator_bits)?;
+    apply_parsed_env("CHRONOS_TSO_SEQUENCE_BITS", &mut sequence_bits)?;
+    config.timestamp_layout =
+        TimestampLayout::new(epoch_unix_ms, physical_bits, generator_bits, sequence_bits)
+            .map_err(|error| format!("invalid timestamp layout: {error}"))?;
+    Ok(())
+}
+
 fn apply_generator_ownership_env(config: &mut TsoConfig) -> AppResult<()> {
     apply_string_env("CHRONOS_OWNERSHIP_PLAN_ID", &mut config.ownership_plan_id);
     apply_parsed_env(
@@ -477,6 +492,7 @@ fn build_config_and_metadata_env() -> AppResult<(TsoConfig, MetadataEnvConfig, S
     apply_metadata_env(&mut config, &metadata);
     apply_security_surface_env(&mut config)?;
     apply_transport_limit_env(&mut config)?;
+    apply_timestamp_layout_env(&mut config)?;
     apply_capacity_env(&mut config)?;
     apply_generator_ownership_env(&mut config)?;
     apply_timing_env(&mut config)?;

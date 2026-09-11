@@ -10,7 +10,7 @@ use std::os::unix::fs::PermissionsExt;
 use thiserror::Error;
 
 use crate::authz::validate_peer_cert_allowlist_entries;
-use crate::{ResourceTier, MAX_GENERATORS};
+use crate::{ResourceTier, TimestampLayout};
 
 pub const DEFAULT_WORKER_ID: &str = "default-worker";
 pub const DEFAULT_ADVERTISE_ENDPOINT: &str = "default-endpoint:50051";
@@ -101,6 +101,8 @@ pub enum TsoConfigValidationError {
     ZeroGrpcMaxConnections,
     #[error("default resource tier {resource_tier} has no configured generators")]
     MissingDefaultTierCapacity { resource_tier: ResourceTier },
+    #[error("invalid timestamp layout: {reason}")]
+    InvalidTimestampLayout { reason: String },
     #[error("{0}")]
     Security(String),
 }
@@ -143,6 +145,7 @@ pub struct ClientTlsPaths<'a> {
 
 #[derive(Debug, Clone)]
 pub struct TsoConfig {
+    pub timestamp_layout: TimestampLayout,
     pub shared_generators: u32,
     pub warm_generators: u32,
     pub max_batch_per_request: u32,
@@ -205,6 +208,7 @@ pub struct TsoConfig {
 impl Default for TsoConfig {
     fn default() -> Self {
         Self {
+            timestamp_layout: TimestampLayout::default(),
             shared_generators: 128,
             warm_generators: 128,
             max_batch_per_request: DEFAULT_MAX_BATCH_PER_REQUEST,
@@ -514,6 +518,12 @@ impl TsoConfig {
     }
 
     pub fn validate_for_startup(&self) -> Result<(), TsoConfigValidationError> {
+        self.timestamp_layout.validate().map_err(|error| {
+            TsoConfigValidationError::InvalidTimestampLayout {
+                reason: error.to_string(),
+            }
+        })?;
+        let max_generators = self.timestamp_layout.max_generators();
         if self.worker_id.trim().is_empty() {
             return Err(TsoConfigValidationError::EmptyWorkerId);
         }
@@ -526,13 +536,9 @@ impl TsoConfig {
         let total_tier_generators = self
             .shared_generators
             .checked_add(self.warm_generators)
-            .ok_or(TsoConfigValidationError::TooManyTierGenerators {
-                max_generators: MAX_GENERATORS,
-            })?;
-        if total_tier_generators > MAX_GENERATORS {
-            return Err(TsoConfigValidationError::TooManyTierGenerators {
-                max_generators: MAX_GENERATORS,
-            });
+            .ok_or(TsoConfigValidationError::TooManyTierGenerators { max_generators })?;
+        if total_tier_generators > max_generators {
+            return Err(TsoConfigValidationError::TooManyTierGenerators { max_generators });
         }
         if self.generator_ownership_modulo == 0 {
             return Err(TsoConfigValidationError::GeneratorOwnershipMisconfigured {

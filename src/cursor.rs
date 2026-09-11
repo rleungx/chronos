@@ -1,6 +1,6 @@
 use std::cmp::Ordering as CmpOrdering;
 
-use crate::{decode_tso, TsoError, SEQUENCE_CAPACITY};
+use crate::{TimestampLayout, TsoError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Cursor {
@@ -8,18 +8,31 @@ pub(crate) struct Cursor {
     pub(crate) sequence: u32,
 }
 
+#[cfg(test)]
 pub(crate) fn next_cursor_after(
     tso_floor: u64,
     target_generator_id: u32,
 ) -> Result<Cursor, TsoError> {
-    let floor = decode_tso(tso_floor);
+    next_cursor_after_with_layout(
+        crate::DEFAULT_TIMESTAMP_LAYOUT,
+        tso_floor,
+        target_generator_id,
+    )
+}
+
+pub(crate) fn next_cursor_after_with_layout(
+    layout: TimestampLayout,
+    tso_floor: u64,
+    target_generator_id: u32,
+) -> Result<Cursor, TsoError> {
+    let floor = layout.decode(tso_floor);
     match target_generator_id.cmp(&floor.generator_id) {
         CmpOrdering::Greater => Ok(Cursor {
             physical_ms: floor.physical_ms,
             sequence: 0,
         }),
         CmpOrdering::Equal => {
-            if floor.sequence + 1 < SEQUENCE_CAPACITY {
+            if floor.sequence + 1 < layout.sequence_capacity() {
                 Ok(Cursor {
                     physical_ms: floor.physical_ms,
                     sequence: floor.sequence + 1,

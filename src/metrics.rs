@@ -2,6 +2,7 @@ use prometheus::{
     core::Collector, register, Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec,
     IntGauge, IntGaugeVec, Opts,
 };
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::LazyLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -364,16 +365,25 @@ pub static TSO_BUILD_INFO: LazyLock<IntGaugeVec> = LazyLock::new(|| {
 pub static TSO_CAPACITY_REMAINING_SECONDS: LazyLock<IntGauge> = LazyLock::new(|| {
     register_int_gauge_metric(
         "tso_capacity_remaining_seconds",
-        "Seconds remaining before the current 40-bit physical timestamp encoding is exhausted",
+        "Seconds remaining before the configured physical timestamp encoding is exhausted",
     )
 });
+
+static TSO_MAX_SUPPORTED_UNIX_MS: AtomicU64 = AtomicU64::new(crate::MAX_UNIX_MS);
+
+pub fn configure_tso_capacity_horizon(max_supported_unix_ms: u64) {
+    TSO_MAX_SUPPORTED_UNIX_MS.store(max_supported_unix_ms, Ordering::Release);
+}
 
 pub fn refresh_tso_capacity_remaining_metric() {
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis().min(u64::MAX as u128) as u64)
         .unwrap_or_default();
-    let remaining_seconds = crate::MAX_UNIX_MS.saturating_sub(now_ms) / 1_000;
+    let remaining_seconds = TSO_MAX_SUPPORTED_UNIX_MS
+        .load(Ordering::Acquire)
+        .saturating_sub(now_ms)
+        / 1_000;
     TSO_CAPACITY_REMAINING_SECONDS.set(remaining_seconds.min(i64::MAX as u64) as i64);
 }
 pub fn init_build_info_metric() {

@@ -5,17 +5,20 @@ use chronos::metadata::{
     ControlPlaneStore, EtcdMetadataStore, IdentityLeaseAuthority, InstanceIdentityLease,
     MemoryMetadataStore,
 };
-use chronos::{SystemClock, TsoConfig, TsoService};
+use chronos::{Clock, TsoConfig, TsoService};
 use tracing::info;
 
 use crate::AppResult;
 
 use super::config::{LoadedStartupConfig, StartupMetadata};
 
-pub(crate) async fn build_tso_service(
+pub(crate) async fn build_tso_service<C>(
     startup: &LoadedStartupConfig,
-    clock: Arc<SystemClock>,
-) -> AppResult<(Arc<TsoService>, Option<InstanceIdentityLease>)> {
+    clock: Arc<C>,
+) -> AppResult<(Arc<TsoService>, Option<InstanceIdentityLease>)>
+where
+    C: Clock + 'static,
+{
     let mut service_config = startup.config.clone();
     if service_config.instance_id.trim().is_empty() {
         service_config.instance_id = startup.config.effective_instance_id().to_owned();
@@ -51,12 +54,15 @@ pub(crate) async fn build_tso_service(
     }
 }
 
-async fn finalize_etcd_startup(
+async fn finalize_etcd_startup<C>(
     config: TsoConfig,
-    clock: Arc<SystemClock>,
+    clock: Arc<C>,
     metadata: Arc<EtcdMetadataStore>,
     mut identity_lease: InstanceIdentityLease,
-) -> AppResult<(Arc<TsoService>, Option<InstanceIdentityLease>)> {
+) -> AppResult<(Arc<TsoService>, Option<InstanceIdentityLease>)>
+where
+    C: Clock + 'static,
+{
     if let Err(error) = metadata
         .verify_instance_identity_write_path(
             identity_lease.lease_id(),

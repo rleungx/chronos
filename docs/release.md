@@ -108,6 +108,9 @@ that advances `CURRENT_CLUSTER_FORMAT_VERSION` requires a quiesced all-worker up
 etcd marker is written, an older binary must not be restarted on that prefix. Restore a pre-upgrade
 snapshot to a separate prefix when a format-level rollback is required.
 
+Cluster format v3 persists the immutable timestamp layout. It may migrate a quiesced v2 prefix only
+to the default layout; any custom layout requires a fresh etcd prefix.
+
 `make test-rolling-upgrade` is narrower than a version-support promise: it builds the exact
 historical SHA pinned in `hack/upgrade/baseline.env` and the current exact SHA, verifies that package
 version, metadata schema, and cluster format are unchanged, then exercises forward replacement

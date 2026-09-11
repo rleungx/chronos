@@ -131,7 +131,12 @@ pub(crate) fn log_startup_preflight(plan: &ValidatedStartupPlan<'_>) {
         advertise_endpoint = %config.advertise_endpoint,
         build_version = chronos::build_version(),
         build_commit = chronos::build_commit(),
-        tso_max_supported_unix_ms = chronos::MAX_UNIX_MS,
+        tso_layout_format_version = config.timestamp_layout.format_version(),
+        tso_epoch_unix_ms = config.timestamp_layout.epoch_unix_ms(),
+        tso_physical_bits = config.timestamp_layout.physical_bits(),
+        tso_generator_bits = config.timestamp_layout.generator_bits(),
+        tso_sequence_bits = config.timestamp_layout.sequence_bits(),
+        tso_max_supported_unix_ms = config.timestamp_layout.max_unix_ms(),
         safety_gap_ms = config.safety_gap_ms,
         max_clock_skew_ms = config.max_clock_skew_ms,
         generator_maintenance_interval_configured_ms =

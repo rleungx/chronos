@@ -19,6 +19,16 @@ ownership:
   shardCount: 256
   assignmentSeed: 20260516
 
+timestampLayout:
+  epochUnixMs: 1767225600000
+  physicalBits: 40
+  generatorBits: 13
+  sequenceBits: 11
+
+capacity:
+  sharedGenerators: 128
+  warmGenerators: 128
+
 etcd:
   endpoints: https://etcd-client.etcd.svc.cluster.local:2379
   prefix: /chronos

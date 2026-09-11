@@ -14,8 +14,8 @@ use crate::runtime::GeneratorLeaseState;
 use crate::TsoError;
 
 pub(in crate::service) use coordination::GeneratorLeaseCoordinator;
-use renewal::GeneratorLeaseRefreshPlan;
 pub(in crate::service) use renewal::GeneratorLeaseRefreshReason;
+use renewal::{GeneratorLeaseRefreshPlan, GeneratorLeaseRefreshTiming};
 
 use super::TsoService;
 
@@ -146,8 +146,11 @@ impl TsoService {
                         let mut record = record;
                         let new_lease_expire_at_ms = now_ms + self.config.generator_lease_ttl_ms;
                         if let Some(generator_floor_tso) = generator_floor_tso {
-                            let floor_cursor =
-                                crate::next_cursor_after(generator_floor_tso, generator_id)?;
+                            let floor_cursor = crate::next_cursor_after_with_layout(
+                                self.config.timestamp_layout,
+                                generator_floor_tso,
+                                generator_id,
+                            )?;
                             let upper_bound_base_ms = max(now_ms, floor_cursor.physical_ms);
                             record.last_issued_tso = Some(generator_floor_tso);
                             record.issued_upper_bound = self
@@ -388,14 +391,14 @@ impl TsoService {
         let local_last = self
             .lookup_generator(generator_id)?
             .current_last_issued_tso()?;
-        let plan = GeneratorLeaseRefreshPlan::build(
+        let plan = GeneratorLeaseRefreshPlan::build_with_layout(
+            self.config.timestamp_layout,
             lease_state.lease_expire_at_ms,
             lease_state.last_persisted_tso,
             lease_state.issued_upper_bound,
             local_last,
             now_ms,
-            ttl,
-            self.config.pre_borrow_ms,
+            GeneratorLeaseRefreshTiming::new(ttl, self.config.pre_borrow_ms),
         );
 
         if !plan.needs_write(reason) {
@@ -517,14 +520,14 @@ impl TsoService {
                 Ok(value) => value,
                 Err(_) => continue,
             };
-            let plan = GeneratorLeaseRefreshPlan::build(
+            let plan = GeneratorLeaseRefreshPlan::build_with_layout(
+                self.config.timestamp_layout,
                 lease_state.lease_expire_at_ms,
                 lease_state.last_persisted_tso,
                 lease_state.issued_upper_bound,
                 local_last,
                 now_ms,
-                ttl,
-                self.config.pre_borrow_ms,
+                GeneratorLeaseRefreshTiming::new(ttl, self.config.pre_borrow_ms),
             );
             if !plan.needs_write(GeneratorLeaseRefreshReason::Maintenance) {
                 continue;

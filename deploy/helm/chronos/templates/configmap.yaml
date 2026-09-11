@@ -13,17 +13,31 @@
 {{- $existingAssignmentSeed := printf "%v" (get $existingConfig.data "CHRONOS_OWNERSHIP_ASSIGNMENT_SEED") -}}
 {{- $existingPlanId := printf "%v" (get $existingConfig.data "CHRONOS_OWNERSHIP_PLAN_ID") -}}
 {{- $existingFormatVersion := int (default "0" (get $existingConfig.data "CHRONOS_CLUSTER_FORMAT_VERSION")) -}}
+{{- $existingEpochUnixMs := printf "%v" (get $existingConfig.data "CHRONOS_TSO_EPOCH_UNIX_MS") -}}
+{{- $existingPhysicalBits := int (default "0" (get $existingConfig.data "CHRONOS_TSO_PHYSICAL_BITS")) -}}
+{{- $existingGeneratorBits := int (default "0" (get $existingConfig.data "CHRONOS_TSO_GENERATOR_BITS")) -}}
+{{- $existingSequenceBits := int (default "0" (get $existingConfig.data "CHRONOS_TSO_SEQUENCE_BITS")) -}}
+{{- $existingSharedGenerators := int (default "0" (get $existingConfig.data "CHRONOS_SHARED_GENERATORS")) -}}
+{{- $existingWarmGenerators := int (default "0" (get $existingConfig.data "CHRONOS_WARM_GENERATORS")) -}}
 {{- $existingDesiredReplicas := int (default 0 $existingStatefulSet.spec.replicas) -}}
 {{- $existingStatusReplicas := int (default 0 $existingStatefulSet.status.replicas) -}}
 {{- $existingReadyReplicas := int (default 0 $existingStatefulSet.status.readyReplicas) -}}
 {{- $existingCurrentReplicas := int (default 0 $existingStatefulSet.status.currentReplicas) -}}
 {{- $existingReplicas := max $existingDesiredReplicas $existingStatusReplicas $existingReadyReplicas $existingCurrentReplicas -}}
 {{- $topologyChanged := or (ne $existingWorkerCount $ownershipWorkerCount) (ne $existingShardCount (int .Values.ownership.shardCount)) (ne $existingAssignmentSeed (printf "%d" (int64 .Values.ownership.assignmentSeed))) (ne $existingPlanId $ownershipPlanId) -}}
+{{- $timestampLayoutChanged := or (ne $existingEpochUnixMs (printf "%d" (int64 .Values.timestampLayout.epochUnixMs))) (ne $existingPhysicalBits (int .Values.timestampLayout.physicalBits)) (ne $existingGeneratorBits (int .Values.timestampLayout.generatorBits)) (ne $existingSequenceBits (int .Values.timestampLayout.sequenceBits)) -}}
+{{- $capacityChanged := or (ne $existingSharedGenerators (int .Values.capacity.sharedGenerators)) (ne $existingWarmGenerators (int .Values.capacity.warmGenerators)) -}}
 {{- if and (ne $existingFormatVersion $clusterFormatVersion) (gt $existingReplicas 0) (gt $desiredReplicas 0) -}}
 {{- fail (printf "refusing cluster-format change from v%d to v%d while %d old replicas are running; deploy a drain release with replicaCount=0 first" $existingFormatVersion $clusterFormatVersion $existingReplicas) -}}
 {{- end -}}
 {{- if and $topologyChanged (gt $existingReplicas 0) (gt $desiredReplicas 0) -}}
 {{- fail (printf "refusing ownership topology change (plan/worker/shard/seed) while %d old replicas are running; deploy a drain release with replicaCount=0 first" $existingReplicas) -}}
+{{- end -}}
+{{- if and $timestampLayoutChanged (gt $existingReplicas 0) (gt $desiredReplicas 0) -}}
+{{- fail (printf "refusing timestamp-layout change while %d old replicas are running; deploy a drain release with replicaCount=0 and use a new metadata prefix" $existingReplicas) -}}
+{{- end -}}
+{{- if and $capacityChanged (gt $existingReplicas 0) (gt $desiredReplicas 0) -}}
+{{- fail (printf "refusing generator-capacity change while %d old replicas are running; deploy a drain release with replicaCount=0 first" $existingReplicas) -}}
 {{- end -}}
 {{- end -}}
 apiVersion: v1
@@ -45,6 +59,12 @@ data:
   CHRONOS_LOG_FORMAT: {{ .Values.runtime.logFormat | quote }}
   CHRONOS_LOG_FILTER: {{ .Values.runtime.logFilter | quote }}
   CHRONOS_CLUSTER_FORMAT_VERSION: {{ $clusterFormatVersion | quote }}
+  CHRONOS_TSO_EPOCH_UNIX_MS: {{ printf "%d" (int64 .Values.timestampLayout.epochUnixMs) | quote }}
+  CHRONOS_TSO_PHYSICAL_BITS: {{ printf "%d" (int64 .Values.timestampLayout.physicalBits) | quote }}
+  CHRONOS_TSO_GENERATOR_BITS: {{ printf "%d" (int64 .Values.timestampLayout.generatorBits) | quote }}
+  CHRONOS_TSO_SEQUENCE_BITS: {{ printf "%d" (int64 .Values.timestampLayout.sequenceBits) | quote }}
+  CHRONOS_SHARED_GENERATORS: {{ printf "%d" (int64 .Values.capacity.sharedGenerators) | quote }}
+  CHRONOS_WARM_GENERATORS: {{ printf "%d" (int64 .Values.capacity.warmGenerators) | quote }}
   CHRONOS_OWNERSHIP_PLAN_ID: {{ $ownershipPlanId | quote }}
   CHRONOS_GENERATOR_OWNERSHIP_MODULO: {{ printf "%d" (int64 .Values.ownership.shardCount) | quote }}
   CHRONOS_OWNERSHIP_WORKER_COUNT: {{ printf "%d" (int64 $ownershipWorkerCount) | quote }}

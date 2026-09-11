@@ -8,6 +8,8 @@ tagged.
 
 ## [Unreleased]
 
+- Add a generic, cluster-wide configurable timestamp layout, persist and fence it in etcd, and
+  expose it through the status API without introducing database-specific profiles.
 - Add a backpressure-aware bidirectional timestamp allocation stream while preserving the unary
   client contract.
 - Update `h2` to 0.4.16 to reject unbounded empty DATA frames on long-lived HTTP/2 connections.

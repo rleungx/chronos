@@ -13,7 +13,7 @@ impl TsoService {
             ResourceTier::Shared => self
                 .config
                 .max_batch_per_request
-                .min(crate::SEQUENCE_CAPACITY),
+                .min(self.config.timestamp_layout.sequence_capacity()),
             ResourceTier::Warm | ResourceTier::Dedicated => self.config.max_batch_per_request,
         };
 
@@ -43,7 +43,11 @@ impl TsoService {
         let Some(recovery_floor_tso) = timeline_state.recovery_floor_tso else {
             return base;
         };
-        let recovery_physical_ms = crate::decode_tso(recovery_floor_tso).physical_ms;
+        let recovery_physical_ms = self
+            .config
+            .timestamp_layout
+            .decode(recovery_floor_tso)
+            .physical_ms;
         if recovery_physical_ms <= now_ms {
             return base;
         }
@@ -57,7 +61,7 @@ impl TsoService {
             ResourceTier::Shared => Some(
                 self.config
                     .max_batch_per_request
-                    .min(crate::SEQUENCE_CAPACITY) as f64,
+                    .min(self.config.timestamp_layout.sequence_capacity()) as f64,
             ),
             ResourceTier::Warm => Some(self.config.max_batch_per_request as f64),
             ResourceTier::Dedicated => None,

@@ -3,10 +3,17 @@ use std::sync::{LazyLock, MutexGuard};
 use std::time::{Instant, SystemTime};
 
 use crate::recovery::{duration_since_unix_epoch_or_zero, record_recovery_event};
-use crate::{checked_physical_ms_from_unix_ms, TsoUnixMsBoundary, MAX_PHYSICAL_MS};
+use crate::{
+    TimestampLayout, TimestampLayoutValidationError, TsoUnixMsBoundary, DEFAULT_TIMESTAMP_LAYOUT,
+    MAX_PHYSICAL_MS,
+};
 
 pub trait Clock: Send + Sync {
     fn now_ms(&self) -> u64;
+
+    fn timestamp_layout(&self) -> Option<TimestampLayout> {
+        None
+    }
 }
 
 #[derive(Debug, Default)]
@@ -28,7 +35,11 @@ static SYSTEM_CLOCK_BASE: LazyLock<SystemClockBase> = LazyLock::new(|| SystemClo
 });
 
 fn relative_ms_from_unix_ms(unix_ms: u64) -> u64 {
-    match checked_physical_ms_from_unix_ms(unix_ms) {
+    relative_ms_from_unix_ms_for_layout(DEFAULT_TIMESTAMP_LAYOUT, unix_ms)
+}
+
+fn relative_ms_from_unix_ms_for_layout(layout: TimestampLayout, unix_ms: u64) -> u64 {
+    match layout.checked_physical_ms_from_unix_ms(unix_ms) {
         Ok(relative_ms) => relative_ms,
         Err(TsoUnixMsBoundary::BeforeCustomEpoch) => {
             record_recovery_event("clock", "system_clock_now_ms", "before_custom_epoch");
@@ -40,7 +51,7 @@ fn relative_ms_from_unix_ms(unix_ms: u64) -> u64 {
                 "system_clock_now_ms",
                 "tso_capacity_horizon_exceeded",
             );
-            MAX_PHYSICAL_MS + 1
+            layout.max_physical_ms() + 1
         }
     }
 }
@@ -69,6 +80,56 @@ impl Clock for SystemClock {
         let candidate_ms = observed_ms.max(monotonic_ms);
         let previous_ms = SYSTEM_CLOCK_LAST_NOW_MS.fetch_max(candidate_ms, Ordering::AcqRel);
         clamp_monotonic_ms(previous_ms, candidate_ms)
+    }
+
+    fn timestamp_layout(&self) -> Option<TimestampLayout> {
+        Some(DEFAULT_TIMESTAMP_LAYOUT)
+    }
+}
+
+/// System clock whose millisecond origin and capacity horizon follow a configured layout.
+#[derive(Debug)]
+pub struct LayoutSystemClock {
+    layout: TimestampLayout,
+    base: SystemClockBase,
+    last_now_ms: AtomicU64,
+}
+
+impl LayoutSystemClock {
+    pub fn new(layout: TimestampLayout) -> Result<Self, TimestampLayoutValidationError> {
+        layout.validate()?;
+        let unix_ms =
+            duration_since_unix_epoch_or_zero(SystemTime::now(), "clock", "system_clock_now_ms")
+                .as_millis() as u64;
+        Ok(Self {
+            layout,
+            base: SystemClockBase {
+                base_relative_ms: relative_ms_from_unix_ms_for_layout(layout, unix_ms),
+                base_instant: Instant::now(),
+            },
+            last_now_ms: AtomicU64::new(0),
+        })
+    }
+}
+
+impl Clock for LayoutSystemClock {
+    fn now_ms(&self) -> u64 {
+        let unix_ms =
+            duration_since_unix_epoch_or_zero(SystemTime::now(), "clock", "system_clock_now_ms")
+                .as_millis() as u64;
+        let observed_ms = relative_ms_from_unix_ms_for_layout(self.layout, unix_ms);
+        let monotonic_ms = self
+            .base
+            .base_relative_ms
+            .saturating_add(self.base.base_instant.elapsed().as_millis() as u64)
+            .min(self.layout.max_physical_ms() + 1);
+        let candidate_ms = observed_ms.max(monotonic_ms);
+        let previous_ms = self.last_now_ms.fetch_max(candidate_ms, Ordering::AcqRel);
+        clamp_monotonic_ms(previous_ms, candidate_ms)
+    }
+
+    fn timestamp_layout(&self) -> Option<TimestampLayout> {
+        Some(self.layout)
     }
 }
 

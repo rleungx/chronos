@@ -12,10 +12,7 @@ use tracing::{info, warn};
 use crate::metadata::ControlPlaneStore;
 use crate::plane::{TsoControlPlane, TsoDataPlane};
 use crate::runtime::{GeneratorRuntimeState, TimelineRuntimeState};
-use crate::{
-    Clock, HealthInfo, ResourceTier, TimelineRoute, TransferReason, TsoConfig, TsoError,
-    MAX_GENERATORS,
-};
+use crate::{Clock, HealthInfo, ResourceTier, TimelineRoute, TransferReason, TsoConfig, TsoError};
 
 use super::background::BackgroundCoordinator;
 use super::contention::MetadataContentionCoordinator;
@@ -49,7 +46,9 @@ impl TsoService {
         config.validate_for_startup().map_err(|error| match error {
             crate::config::TsoConfigValidationError::TooManyTierGenerators { .. } => {
                 TsoError::GeneratorIdOutOfRange {
-                    generator_id: config.shared_generators + config.warm_generators,
+                    generator_id: config
+                        .shared_generators
+                        .saturating_add(config.warm_generators),
                 }
             }
             crate::config::TsoConfigValidationError::GeneratorOwnershipMisconfigured {
@@ -58,6 +57,14 @@ impl TsoService {
             } => TsoError::GeneratorOwnershipMisconfigured { modulo, remainder },
             other => TsoError::Internal(other.to_string()),
         })?;
+        if let Some(clock_layout) = clock.timestamp_layout() {
+            if clock_layout != config.timestamp_layout {
+                return Err(TsoError::Internal(format!(
+                    "clock timestamp layout {:?} does not match configured cluster layout {:?}",
+                    clock_layout, config.timestamp_layout
+                )));
+            }
+        }
         config
             .validate_authoritative_metadata_runtime_contract()
             .map_err(|error| TsoError::Internal(error.to_string()))?;
@@ -72,6 +79,8 @@ impl TsoService {
         };
         let max_timeline_runtime_entries = config.max_timeline_runtime_entries;
         let max_concurrent_timeline_loads = config.max_concurrent_timeline_loads;
+        let timestamp_layout = config.timestamp_layout;
+        let max_generators = timestamp_layout.max_generators();
         let contention_jitter_seed = Self::contention_jitter_seed(&instance_id);
         let background = BackgroundCoordinator::new();
         let service = Arc::new(Self {
@@ -79,19 +88,19 @@ impl TsoService {
             instance_id,
             clock,
             metadata: metadata as Arc<dyn ControlPlaneStore>,
-            generator_runtime: GeneratorRuntimeState::new(MAX_GENERATORS),
+            generator_runtime: GeneratorRuntimeState::with_layout(max_generators, timestamp_layout),
             timeline_runtime: TimelineRuntimeState::new(max_timeline_runtime_entries),
-            generator_admission_gates: (0..MAX_GENERATORS)
+            generator_admission_gates: (0..max_generators)
                 .map(|_| Arc::new(Semaphore::new(1)))
                 .collect(),
-            generator_fairness_trackers: (0..MAX_GENERATORS)
+            generator_fairness_trackers: (0..max_generators)
                 .map(|_| {
                     Arc::new(std::sync::Mutex::new(
                         super::GeneratorFairnessState::default(),
                     ))
                 })
                 .collect(),
-            generator_fairness_notifiers: (0..MAX_GENERATORS)
+            generator_fairness_notifiers: (0..max_generators)
                 .map(|_| Arc::new(tokio::sync::Notify::new()))
                 .collect(),
             timeline_load_coordinator: TimelineLoadCoordinator::default(),
@@ -557,7 +566,10 @@ mod tests {
 
     use super::{ShutdownTransferCandidates, ShutdownTransferState, TsoService};
     use crate::metadata::{GeneratorLeaseAuthority, MemoryMetadataStore, TimelineAuthority};
-    use crate::{AllocateTimestampsRequest, ManualClock, ResourceTier, TsoConfig, TsoError};
+    use crate::{
+        AllocateTimestampsRequest, ManualClock, ResourceTier, SystemClock, TimestampLayout,
+        TsoConfig, TsoError,
+    };
 
     fn required_test_config(config: TsoConfig) -> TsoConfig {
         crate::test_tls::required_grpc_tls_test_config(config, 100)
@@ -621,6 +633,27 @@ mod tests {
         };
 
         assert!(matches!(error, TsoError::Internal(_)));
+    }
+
+    #[test]
+    fn service_new_rejects_a_clock_bound_to_another_layout() {
+        let config = required_test_config(TsoConfig {
+            timestamp_layout: TimestampLayout::new(0, 45, 8, 11).unwrap(),
+            ..TsoConfig::default()
+        });
+
+        let error = match TsoService::new(
+            config,
+            Arc::new(SystemClock),
+            Arc::new(MemoryMetadataStore::new()),
+        ) {
+            Ok(_) => panic!("service construction should reject a mismatched clock layout"),
+            Err(error) => error,
+        };
+
+        assert!(
+            matches!(error, TsoError::Internal(message) if message.contains("clock timestamp layout"))
+        );
     }
 
     #[tokio::test]

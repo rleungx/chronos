@@ -17,7 +17,7 @@ use chronos::rpc::{
     TsoTimestampService,
 };
 use chronos::{
-    OwnershipDriftEvidence, SystemClock, TsoConfig, TsoError, TsoService, WorkerReadinessSink,
+    LayoutSystemClock, OwnershipDriftEvidence, TsoConfig, TsoError, TsoService, WorkerReadinessSink,
 };
 
 use crate::AppResult;
@@ -632,8 +632,9 @@ pub(crate) async fn run() -> AppResult<()> {
         reason = "process_start"
     );
 
-    let clock = Arc::new(SystemClock);
     let config = &startup.config;
+    chronos::metrics::configure_tso_capacity_horizon(config.timestamp_layout.max_unix_ms());
+    let clock = Arc::new(LayoutSystemClock::new(config.timestamp_layout)?);
     let ready = Arc::new(AtomicBool::new(false));
     let startup_complete = Arc::new(AtomicBool::new(false));
     let (shutdown_tx, shutdown_rx) = watch::channel(false);

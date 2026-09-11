@@ -1,6 +1,45 @@
 use super::*;
 
 #[tokio::test]
+async fn allocation_uses_the_configured_timestamp_layout() {
+    let layout = crate::TimestampLayout::new(0, 46, 7, 11).unwrap();
+    let service = TsoService::new(
+        with_worker(
+            TsoConfig {
+                timestamp_layout: layout,
+                shared_generators: 64,
+                warm_generators: 64,
+                ..TsoConfig::default()
+            },
+            "worker-a",
+        ),
+        Arc::new(ManualClock::new(50_000)),
+        Arc::new(MemoryMetadataStore::new()),
+    )
+    .unwrap();
+
+    let route = service.ensure_timeline("custom.layout").await.unwrap();
+    let response = service
+        .allocate_timestamps(AllocateTimestampsRequest {
+            timeline_key: route.timeline_key.clone(),
+            count: 2,
+            expected_epoch: route.epoch,
+            expected_route_version: route.route_version,
+            client_request_id: "custom-layout-allocation".into(),
+        })
+        .await
+        .unwrap();
+    let start = layout.decode(response.ranges[0].start_tso);
+    let end = layout.decode(response.ranges[0].end_tso);
+
+    assert_eq!(start.physical_ms, 50_000);
+    assert_eq!(start.generator_id, route.generator_id);
+    assert_eq!(start.sequence, 0);
+    assert_eq!(end.sequence, 1);
+    assert_eq!(service.data_plane().timestamp_layout(), layout);
+}
+
+#[tokio::test]
 async fn shared_tier_rejects_batches_above_single_ms_capacity() {
     let service = TsoService::new(
         with_worker(

@@ -106,14 +106,19 @@ For Helm, the drain release uses `replicaCount=0` and an explicit nonzero
 `ownership.workerCount` because a zero-replica release cannot derive it. The chart permits topology
 or format updates only in that zero-replica release. The activation release sets the new
 `replicaCount` and returns `ownership.workerCount` to `0` (derive from replicas). The chart refuses
-all online plan/worker/shard/seed and cluster-format changes; there is no unsafe bypass. ConfigMap
-changes roll pods automatically; increment
+all online plan/worker/shard/seed, generator-capacity, timestamp-layout, and cluster-format changes;
+there is no unsafe bypass. ConfigMap changes roll pods automatically; increment
 `security.tlsRevision` or `security.allowlistRevision` when rotating same-name external Secrets.
 
 Every identity lease declares `CURRENT_CLUSTER_FORMAT_VERSION`, and etcd stores the persistent
-`cluster/format_version` marker. Startup rejects legacy active identities or a different marker.
+`cluster/format_version` marker plus `cluster/timestamp_layout`. Startup rejects legacy active
+identities, a different format marker, or a timestamp layout that differs from local config.
 Once a prefix is upgraded, never start an older binary against it; rollback requires a compatible
 binary or restoring a pre-upgrade etcd snapshot to a separate prefix.
+
+Cluster format v3 automatically migrates a quiesced v2 prefix to the default timestamp layout.
+It never assigns a custom layout to existing v2 data. A custom layout requires a new metadata
+prefix so previously issued timestamps cannot be decoded under a different format.
 
 The `requests/` and `request_cleanup/` readers are temporary v1 idempotency-key compatibility,
 not permanent metadata APIs. Keep them until every worker uses v2, more time than the largest
@@ -209,11 +214,30 @@ Graceful shutdown flushes runtime floors and transfers with bounded concurrency 
 seconds. Keep Kubernetes `terminationGracePeriodSeconds` at 120 or higher so background-task drain
 and metadata shutdown retain a final 30-second margin; the Helm schema enforces this floor.
 
-The current wire encoding has a 40-bit millisecond physical field starting at
-`2026-01-01T00:00:00Z`; its last encodable instant is `2060-11-03T19:53:47.775Z`. Monitor
-`tso_capacity_remaining_seconds`. The bundled alert fires with five years remaining so a versioned
-encoding and mixed-version migration can be designed, load-tested, and deployed well before the
-horizon; Chronos fails closed with `TSO overflow` after the boundary.
+The default wire encoding has a 40-bit millisecond physical field starting at
+`2026-01-01T00:00:00Z`; its last encodable instant is `2060-11-03T19:53:47.775Z`. A deployment may
+instead set `CHRONOS_TSO_EPOCH_UNIX_MS`, `CHRONOS_TSO_PHYSICAL_BITS`,
+`CHRONOS_TSO_GENERATOR_BITS`, and `CHRONOS_TSO_SEQUENCE_BITS`. The widths must total 64;
+physical and sequence widths must be nonzero; generator width is at most 13 and sequence width at
+most 31; generator plus sequence width is at most 32. The sum of
+`CHRONOS_SHARED_GENERATORS` and `CHRONOS_WARM_GENERATORS` must fit the resulting generator
+capacity. All workers must use exactly the same layout.
+
+For example, a generic encoding with a Unix epoch and 18 total logical bits can be configured as:
+
+```bash
+export CHRONOS_TSO_EPOCH_UNIX_MS=0
+export CHRONOS_TSO_PHYSICAL_BITS=46
+export CHRONOS_TSO_GENERATOR_BITS=7
+export CHRONOS_TSO_SEQUENCE_BITS=11
+export CHRONOS_SHARED_GENERATORS=64
+export CHRONOS_WARM_GENERATORS=64
+```
+
+Use `TimelineStatusService.GetTimestampLayout` as the authoritative discovery API for database
+adapters. Do not duplicate Chronos bit constants in an adapter. Monitor
+`tso_capacity_remaining_seconds`; Chronos fails closed with `TSO overflow` after the configured
+physical horizon.
 
 ## Health and readiness
 

@@ -5,7 +5,7 @@ use tokio::sync::{broadcast, Notify};
 
 use crate::{
     AllocateTimestampsRequest, AllocateTimestampsResponse, HealthInfo, ResourceTier,
-    TimelineLifecycleState, TimelineRoute, TransferReason, TsoError, TsoService,
+    TimelineLifecycleState, TimelineRoute, TimestampLayout, TransferReason, TsoError, TsoService,
 };
 
 #[derive(Clone, Default)]
@@ -159,6 +159,10 @@ impl TsoControlPlane {
     pub fn health(&self) -> HealthInfo {
         self.inner.health()
     }
+
+    pub fn timestamp_layout(&self) -> TimestampLayout {
+        self.inner.config.timestamp_layout
+    }
 }
 
 #[derive(Clone)]
@@ -191,6 +195,10 @@ impl TsoDataPlane {
 
     pub fn health(&self) -> HealthInfo {
         self.inner.health()
+    }
+
+    pub fn timestamp_layout(&self) -> TimestampLayout {
+        self.inner.config.timestamp_layout
     }
 
     pub fn max_timeline_proxy_lanes(&self) -> usize {

@@ -5,8 +5,9 @@ use crate::config::TsoConfigValidationError;
 use crate::proto::v1::{
     timeline_control_service_server::TimelineControlService,
     timeline_status_service_server::TimelineStatusService, GetTimelineStatusRequest,
-    GetTimelineStatusResponse, HealthResponse, ListTimelineStatusesRequest,
-    ListTimelineStatusesResponse, TransferTimelineRequest, TransferTimelineResponse,
+    GetTimelineStatusResponse, GetTimestampLayoutResponse, HealthResponse,
+    ListTimelineStatusesRequest, ListTimelineStatusesResponse,
+    TimestampLayout as ProtoTimestampLayout, TransferTimelineRequest, TransferTimelineResponse,
 };
 use crate::TsoControlPlane;
 
@@ -113,6 +114,23 @@ impl TsoTimelineStatusService {
 
 #[tonic::async_trait]
 impl TimelineStatusService for TsoTimelineStatusService {
+    async fn get_timestamp_layout(
+        &self,
+        request: Request<()>,
+    ) -> Result<Response<GetTimestampLayoutResponse>, Status> {
+        self.authorize(&request)?;
+        let layout = self.control_plane.timestamp_layout();
+        Ok(Response::new(GetTimestampLayoutResponse {
+            layout: Some(ProtoTimestampLayout {
+                format_version: layout.format_version(),
+                epoch_unix_ms: layout.epoch_unix_ms(),
+                physical_bits: u32::from(layout.physical_bits()),
+                generator_bits: u32::from(layout.generator_bits()),
+                sequence_bits: u32::from(layout.sequence_bits()),
+            }),
+        }))
+    }
+
     async fn get_timeline_status(
         &self,
         request: Request<GetTimelineStatusRequest>,
@@ -204,6 +222,35 @@ mod tests {
                 .await
                 .expect("etcd store should start"),
         )
+    }
+
+    #[tokio::test]
+    async fn get_timestamp_layout_returns_the_cluster_encoding() {
+        let layout = crate::TimestampLayout::new(0, 46, 7, 11).unwrap();
+        let service = TsoService::new(
+            required_test_config(TsoConfig {
+                timestamp_layout: layout,
+                shared_generators: 64,
+                warm_generators: 64,
+                ..TsoConfig::default()
+            }),
+            Arc::new(ManualClock::new(200)),
+            Arc::new(MemoryMetadataStore::new()),
+        )
+        .unwrap();
+        let rpc = TsoTimelineStatusService::new(service.control_plane());
+
+        let response = rpc
+            .get_timestamp_layout(Request::new(()))
+            .await
+            .unwrap()
+            .into_inner();
+        let actual = response.layout.unwrap();
+        assert_eq!(actual.format_version, layout.format_version());
+        assert_eq!(actual.epoch_unix_ms, 0);
+        assert_eq!(actual.physical_bits, 46);
+        assert_eq!(actual.generator_bits, 7);
+        assert_eq!(actual.sequence_bits, 11);
     }
 
     #[tokio::test]

@@ -22,6 +22,12 @@ timeout, idempotency, authorization, and structured-error semantics as the unary
 application-facing clients continue to use the unary API so their route-recovery contract remains
 unchanged.
 
+Chronos uses a cluster-wide `TimestampLayout` instead of a database-specific timestamp profile.
+The default remains `40` physical bits, `13` generator bits, and `11` sequence bits with the
+2026-01-01 UTC epoch. Deployments that need another 64-bit encoding can configure the epoch and bit
+widths; `TimelineStatusService.GetTimestampLayout` exposes the effective layout to adapters and
+operator tooling. A custom layout is immutable for an etcd metadata prefix.
+
 In production, construct clients with a stable control-plane address (for example, a Kubernetes
 Service). Advertised owner endpoints may change or disappear during failover; the control-plane
 address must remain reachable so clients can refresh their cached route.

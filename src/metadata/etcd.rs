@@ -29,7 +29,7 @@ use tokio::time::{sleep, Duration, Instant};
 use tracing::{debug, error, info, warn};
 
 use crate::recovery::record_recovery_event;
-use crate::{metrics, TimelineLifecycleState, TimelineRoute, TsoConfig, TsoError};
+use crate::{metrics, TimelineLifecycleState, TimelineRoute, TimestampLayout, TsoConfig, TsoError};
 
 const REQUEST_RECORD_PRUNE_MIN_FETCH_LIMIT: usize = 128;
 const REQUEST_RECORD_PRUNE_MAX_FETCH_LIMIT: usize = 4096;
@@ -319,7 +319,10 @@ impl EtcdMetadataStore {
         let request_retry_budget = etcd_request_retry_budget(config);
         let store =
             Self::connect_with_options(endpoints, prefix, options, request_retry_budget).await?;
-        if let Err(error) = store.initialize_cluster_format_and_indexes().await {
+        if let Err(error) = store
+            .initialize_cluster_format_and_indexes_with_layout(config.timestamp_layout)
+            .await
+        {
             store.shutdown_route_watch().await;
             return Err(error);
         }
@@ -549,6 +552,14 @@ impl EtcdMetadataStore {
 
     fn cluster_format_key(&self) -> String {
         keys::cluster_format_key(&self.prefix)
+    }
+
+    fn cluster_prefix(&self) -> String {
+        keys::cluster_prefix(&self.prefix)
+    }
+
+    fn cluster_timestamp_layout_key(&self) -> String {
+        keys::cluster_timestamp_layout_key(&self.prefix)
     }
 
     fn timeline_creation_lock_key(&self) -> String {

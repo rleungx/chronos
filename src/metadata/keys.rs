@@ -189,6 +189,14 @@ pub(super) fn cluster_format_key(prefix: &str) -> String {
     namespace(prefix, "cluster/format_version")
 }
 
+pub(super) fn cluster_prefix(prefix: &str) -> String {
+    namespace(prefix, "cluster/")
+}
+
+pub(super) fn cluster_timestamp_layout_key(prefix: &str) -> String {
+    namespace(prefix, "cluster/timestamp_layout")
+}
+
 pub(super) fn timeline_creation_lock_key(prefix: &str) -> String {
     namespace(prefix, "cluster/timeline_creation_lock")
 }

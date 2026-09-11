@@ -10,7 +10,7 @@ use crate::{
 
 pub const CURRENT_METADATA_SCHEMA_VERSION: u32 = 1;
 /// Cluster-wide writer format. A change requires a quiesced, all-at-once worker upgrade.
-pub const CURRENT_CLUSTER_FORMAT_VERSION: u32 = 2;
+pub const CURRENT_CLUSTER_FORMAT_VERSION: u32 = 3;
 
 fn default_metadata_schema_version() -> u32 {
     CURRENT_METADATA_SCHEMA_VERSION

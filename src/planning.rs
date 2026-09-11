@@ -3,7 +3,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
 use crate::metadata::{GeneratorRecord, TimelineRecord};
-use crate::{ResourceTier, TransferReason, TsoError, MAX_GENERATORS};
+use crate::{ResourceTier, TransferReason, TsoError};
 
 #[derive(Debug, Clone)]
 pub(crate) struct TransferPlan {
@@ -17,8 +17,9 @@ pub(crate) fn resource_tier_for_generator_id(
     generator_id: u32,
     shared_generators: u32,
     warm_generators: u32,
+    max_generators: u32,
 ) -> Result<ResourceTier, TsoError> {
-    if generator_id >= MAX_GENERATORS {
+    if generator_id >= max_generators {
         return Err(TsoError::GeneratorIdOutOfRange { generator_id });
     }
 

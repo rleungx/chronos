@@ -458,6 +458,7 @@ var TimelineControlService_ServiceDesc = grpc.ServiceDesc{
 }
 
 const (
+	TimelineStatusService_GetTimestampLayout_FullMethodName   = "/chronos.tso.v1.TimelineStatusService/GetTimestampLayout"
 	TimelineStatusService_GetTimelineStatus_FullMethodName    = "/chronos.tso.v1.TimelineStatusService/GetTimelineStatus"
 	TimelineStatusService_ListTimelineStatuses_FullMethodName = "/chronos.tso.v1.TimelineStatusService/ListTimelineStatuses"
 )
@@ -468,6 +469,7 @@ const (
 //
 // Status RPCs are intended for diagnostics and operator tooling.
 type TimelineStatusServiceClient interface {
+	GetTimestampLayout(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*GetTimestampLayoutResponse, error)
 	GetTimelineStatus(ctx context.Context, in *GetTimelineStatusRequest, opts ...grpc.CallOption) (*GetTimelineStatusResponse, error)
 	ListTimelineStatuses(ctx context.Context, in *ListTimelineStatusesRequest, opts ...grpc.CallOption) (*ListTimelineStatusesResponse, error)
 }
@@ -478,6 +480,16 @@ type timelineStatusServiceClient struct {
 
 func NewTimelineStatusServiceClient(cc grpc.ClientConnInterface) TimelineStatusServiceClient {
 	return &timelineStatusServiceClient{cc}
+}
+
+func (c *timelineStatusServiceClient) GetTimestampLayout(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*GetTimestampLayoutResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetTimestampLayoutResponse)
+	err := c.cc.Invoke(ctx, TimelineStatusService_GetTimestampLayout_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 func (c *timelineStatusServiceClient) GetTimelineStatus(ctx context.Context, in *GetTimelineStatusRequest, opts ...grpc.CallOption) (*GetTimelineStatusResponse, error) {
@@ -506,6 +518,7 @@ func (c *timelineStatusServiceClient) ListTimelineStatuses(ctx context.Context, 
 //
 // Status RPCs are intended for diagnostics and operator tooling.
 type TimelineStatusServiceServer interface {
+	GetTimestampLayout(context.Context, *emptypb.Empty) (*GetTimestampLayoutResponse, error)
 	GetTimelineStatus(context.Context, *GetTimelineStatusRequest) (*GetTimelineStatusResponse, error)
 	ListTimelineStatuses(context.Context, *ListTimelineStatusesRequest) (*ListTimelineStatusesResponse, error)
 	mustEmbedUnimplementedTimelineStatusServiceServer()
@@ -518,6 +531,9 @@ type TimelineStatusServiceServer interface {
 // pointer dereference when methods are called.
 type UnimplementedTimelineStatusServiceServer struct{}
 
+func (UnimplementedTimelineStatusServiceServer) GetTimestampLayout(context.Context, *emptypb.Empty) (*GetTimestampLayoutResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetTimestampLayout not implemented")
+}
 func (UnimplementedTimelineStatusServiceServer) GetTimelineStatus(context.Context, *GetTimelineStatusRequest) (*GetTimelineStatusResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetTimelineStatus not implemented")
 }
@@ -543,6 +559,24 @@ func RegisterTimelineStatusServiceServer(s grpc.ServiceRegistrar, srv TimelineSt
 		t.testEmbeddedByValue()
 	}
 	s.RegisterService(&TimelineStatusService_ServiceDesc, srv)
+}
+
+func _TimelineStatusService_GetTimestampLayout_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(emptypb.Empty)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(TimelineStatusServiceServer).GetTimestampLayout(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: TimelineStatusService_GetTimestampLayout_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(TimelineStatusServiceServer).GetTimestampLayout(ctx, req.(*emptypb.Empty))
+	}
+	return interceptor(ctx, in, info, handler)
 }
 
 func _TimelineStatusService_GetTimelineStatus_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
@@ -588,6 +622,10 @@ var TimelineStatusService_ServiceDesc = grpc.ServiceDesc{
 	ServiceName: "chronos.tso.v1.TimelineStatusService",
 	HandlerType: (*TimelineStatusServiceServer)(nil),
 	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "GetTimestampLayout",
+			Handler:    _TimelineStatusService_GetTimestampLayout_Handler,
+		},
 		{
 			MethodName: "GetTimelineStatus",
 			Handler:    _TimelineStatusService_GetTimelineStatus_Handler,

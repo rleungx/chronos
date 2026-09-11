@@ -37,6 +37,7 @@ service TimelineControlService {
 
 // Status RPCs are intended for diagnostics and operator tooling.
 service TimelineStatusService {
+  rpc GetTimestampLayout(google.protobuf.Empty) returns (GetTimestampLayoutResponse);
   rpc GetTimelineStatus(GetTimelineStatusRequest) returns (GetTimelineStatusResponse);
   rpc ListTimelineStatuses(ListTimelineStatusesRequest) returns (ListTimelineStatusesResponse);
 }
@@ -234,4 +235,18 @@ message ListTimelineStatusesRequest {
 message ListTimelineStatusesResponse {
   repeated TimelineStatus statuses = 1;
   string next_page_token = 2;
+}
+
+// TimestampLayout describes the immutable encoding shared by every worker in a metadata prefix.
+// The bit widths always total 64 and physical values use milliseconds relative to epoch_unix_ms.
+message TimestampLayout {
+  uint32 format_version = 1;
+  uint64 epoch_unix_ms = 2;
+  uint32 physical_bits = 3;
+  uint32 generator_bits = 4;
+  uint32 sequence_bits = 5;
+}
+
+message GetTimestampLayoutResponse {
+  TimestampLayout layout = 1;
 }

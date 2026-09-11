@@ -24,8 +24,9 @@ Rollback immediately when any of the following occurs:
 ## Rollback steps
 
 1. Drain or remove traffic from the bad instance set.
-2. Read the prefix's persistent `cluster/format_version` marker. Compare it with the
-   `cluster_format_version` printed by the rollback binary's `--print-effective-config` output.
+2. Read the prefix's persistent `cluster/format_version` and `cluster/timestamp_layout` markers.
+   Compare them with the cluster format and `tso_*` layout fields printed by the rollback binary's
+   `--print-effective-config` output.
 3. If the versions match, stop every current worker, wait for identity leases to expire, and then
    deploy the last compatible release candidate whose validation bundle is intact. Do not run old
    and new writers concurrently.
@@ -51,4 +52,5 @@ Rollback immediately when any of the following occurs:
 
 - Do not promote a new build until the failed candidate has a rooted explanation.
 - Do not overwrite the validation artifacts for the last known good candidate.
-- Do not delete or rewrite `cluster/format_version` to force an older binary to start.
+- Do not delete or rewrite `cluster/format_version` or `cluster/timestamp_layout` to force an older
+  binary to start.

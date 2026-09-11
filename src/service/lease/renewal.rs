@@ -1,6 +1,6 @@
 use std::cmp::max;
 
-use crate::decode_tso;
+use crate::TimestampLayout;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::service) enum GeneratorLeaseRefreshReason {
@@ -29,7 +29,23 @@ pub(in crate::service) struct GeneratorLeaseRefreshPlan {
     should_extend_upper_bound: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::service) struct GeneratorLeaseRefreshTiming {
+    ttl_ms: u64,
+    pre_borrow_ms: u64,
+}
+
+impl GeneratorLeaseRefreshTiming {
+    pub(in crate::service) fn new(ttl_ms: u64, pre_borrow_ms: u64) -> Self {
+        Self {
+            ttl_ms,
+            pre_borrow_ms,
+        }
+    }
+}
+
 impl GeneratorLeaseRefreshPlan {
+    #[cfg(test)]
     pub(in crate::service) fn build(
         lease_expire_at_ms: u64,
         last_persisted_tso: Option<u64>,
@@ -39,16 +55,37 @@ impl GeneratorLeaseRefreshPlan {
         ttl_ms: u64,
         pre_borrow_ms: u64,
     ) -> Self {
-        let should_renew_lease = lease_expire_at_ms <= now_ms.saturating_add(ttl_ms / 2);
+        Self::build_with_layout(
+            crate::DEFAULT_TIMESTAMP_LAYOUT,
+            lease_expire_at_ms,
+            last_persisted_tso,
+            issued_upper_bound,
+            local_last_issued_tso,
+            now_ms,
+            GeneratorLeaseRefreshTiming::new(ttl_ms, pre_borrow_ms),
+        )
+    }
+
+    pub(in crate::service) fn build_with_layout(
+        layout: TimestampLayout,
+        lease_expire_at_ms: u64,
+        last_persisted_tso: Option<u64>,
+        issued_upper_bound: Option<u64>,
+        local_last_issued_tso: Option<u64>,
+        now_ms: u64,
+        timing: GeneratorLeaseRefreshTiming,
+    ) -> Self {
+        let should_renew_lease = lease_expire_at_ms <= now_ms.saturating_add(timing.ttl_ms / 2);
         let candidate_last = merge_max(last_persisted_tso, local_last_issued_tso);
         let current_upper_bound = merge_max(issued_upper_bound, candidate_last);
         let should_extend_upper_bound = current_upper_bound
             .map(|upper_bound| {
-                decode_tso(upper_bound).physical_ms <= now_ms.saturating_add(pre_borrow_ms / 2)
+                layout.decode(upper_bound).physical_ms
+                    <= now_ms.saturating_add(timing.pre_borrow_ms / 2)
             })
             .unwrap_or(true);
         let next_upper_bound_base_ms = current_upper_bound
-            .map(|upper_bound| decode_tso(upper_bound).physical_ms)
+            .map(|upper_bound| layout.decode(upper_bound).physical_ms)
             .map(|upper_bound_ms| max(now_ms, upper_bound_ms))
             .unwrap_or(now_ms);
 

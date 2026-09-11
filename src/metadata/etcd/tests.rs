@@ -1,5 +1,5 @@
 use crate::metrics;
-use crate::{ResourceTier, TimelineLifecycleState, TsoConfig};
+use crate::{ResourceTier, TimelineLifecycleState, TimestampLayout, TsoConfig};
 
 use super::EtcdMetadataStore;
 use super::{
@@ -794,5 +794,104 @@ async fn etcd_cluster_format_initialization_rejects_active_legacy_identity() {
     assert!(error.to_string().contains("incompatible cluster format"));
 
     client.lease_revoke(lease_id).await.unwrap();
+    store.shutdown_route_watch().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a reachable etcd; set CHRONOS_TEST_ETCD_ENDPOINTS or run one on 127.0.0.1:2379"]
+async fn etcd_cluster_format_initialization_persists_and_enforces_timestamp_layout() {
+    let (store, _) = test_etcd_store("format-layout").await;
+    let layout = TimestampLayout::new(0, 46, 7, 11).unwrap();
+    store
+        .initialize_cluster_format_and_indexes_with_layout(layout)
+        .await
+        .unwrap();
+
+    let stored = store
+        .client
+        .clone()
+        .get(store.cluster_timestamp_layout_key(), None)
+        .await
+        .unwrap();
+    let stored: TimestampLayout =
+        serde_json::from_slice(stored.kvs().first().unwrap().value()).unwrap();
+    assert_eq!(stored, layout);
+
+    let mismatch = TimestampLayout::new(1, 46, 7, 11).unwrap();
+    let error = store
+        .initialize_cluster_format_and_indexes_with_layout(mismatch)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("timestamp layout mismatch"));
+    store.shutdown_route_watch().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a reachable etcd; set CHRONOS_TEST_ETCD_ENDPOINTS or run one on 127.0.0.1:2379"]
+async fn etcd_cluster_format_v2_migrates_only_to_the_default_timestamp_layout() {
+    let (default_store, _) = test_etcd_store("format-v2-default").await;
+    default_store
+        .client
+        .clone()
+        .put(default_store.cluster_format_key(), "2", None)
+        .await
+        .unwrap();
+    default_store
+        .initialize_cluster_format_and_indexes()
+        .await
+        .unwrap();
+    let migrated = default_store
+        .client
+        .clone()
+        .get(default_store.cluster_format_key(), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        migrated.kvs().first().map(|kv| kv.value()),
+        Some(CURRENT_CLUSTER_FORMAT_VERSION.to_string().as_bytes())
+    );
+    default_store.shutdown_route_watch().await;
+
+    let (custom_store, _) = test_etcd_store("format-v2-custom").await;
+    custom_store
+        .client
+        .clone()
+        .put(custom_store.cluster_format_key(), "2", None)
+        .await
+        .unwrap();
+    let custom = TimestampLayout::new(0, 46, 7, 11).unwrap();
+    let error = custom_store
+        .initialize_cluster_format_and_indexes_with_layout(custom)
+        .await
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("require a new, empty metadata prefix"));
+    custom_store.shutdown_route_watch().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a reachable etcd; set CHRONOS_TEST_ETCD_ENDPOINTS or run one on 127.0.0.1:2379"]
+async fn etcd_custom_timestamp_layout_rejects_markerless_existing_timestamp_data() {
+    let (store, _) = test_etcd_store("format-markerless-data").await;
+    store
+        .client
+        .clone()
+        .put(
+            store.request_key("orphan-timeline", "orphan-request"),
+            "legacy-request",
+            None,
+        )
+        .await
+        .unwrap();
+
+    let custom = TimestampLayout::new(0, 46, 7, 11).unwrap();
+    let error = store
+        .initialize_cluster_format_and_indexes_with_layout(custom)
+        .await
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("existing timestamp-bearing metadata was found"));
     store.shutdown_route_watch().await;
 }

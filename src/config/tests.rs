@@ -3,7 +3,7 @@ use super::{
     PRODUCTION_MAX_BATCH_PER_REQUEST, PRODUCTION_MAX_TIMELINE_PROXY_LANES,
     PRODUCTION_MAX_TIMELINE_RUNTIME_ENTRIES,
 };
-use crate::ResourceTier;
+use crate::{ResourceTier, TimestampLayout};
 use std::path::PathBuf;
 
 #[cfg(unix)]
@@ -86,6 +86,21 @@ fn etcd_tls_paths_require_complete_bundle() {
 #[test]
 fn validate_for_startup_accepts_valid_config() {
     assert!(valid_config().validate_for_startup().is_ok());
+}
+
+#[test]
+fn validate_for_startup_uses_layout_generator_capacity() {
+    let mut config = valid_config();
+    config.timestamp_layout = TimestampLayout::new(0, 46, 7, 11).unwrap();
+    config.shared_generators = 96;
+    config.warm_generators = 33;
+
+    assert_eq!(
+        config.validate_for_startup(),
+        Err(TsoConfigValidationError::TooManyTierGenerators {
+            max_generators: 128,
+        })
+    );
 }
 
 #[test]

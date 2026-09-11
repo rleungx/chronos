@@ -46,8 +46,11 @@ impl TsoService {
                 TimelineServingReadiness::RequiresActivation => {
                     debug_assert!(lifecycle.should_activate_locally());
                     if let Some(recovery_floor_tso) = recovered_timeline_floor_tso(&record) {
-                        let recovery_physical_ms =
-                            crate::decode_tso(recovery_floor_tso).physical_ms;
+                        let recovery_physical_ms = self
+                            .config
+                            .timestamp_layout
+                            .decode(recovery_floor_tso)
+                            .physical_ms;
                         let now_ms = self.clock.now_ms();
                         if recovery_physical_ms
                             > now_ms.saturating_add(self.config.recovery_catchup_budget_ms)

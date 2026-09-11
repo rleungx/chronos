@@ -69,6 +69,8 @@ fail!("values.schema.json must reject unknown security properties") unless schem
 fail!("values.schema.json must reject unknown topology spread properties") unless schema.dig("properties", "topologySpreadConstraints", "additionalProperties") == false
 fail!("values.schema.json must constrain ownership shard count") unless schema.dig("properties", "ownership", "properties", "shardCount", "minimum") == 3
 fail!("values.schema.json must reject removed ownership escape hatches") unless schema.dig("properties", "ownership", "additionalProperties") == false
+fail!("values.schema.json must constrain timestamp generator bits") unless schema.dig("properties", "timestampLayout", "properties", "generatorBits", "maximum") == 13
+fail!("values.schema.json must constrain timestamp sequence bits") unless schema.dig("properties", "timestampLayout", "properties", "sequenceBits", "maximum") == 31
 fail!("values.schema.json must preserve the bounded shutdown window") unless schema.dig("properties", "runtime", "properties", "terminationGracePeriodSeconds", "minimum") == 120
 ' "${chart}"
 
@@ -78,6 +80,9 @@ require_contains "${chart}/templates/configmap.yaml" 'refusing ownership topolog
 require_contains "${chart}/templates/configmap.yaml" 'refusing cluster-format change'
 require_contains "${chart}/templates/configmap.yaml" '$existingStatefulSet.status.replicas'
 require_contains "${chart}/templates/configmap.yaml" 'CHRONOS_CLUSTER_FORMAT_VERSION'
+require_contains "${chart}/templates/configmap.yaml" 'CHRONOS_TSO_EPOCH_UNIX_MS'
+require_contains "${chart}/templates/configmap.yaml" 'refusing timestamp-layout change'
+require_contains "${chart}/templates/configmap.yaml" 'refusing generator-capacity change'
 require_contains "${chart}/templates/configmap.yaml" 'CHRONOS_GRPC_MAX_CONNECTIONS'
 require_contains "${chart}/templates/_helpers.tpl" 'chronos.ownershipWorkerCount'
 require_contains "${chart}/templates/_helpers.tpl" 'chronos.clusterFormatVersion'

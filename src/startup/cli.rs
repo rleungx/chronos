@@ -208,7 +208,30 @@ fn print_config_lines(config: &TsoConfig) -> AppResult<()> {
         "cluster_format_version={}",
         chronos::metadata::CURRENT_CLUSTER_FORMAT_VERSION
     );
-    println!("tso_max_supported_unix_ms={}", chronos::MAX_UNIX_MS);
+    println!(
+        "tso_layout_format_version={}",
+        config.timestamp_layout.format_version()
+    );
+    println!(
+        "tso_epoch_unix_ms={}",
+        config.timestamp_layout.epoch_unix_ms()
+    );
+    println!(
+        "tso_physical_bits={}",
+        config.timestamp_layout.physical_bits()
+    );
+    println!(
+        "tso_generator_bits={}",
+        config.timestamp_layout.generator_bits()
+    );
+    println!(
+        "tso_sequence_bits={}",
+        config.timestamp_layout.sequence_bits()
+    );
+    println!(
+        "tso_max_supported_unix_ms={}",
+        config.timestamp_layout.max_unix_ms()
+    );
     Ok(())
 }
 

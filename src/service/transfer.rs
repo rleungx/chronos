@@ -536,6 +536,7 @@ impl TsoService {
                 generator_id,
                 self.config.shared_generators,
                 self.config.warm_generators,
+                self.config.timestamp_layout.max_generators(),
             )?,
             None => record.route.resource_tier,
         };

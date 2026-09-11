@@ -53,7 +53,7 @@ app.kubernetes.io/component: tso
 {{- end -}}
 {{- end -}}
 
-{{- define "chronos.clusterFormatVersion" -}}2{{- end -}}
+{{- define "chronos.clusterFormatVersion" -}}3{{- end -}}
 
 {{- define "chronos.image" -}}
 {{- if .Values.image.digest -}}

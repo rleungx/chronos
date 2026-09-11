@@ -23,7 +23,7 @@ use crate::plane::RequestCancellation;
 use crate::planning::{generator_recovery_floor_tso, pick_owned_generator_by_hash};
 use crate::recovery::record_recovery_event;
 use crate::runtime::Generator;
-use crate::{decode_tso, next_cursor_after, Clock, TsoConfig, TsoError, MAX_GENERATORS};
+use crate::{Clock, TsoConfig, TsoError};
 
 use crate::runtime::{GeneratorRuntimeState, TimelineRuntimeState};
 use background::BackgroundCoordinator;
@@ -453,7 +453,7 @@ impl TsoService {
     }
 
     pub(super) fn ensure_generator_id_range(&self, generator_id: u32) -> Result<(), TsoError> {
-        if generator_id >= MAX_GENERATORS {
+        if generator_id >= self.config.timestamp_layout.max_generators() {
             return Err(TsoError::GeneratorIdOutOfRange { generator_id });
         }
         Ok(())
@@ -487,8 +487,17 @@ impl TsoService {
         let Some(current_floor) = self.current_generator_floor(generator_id).await? else {
             return Ok(0);
         };
-        let current_ms = decode_tso(current_floor).physical_ms;
-        let target_ms = next_cursor_after(safe_floor, generator_id)?.physical_ms;
+        let current_ms = self
+            .config
+            .timestamp_layout
+            .decode(current_floor)
+            .physical_ms;
+        let target_ms = crate::next_cursor_after_with_layout(
+            self.config.timestamp_layout,
+            safe_floor,
+            generator_id,
+        )?
+        .physical_ms;
         Ok(target_ms.saturating_sub(current_ms))
     }
 
@@ -522,7 +531,7 @@ impl TsoService {
         {
             return Ok((generator_id, false));
         }
-        for generator_id in dedicated_start..MAX_GENERATORS {
+        for generator_id in dedicated_start..self.config.timestamp_layout.max_generators() {
             if !self.owns_generator_id(generator_id) {
                 continue;
             }

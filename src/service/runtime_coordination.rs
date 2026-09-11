@@ -69,12 +69,14 @@ impl TsoService {
         generator_id: u32,
         base_ms: u64,
     ) -> Option<u64> {
-        crate::encode_tso(
-            base_ms + self.config.pre_borrow_ms,
-            generator_id,
-            crate::SEQUENCE_CAPACITY - 1,
-        )
-        .ok()
+        self.config
+            .timestamp_layout
+            .encode(
+                base_ms + self.config.pre_borrow_ms,
+                generator_id,
+                self.config.timestamp_layout.sequence_capacity() - 1,
+            )
+            .ok()
     }
 
     pub async fn get_timeline_route(&self, timeline_key: &str) -> Result<TimelineRoute, TsoError> {

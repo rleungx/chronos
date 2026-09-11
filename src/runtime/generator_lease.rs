@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use dashmap::DashMap;
 
-use crate::{encode_tso, metrics, next_cursor_after, TimestampRange, TsoError, SEQUENCE_CAPACITY};
+use crate::{metrics, next_cursor_after_with_layout, TimestampLayout, TimestampRange, TsoError};
 
 const MAX_GENERATOR_CONTENTION_RETRIES: u32 = 32;
 
@@ -17,22 +17,29 @@ pub(crate) enum AllocateAfterResult {
 #[derive(Debug)]
 pub(crate) struct Generator {
     id: u32,
+    layout: TimestampLayout,
     next_index: AtomicU64,
     ready_lease_token: AtomicU64,
 }
 
 impl Generator {
+    #[cfg(test)]
     pub(crate) fn new(id: u32) -> Self {
+        Self::with_layout(id, crate::DEFAULT_TIMESTAMP_LAYOUT)
+    }
+
+    pub(crate) fn with_layout(id: u32, layout: TimestampLayout) -> Self {
         Self {
             id,
+            layout,
             next_index: AtomicU64::new(0),
             ready_lease_token: AtomicU64::new(0),
         }
     }
 
     pub(crate) fn init_after_floor(&self, floor: u64) -> Result<(), TsoError> {
-        let cap = SEQUENCE_CAPACITY as u64;
-        let cursor = next_cursor_after(floor, self.id)?;
+        let cap = u64::from(self.layout.sequence_capacity());
+        let cursor = next_cursor_after_with_layout(self.layout, floor, self.id)?;
         let index = cursor
             .physical_ms
             .checked_mul(cap)
@@ -60,7 +67,7 @@ impl Generator {
     }
 
     pub(crate) fn current_last_issued_tso(&self) -> Result<Option<u64>, TsoError> {
-        let cap = SEQUENCE_CAPACITY as u64;
+        let cap = u64::from(self.layout.sequence_capacity());
         let next = self.next_index.load(AtomicOrdering::Acquire);
         if next == 0 {
             return Ok(None);
@@ -68,7 +75,7 @@ impl Generator {
         let last_index = next - 1;
         let physical_ms = last_index / cap;
         let sequence = (last_index % cap) as u32;
-        Ok(Some(encode_tso(physical_ms, self.id, sequence)?))
+        Ok(Some(self.layout.encode(physical_ms, self.id, sequence)?))
     }
 
     pub(crate) fn allocate_after(
@@ -80,12 +87,12 @@ impl Generator {
         max_clock_rewind_ms: u64,
         issued_upper_bound: Option<u64>,
     ) -> Result<AllocateAfterResult, TsoError> {
-        let cap = SEQUENCE_CAPACITY as u64;
+        let cap = u64::from(self.layout.sequence_capacity());
         let count_u64 = u64::from(count);
         let mut contention_retries = 0u32;
         let floor_index = match floor {
             Some(value) => {
-                let floor_cursor = next_cursor_after(value, self.id)?;
+                let floor_cursor = next_cursor_after_with_layout(self.layout, value, self.id)?;
                 floor_cursor
                     .physical_ms
                     .checked_mul(cap)
@@ -136,7 +143,9 @@ impl Generator {
                 });
             }
             if let Some(issued_upper_bound) = issued_upper_bound {
-                let requested_end_tso = encode_tso(last_physical_ms, self.id, last_sequence)?;
+                let requested_end_tso =
+                    self.layout
+                        .encode(last_physical_ms, self.id, last_sequence)?;
                 if requested_end_tso > issued_upper_bound {
                     return Err(TsoError::IssuedUpperBoundExceeded {
                         requested_end_tso,
@@ -163,9 +172,9 @@ impl Generator {
                         let sequence = sequence_index as u32;
                         let available = cap - sequence_index;
                         let take = min(remaining, available);
-                        let start_tso = encode_tso(physical_ms, self.id, sequence)?;
+                        let start_tso = self.layout.encode(physical_ms, self.id, sequence)?;
                         let end_sequence = sequence + (take as u32) - 1;
-                        let end_tso = encode_tso(physical_ms, self.id, end_sequence)?;
+                        let end_tso = self.layout.encode(physical_ms, self.id, end_sequence)?;
                         ranges.push(TimestampRange { start_tso, end_tso });
                         remaining -= take;
                         cursor_index = cursor_index
@@ -214,10 +223,15 @@ pub(crate) struct GeneratorRuntimeState {
 }
 
 impl GeneratorRuntimeState {
+    #[cfg(test)]
     pub(crate) fn new(max_generators: u32) -> Self {
+        Self::with_layout(max_generators, crate::DEFAULT_TIMESTAMP_LAYOUT)
+    }
+
+    pub(crate) fn with_layout(max_generators: u32, layout: TimestampLayout) -> Self {
         let mut generators = Vec::with_capacity(max_generators as usize);
         for id in 0..max_generators {
-            generators.push(Arc::new(Generator::new(id)));
+            generators.push(Arc::new(Generator::with_layout(id, layout)));
         }
         Self {
             generators,
@@ -349,6 +363,8 @@ impl GeneratorRuntimeState {
 
 #[cfg(test)]
 mod tests {
+    use crate::{encode_tso, SEQUENCE_CAPACITY};
+
     use super::*;
 
     #[test]

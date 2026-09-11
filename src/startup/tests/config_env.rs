@@ -280,6 +280,39 @@ fn load_tso_config_accepts_generator_ownership_partition_env() {
 }
 
 #[test]
+fn load_tso_config_accepts_generic_timestamp_layout_env() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    clear_tso_env();
+    unsafe {
+        env::set_var("CHRONOS_TSO_EPOCH_UNIX_MS", "0");
+        env::set_var("CHRONOS_TSO_PHYSICAL_BITS", "46");
+        env::set_var("CHRONOS_TSO_GENERATOR_BITS", "7");
+        env::set_var("CHRONOS_TSO_SEQUENCE_BITS", "11");
+        env::set_var("CHRONOS_SHARED_GENERATORS", "64");
+        env::set_var("CHRONOS_WARM_GENERATORS", "64");
+    }
+
+    let config = load_tso_config().unwrap();
+    assert_eq!(config.timestamp_layout.epoch_unix_ms(), 0);
+    assert_eq!(config.timestamp_layout.physical_bits(), 46);
+    assert_eq!(config.timestamp_layout.generator_bits(), 7);
+    assert_eq!(config.timestamp_layout.sequence_bits(), 11);
+    assert_eq!(config.timestamp_layout.max_generators(), 128);
+}
+
+#[test]
+fn load_tso_config_rejects_timestamp_layouts_that_do_not_fill_u64() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    clear_tso_env();
+    unsafe { env::set_var("CHRONOS_TSO_PHYSICAL_BITS", "39") };
+
+    let error = load_tso_config().unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("timestamp layout bit widths must total 64"));
+}
+
+#[test]
 fn load_tso_config_rejects_removed_internal_tuning_env_vars() {
     let _guard = ENV_LOCK.lock().unwrap();
 
