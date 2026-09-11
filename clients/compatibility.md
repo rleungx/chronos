@@ -1,6 +1,8 @@
 # Client versioning and compatibility
 
-Chronos clients are versioned independently from the server and from each other:
+The independently packaged Go, Java, and C++ clients are versioned separately from the server and
+from each other. The Rust client ships as part of the main `chronos` crate and follows the server
+version; it does not use an independent `clients/rust/vX.Y.Z` release tag.
 
 | Client | Release tag | Distribution |
 | --- | --- | --- |
@@ -41,7 +43,7 @@ their local dependencies; the project does not claim cross-distribution C++ ABI 
   an unreleased server unless its release notes explicitly declare that minimum server version.
 
 The first release of each client establishes its compatibility baseline. Until that tag exists, the
-client remains pre-release even when its repository-local tests pass. CI self-compares each current
+client remains pre-release even when its in-repository tests pass. CI self-compares each current
 artifact so a missing or broken compatibility tool cannot silently disable the first subsequent
 release comparison.
 

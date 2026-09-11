@@ -2,19 +2,20 @@
 
 `Client` is the C++ application-facing Chronos client implementation.
 
-Support level: Release-ready implementation with versioned CMake package archives.
+Support level: Primary.
 
 ## Install
 
-C++ releases use tags such as `clients/cpp/v0.1.0` and attach a platform-specific `.tar.gz` plus
-portable SHA-256 checksums and build provenance. After extracting the archive under a chosen prefix:
+After the first client release is published, C++ releases will use tags such as
+`clients/cpp/v0.1.0` and attach a platform-specific `.tar.gz` plus portable SHA-256 checksums and
+build provenance. After extracting the archive under a chosen prefix:
 
 ```cmake
 find_package(chronos CONFIG REQUIRED)
 target_link_libraries(your_target PRIVATE chronos::client)
 ```
 
-The published binary package targets Ubuntu 24.04 x86-64 and uses that distribution's gRPC and
+The release binary package targets Ubuntu 24.04 x86-64 and uses that distribution's gRPC and
 protobuf development libraries. Build from source on other platforms; no cross-distribution C++ ABI
 compatibility is claimed.
 

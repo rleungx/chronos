@@ -53,13 +53,14 @@ stable Service or load balancer in production so it remains reachable after an o
 |---|---|---|
 | Rust | Primary | In-repo implementation, linted, and tested |
 | Go | Primary | Packaged submodule with generated proto and tests |
-| Java | Repository-local | In-repo implementation, tests, and Maven publication metadata |
-| C++ | Repository-local | In-repo implementation, tests, and CMake install/export target |
+| Java | Primary | In-repo implementation, tests, and Maven publication metadata |
+| C++ | Primary | In-repo implementation, tests, and CMake install/export target |
 
 ## Compatibility
 
-Client examples and library entry points are CI-gated. This repository has not published its first
-client release yet, so the current checkout remains a source-based integration. Tag-triggered
+Client examples and library entry points are CI-gated. This repository has not published a stable
+client version yet, so the current checkout remains a source-based integration. The Rust client
+ships as part of the main `chronos` crate and follows the server release lifecycle. Tag-triggered
 release automation is available for Go, Java, and C++; only artifacts produced by that workflow are
 published releases.
 
@@ -70,5 +71,5 @@ The versioning, distribution, and public compatibility policy is defined in
 `clients/compatibility.md`.
 
 The cross-language client contract lives in `clients/client-contract.md` and is checked by
-`make client-conformance-check`. Repository-local package metadata is checked by
+`make client-conformance-check`. Package metadata is checked by
 `make client-package-check`.

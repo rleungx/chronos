@@ -73,8 +73,8 @@ Supported application-facing clients:
 |---|---|
 | Rust | Primary |
 | Go | Primary |
-| Java | Repository-local |
-| C++ | Repository-local |
+| Java | Primary |
+| C++ | Primary |
 
 Applications should use the client libraries instead of calling route-management RPCs directly.
 Route RPCs remain part of the wire contract, but normal allocation traffic only needs the client

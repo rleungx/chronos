@@ -2,14 +2,15 @@
 
 `Client` is the Java application-facing Chronos client implementation.
 
-Support level: Release-ready implementation with GitHub Packages publication metadata.
+Support level: Primary.
 
 ## Install
 
-Published coordinates are `io.github.rleungx:chronos-java-client:<version>` in the repository's
-GitHub Packages Maven registry. GitHub Packages requires Maven credentials, including for public
-packages. Releases also attach the binary, sources, and Javadoc JARs to the corresponding GitHub
-Release tag, such as `clients/java/v0.1.0`, together with SHA-256 checksums and build provenance.
+After the first client release is published, its coordinates will be
+`io.github.rleungx:chronos-java-client:<version>` in the repository's GitHub Packages Maven
+registry. GitHub Packages requires Maven credentials, including for public packages. Releases also
+attach the binary, sources, and Javadoc JARs to the corresponding GitHub Release tag, such as
+`clients/java/v0.1.0`, together with SHA-256 checksums and build provenance.
 
 Gradle Kotlin DSL consumers can configure the authenticated repository and dependency as follows.
 `GITHUB_TOKEN` must be a classic personal access token with `read:packages` permission outside
